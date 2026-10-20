@@ -1,0 +1,57 @@
+[package]
+name = "vgrab"
+version = "1.0.0"
+description = "Video downloader built on yt-dlp"
+authors = ["dreamcatsky"]
+license = "MIT"
+repository = "https://github.com/dreamcatsky/vgrab"
+homepage = "https://github.com/dreamcatsky/vgrab"
+readme = "../README.md"
+keywords = ["download", "yt-dlp", "tauri", "video", "downloader"]
+categories = ["multimedia::video", "download"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "vgrab_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# tray-icon：系统托盘图标（关闭窗口后驻留托盘）。这是 tauri 的可选 feature，
+# 不开这个 feature 时 `tauri::tray` 模块根本不存在，编译直接报 unresolved import。
+# 只加它不会拖入 image 解码依赖：托盘图标复用 exe 内嵌的窗口图标资源。
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt-multi-thread"] }
+dirs = "5"
+# socks：设置页的 SOCKS5 代理需要它（HTTP 代理不需要，但加上才能覆盖 v2rayN 的 10808）
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "charset", "socks"] }
+futures-util = "0.3"
+urlencoding = "2"
+
+# 读系统剪贴板（文件 → 从剪贴板添加URL）。
+# 只为这一个功能引入整个 clipboard 插件不划算：Windows 的剪贴板读取只有
+# OpenClipboard/GetClipboardData 两个调用，直接绑系统库比多一个依赖更省。
+# 非 Windows 平台走 arboard 也没有意义——本程序只发布 Windows 构建。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+] }
+
+# 发布构建：LTO + 单 codegen unit 换更好的内联与更小的二进制。
+# 不设 panic = "abort"：SlotGuard 依赖 Drop 归还并发槽位，abort 会让它在 panic 时失效。
+# 协议关联（vgrab://）走自写的注册表逻辑（deeplink.rs），不引入 deep-link 插件：
+# 那个插件在某些环境下会把自身目标写成 dev 期 exe 路径，安装后静默失效。
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

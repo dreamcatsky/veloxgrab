@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "VGrab Downloader",
+  "version": "1.0.0",
+  "description": "把网页里的下载链接、图片、视频直接发给 VGrab 桌面程序下载。",
+  "permissions": ["activeTab", "contextMenus", "scripting", "storage", "downloads", "notifications"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "用 VGrab 下载"
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

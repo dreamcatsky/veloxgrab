@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>VGrab</title>
+<style>
+  body { width: 340px; margin: 0; padding: 12px; font: 13px/1.5 system-ui, "Microsoft YaHei", sans-serif; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  .row { margin-bottom: 8px; }
+  label { display: block; color: #666; margin-bottom: 2px; font-size: 12px; }
+  input, select { width: 100%; box-sizing: border-box; padding: 5px 6px; border: 1px solid #ccc; border-radius: 4px; font: inherit; }
+  .media { max-height: 140px; overflow: auto; border: 1px solid #eee; border-radius: 4px; padding: 4px; margin-bottom: 8px; }
+  .media div { padding: 3px 4px; border-radius: 3px; cursor: pointer; word-break: break-all; }
+  .media div:hover { background: #f0f4ff; }
+  .dim { color: #999; }
+  .chk { display: flex; align-items: center; gap: 6px; color: #333; font-size: 12.5px; }
+  .chk input { width: auto; margin: 0; }
+  button { width: 100%; padding: 7px; border: 0; border-radius: 4px; background: #4a7dff; color: #fff; font: inherit; cursor: pointer; }
+  button:disabled { background: #aab; cursor: default; }
+  #msg { margin-top: 8px; color: #0a7; min-height: 1.2em; }
+  #msg.err { color: #d33; }
+</style>
+</head>
+<body>
+  <h1>用 VGrab 下载</h1>
+
+  <div class="row">
+    <label>当前页面链接</label>
+    <input id="url" type="text" spellcheck="false" />
+  </div>
+
+  <div class="row" id="mediaWrap" style="display:none">
+    <label>页面里的媒体 <span class="dim">（点一条直接发送）</span></label>
+    <div id="mediaList" class="media"></div>
+  </div>
+
+  <div class="row">
+    <label class="chk"><input id="intercept" type="checkbox" checked /> 接管浏览器下载（点下载链接自动转给 VGrab）</label>
+  </div>
+
+  <div class="row">
+    <label>保存目录 <span class="dim">（留空 = VGrab 默认目录）</span></label>
+    <input id="dir" type="text" spellcheck="false" placeholder="D:\Downloads" />
+  </div>
+
+  <div class="row">
+    <label>线程数</label>
+    <select id="threads">
+      <option>1</option><option>2</option><option selected>4</option>
+      <option>8</option><option>16</option><option>32</option>
+    </select>
+  </div>
+
+  <button id="send">发送给 VGrab</button>
+  <div id="msg"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

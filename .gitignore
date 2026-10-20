@@ -1,0 +1,30 @@
+# 构建产物
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+# 生成物
+src-tauri/icons/source.png
+
+# 本地依赖（不入库，见 README 说明）
+yt-dlp.exe
+ffmpeg.exe
+bin/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日志与临时文件
+*.log
+npm-debug.log*
+
+# 内部开发过程产物（不随仓库发布）
+.agent-notes/
+CODE_REVIEW*.md
+G*.png
+.e2e-server.js

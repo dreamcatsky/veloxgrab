@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>VGrab</title>
+<link rel="stylesheet" href="styles.css" />
+<!-- 主题必须在首帧前落定，所以是 <head> 里的同步脚本，不 defer -->
+<script src="theme.js"></script>
+</head>
+<body>
+  <!-- 菜单栏（对齐 IDM 的五大项 + 二级菜单）。
+       用 HTML 自绘而不是 tauri::Menu：原生菜单画在 webview 之外的窗口客户区，
+       既吃不到本程序的深色主题（Windows 上会是浅色一块），也没法在截图里验证。 -->
+  <nav class="menubar" id="menubar">
+    <div class="menu" data-menu="task">
+      <button class="menu-btn" data-i18n="menuTask">任务(T)</button>
+      <div class="menu-pop">
+        <button class="menu-item" data-cmd="addDownload"><span data-i18n="miAddDownload">添加新下载</span><kbd>Ctrl+N</kbd></button>
+        <div class="menu-sep"></div>
+        <button class="menu-item" data-cmd="startAll"><span data-i18n="miStartAll">全部开始</span></button>
+        <button class="menu-item" data-cmd="pauseAll"><span data-i18n="miPauseAll">全部暂停</span></button>
+      </div>
+    </div>
+
+    <div class="menu" data-menu="file">
+      <button class="menu-btn" data-i18n="menuFile">文件(F)</button>
+      <div class="menu-pop">
+        <button class="menu-item" data-cmd="openDownloadDir"><span data-i18n="miOpenDir">打开下载文件夹</span></button>
+        <button class="menu-item" data-cmd="addFromClipboard"><span data-i18n="miFromClipboard">从剪贴板添加URL</span><kbd>Ctrl+V</kbd></button>
+      </div>
+    </div>
+
+    <div class="menu" data-menu="download">
+      <button class="menu-btn" data-i18n="menuDownload">下载(D)</button>
+      <div class="menu-pop">
+        <button class="menu-item" data-cmd="resumeSelected"><span data-i18n="miResumeSel">恢复选中</span></button>
+        <button class="menu-item" data-cmd="pauseSelected"><span data-i18n="miPauseSel">暂停选中</span></button>
+        <button class="menu-item" data-cmd="deleteSelected"><span data-i18n="miDeleteSel">删除选中</span><kbd>Del</kbd></button>
+        <div class="menu-sep"></div>
+        <button class="menu-item" data-cmd="clearAll"><span data-i18n="miClearAll">清空所有任务</span></button>
+        <div class="menu-sep"></div>
+        <button class="menu-item" data-cmd="openSettings"><span data-i18n="miOptions">选项/设置</span><kbd>Ctrl+,</kbd></button>
+      </div>
+    </div>
+
+    <div class="menu" data-menu="view">
+      <button class="menu-btn" data-i18n="menuView">查看(V)</button>
+      <div class="menu-pop">
+        <button class="menu-item" data-cmd="refresh"><span data-i18n="miRefresh">刷新</span><kbd>F5</kbd></button>
+        <button class="menu-item" data-cmd="openProgress"><span data-i18n="miProgress">打开进度窗口</span></button>
+      </div>
+    </div>
+
+    <div class="menu" data-menu="help">
+      <button class="menu-btn" data-i18n="menuHelp">帮助(H)</button>
+      <div class="menu-pop">
+        <button class="menu-item" data-cmd="usage"><span data-i18n="miUsage">使用说明</span></button>
+        <button class="menu-item" data-cmd="setupExt"><span data-i18n="miSetupExt">启用浏览器扩展…</span></button>
+        <div class="menu-sep"></div>
+        <button class="menu-item" data-cmd="about"><span data-i18n="miAbout">关于 VGrab</span></button>
+      </div>
+    </div>
+
+    <span id="menuSelHint" class="menu-sel-hint"></span>
+  </nav>
+
+  <!-- 图标工具栏（第二排）：对齐 TDM Fast 的「图标 + 下方文字」。
+       动作全部复用 runMenuCommand，键盘快捷键、菜单项、工具栏按钮是同一条代码路径。 -->
+  <div class="toolbar" id="toolbar">
+    <button class="tb tb-add" data-cmd="addDownload">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+        <circle cx="12" cy="12" r="9" />
+        <line x1="12" y1="8" x2="12" y2="16" />
+        <line x1="8" y1="12" x2="16" y2="12" />
+      </svg>
+      <span data-i18n="tbAddUrl">添加URL</span>
+    </button>
+
+    <button class="tb tb-resume" data-cmd="resumeSelected">
+      <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
+        <path d="M9 6.5v11l9-5.5-9-5.5z" />
+      </svg>
+      <span data-i18n="tbResume">恢复</span>
+    </button>
+
+    <button class="tb tb-pause" data-cmd="pauseSelected">
+      <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
+        <rect x="8" y="6" width="3" height="12" rx="1" />
+        <rect x="13" y="6" width="3" height="12" rx="1" />
+      </svg>
+      <span data-i18n="tbPause">暂停</span>
+    </button>
+
+    <button class="tb tb-pause-all" data-cmd="pauseAll">
+      <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
+        <rect x="7" y="6" width="3" height="12" rx="1" />
+        <rect x="12" y="6" width="3" height="12" rx="1" />
+        <rect x="17" y="6" width="2" height="12" rx="1" opacity=".55" />
+      </svg>
+      <span data-i18n="tbPauseAll">全部暂停</span>
+    </button>
+
+    <button class="tb tb-delete" data-cmd="deleteSelected">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <path d="M4 7h16" />
+        <path d="M9 7V5h6v2" />
+        <path d="M6 7l1 12h10l1-12" />
+      </svg>
+      <span data-i18n="tbDelete">删除</span>
+    </button>
+
+    <span class="tb-sep"></span>
+
+    <button class="tb tb-open" data-cmd="openSelected">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 8V6h6l2 2h10v10H3V8z" />
+        <path d="M7 13h7" />
+        <path d="M11 10l3 3-3 3" />
+      </svg>
+      <span data-i18n="tbOpen">打开</span>
+    </button>
+
+    <button class="tb tb-folder" data-cmd="openDownloadDir">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+        <path d="M3 7V5h6l2 2h10v12H3V7z" />
+        <path d="M3 11h18" />
+      </svg>
+      <span data-i18n="tbFolder">打开文件夹</span>
+    </button>
+
+    <button class="tb tb-options" data-cmd="openSettings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <circle cx="12" cy="12" r="3" />
+        <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" />
+      </svg>
+      <span data-i18n="tbOptions">选项</span>
+    </button>
+  </div>
+
+  <!-- 主体：左侧类别栏 + 中间明细表 -->
+  <div class="main">
+    <aside class="sidebar" id="sidebar">
+      <div class="sb-group">
+        <div class="sb-title" data-i18n="sbCategory">类别</div>
+        <button class="sb-item active" data-view="all">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+          <span data-i18n="sbAll">所有下载</span>
+          <span class="sb-count" id="cntAll">0</span>
+        </button>
+        <button class="sb-item" data-view="active">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 4v10" /><path d="M8 11l4 4 4-4" /><path d="M4 19h16" /></svg>
+          <span data-i18n="sbActive">正在下载</span>
+          <span class="sb-count" id="cntActive">0</span>
+        </button>
+        <button class="sb-item" data-view="done">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 12l5 5L20 6" /></svg>
+          <span data-i18n="sbDone">已完成</span>
+          <span class="sb-count" id="cntDone">0</span>
+        </button>
+      </div>
+
+      <div class="sb-group">
+        <div class="sb-title" data-i18n="sbType">分类</div>
+        <button class="sb-item" data-cat="video">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="3" y="5" width="13" height="14" rx="2" /><path d="M16 10l5-3v10l-5-3" /></svg>
+          <span data-i18n="catVideo">视频</span>
+          <span class="sb-count" id="cntVideo">0</span>
+        </button>
+        <button class="sb-item" data-cat="music">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="7" cy="17" r="3" /><circle cx="17" cy="15" r="3" /><path d="M10 17V6l10-2v11" /></svg>
+          <span data-i18n="catMusic">音乐</span>
+          <span class="sb-count" id="cntMusic">0</span>
+        </button>
+        <button class="sb-item" data-cat="program">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M8 9l3 3-3 3" /><path d="M13 15h4" /></svg>
+          <span data-i18n="catProgram">程序</span>
+          <span class="sb-count" id="cntProgram">0</span>
+        </button>
+        <button class="sb-item" data-cat="archive">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M4 6h16v14H4z" /><path d="M10 6v3h4V6" /><path d="M12 12v4" /></svg>
+          <span data-i18n="catArchive">压缩包</span>
+          <span class="sb-count" id="cntArchive">0</span>
+        </button>
+        <button class="sb-item" data-cat="document">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v4h4" /><path d="M9 13h6M9 17h6" /></svg>
+          <span data-i18n="catDocument">文档</span>
+          <span class="sb-count" id="cntDocument">0</span>
+        </button>
+      </div>
+
+      <!-- 这里原本还有「下载记录」和「设置」两项，已删除：
+           - 下载记录：内容与「所有下载/正在下载/已完成」完全重复，且这三个筛选
+             现在也能看到上次运行留下的已完成任务（启动时从 history.json 回灌），
+             单独一个视图只剩冗余。
+           - 设置：与工具栏最右侧的「选项」是同一个页面，两处入口只会让人以为
+             是两个不同的东西。保留「选项」。 -->
+    </aside>
+
+    <section class="center">
+      <!-- 任务表：表头与行用同一套 grid 模板，列才对得齐 -->
+      <div id="taskView" class="center-view active">
+        <div class="list-head" id="listHead">
+          <label class="lh-check"><input id="selectAll" type="checkbox" /></label>
+          <span data-i18n="colName">名称</span>
+          <span data-i18n="colSize">大小</span>
+          <span data-i18n="colState">状态</span>
+          <span data-i18n="colProgress">进度</span>
+          <span data-i18n="colSpeed">速度</span>
+          <span data-i18n="colEta">剩余时间</span>
+          <span></span>
+        </div>
+        <div id="taskList" class="task-rows"></div>
+        <div id="listEmpty" class="list-empty" data-i18n="listEmpty">还没有下载任务。点「添加URL」或使用浏览器嗅探。</div>
+      </div>
+
+      <!-- 设置（对齐 TDM Fast「选项」面板） -->
+      <div id="settingsView" class="center-view">
+        <div class="form">
+
+          <h3 class="sec-title" data-i18n="secDownload">下载</h3>
+
+          <label class="fld">
+            <span data-i18n="downloadDir">默认下载目录</span>
+            <div class="inline">
+              <input id="setDownloadDir" type="text" spellcheck="false" />
+              <button id="pickDir" class="ghost"><span data-i18n="pickDirBtn">选择…</span></button>
+            </div>
+          </label>
+
+          <label class="fld">
+            <span><span data-i18n="maxConcurrent">同时下载任务数</span> <em class="dim">(1-8)</em></span>
+            <input id="setConcurrent" type="range" min="1" max="8" step="1" />
+            <output id="setConcurrentVal" class="dim"></output>
+          </label>
+
+          <label class="fld">
+            <span><span data-i18n="defaultThreads">默认下载线程数</span> <em class="dim" data-i18n="defaultThreadsHint">(1-64，直链分块并发)</em></span>
+            <input id="setDefaultThreads" type="range" min="1" max="64" step="1" />
+            <output id="setDefaultThreadsVal" class="dim"></output>
+          </label>
+
+          <label class="fld">
+            <span><span data-i18n="fragments">单视频并发分片数</span> <em class="dim" data-i18n="fragmentsHint">(1-64，yt-dlp 流分片)</em></span>
+            <input id="setFragments" type="range" min="1" max="64" step="1" />
+            <output id="setFragmentsVal" class="dim"></output>
+          </label>
+
+          <div class="nd-grid">
+            <label class="fld">
+              <span><span data-i18n="hfCap">HuggingFace 线程上限</span> <em class="dim" data-i18n="hfCapHint">(无 Token 时生效，0 = 不限)</em></span>
+              <input id="setHfCap" type="number" min="0" max="64" step="1" />
+            </label>
+            <label class="fld">
+              <span><span data-i18n="hfToken">HuggingFace Access Token</span> <em class="dim" data-i18n="hfTokenHint">(可选，hf_xxx)</em></span>
+              <input id="setHfToken" type="text" placeholder="hf_..." spellcheck="false" />
+            </label>
+          </div>
+
+          <label class="fld">
+            <span><span data-i18n="rateLimit">全局限速</span> <em class="dim" data-i18n="rateLimitHint">(KB/s，0 = 不限)</em></span>
+            <input id="setRateLimit" type="number" min="0" step="50" />
+          </label>
+
+          <h3 class="sec-title" data-i18n="secBehavior">弹窗与行为</h3>
+
+          <label class="fld checkbox">
+            <input id="setPopupSaveAs" type="checkbox" />
+            <span><span data-i18n="popupSaveAs">浏览器 vgrab:// 下载先弹出「另存为」</span> <em class="dim" data-i18n="popupSaveAsHint">(关掉则直接存入默认目录)</em></span>
+          </label>
+
+          <label class="fld checkbox">
+            <input id="setPopupQuality" type="checkbox" />
+            <span><span data-i18n="popupQuality">视频平台弹出清晰度选择</span> <em class="dim" data-i18n="popupQualityHint">(关掉则自动选最高画质)</em></span>
+          </label>
+
+          <label class="fld checkbox">
+            <input id="setAutoProgress" type="checkbox" />
+            <span data-i18n="autoProgress">开始下载自动切到任务列表</span>
+          </label>
+
+          <label class="fld checkbox">
+            <input id="setMergeMp4" type="checkbox" />
+            <span data-i18n="mergeMp4">总是合并输出为 MP4</span>
+          </label>
+
+          <label class="fld checkbox">
+            <input id="setAutostart" type="checkbox" />
+            <span><span data-i18n="autostart">开机自动启动 VGrab</span> <em class="dim" data-i18n="autostartHint">(保存时写入注册表 Run 键)</em></span>
+          </label>
+
+          <label class="fld checkbox">
+            <input id="setTelemetry" type="checkbox" />
+            <span><span data-i18n="telemetry">匿名使用统计</span> <em class="dim" data-i18n="telemetryHint">(本程序没有任何上报，勾选仅作占位)</em></span>
+          </label>
+
+          <h3 class="sec-title" data-i18n="secVideo">视频与 Cookie</h3>
+
+          <label class="fld">
+            <span data-i18n="cookieBrowser">视频 Cookies 来源</span>
+            <select id="setBrowser">
+              <option value="none" data-i18n="cookieNone">不使用</option>
+              <option value="chrome">Chrome</option>
+              <option value="edge">Edge</option>
+              <option value="firefox">Firefox</option>
+              <option value="brave">Brave</option>
+            </select>
+            <small class="dim" data-i18n="cookieBrowserHint">从浏览器读取登录态，用于解析需要登录的内容</small>
+          </label>
+
+          <label class="fld">
+            <span><span data-i18n="cookieFile">Cookie 文件</span> <em class="dim" data-i18n="cookieFileHint">(可选，Netscape 格式，优先于浏览器)</em></span>
+            <div class="inline">
+              <input id="setCookiesFile" type="text" data-i18n-ph="cookieFilePlaceholder" placeholder="留空则使用上面的浏览器选项" spellcheck="false" />
+              <button id="pickCookies" class="ghost"><span data-i18n="pickFileBtn">选择…</span></button>
+            </div>
+          </label>
+
+          <h3 class="sec-title" data-i18n="secProxy">代理</h3>
+
+          <label class="fld checkbox">
+            <input id="setProxyEnabled" type="checkbox" />
+            <span data-i18n="proxyEnable">启用代理（直链下载与视频解析都走代理）</span>
+          </label>
+
+          <div class="proxy-grid hidden" id="proxyDetail">
+            <label class="fld">
+              <span data-i18n="proxyType">类型</span>
+              <select id="setProxyType">
+                <option value="http">HTTP</option>
+                <option value="socks5">SOCKS5</option>
+              </select>
+            </label>
+            <label class="fld">
+              <span data-i18n="proxyHost">地址</span>
+              <input id="setProxyHost" type="text" placeholder="127.0.0.1" spellcheck="false" />
+            </label>
+            <label class="fld">
+              <span data-i18n="proxyPort">端口</span>
+              <input id="setProxyPort" type="number" min="0" max="65535" placeholder="7890" />
+            </label>
+            <label class="fld">
+              <span><span data-i18n="proxyUser">用户名</span> <em class="dim" data-i18n="optionalHint">(可选)</em></span>
+              <input id="setProxyUser" type="text" spellcheck="false" />
+            </label>
+            <label class="fld">
+              <span><span data-i18n="proxyPass">密码</span> <em class="dim" data-i18n="optionalHint">(可选)</em></span>
+              <input id="setProxyPass" type="text" />
+            </label>
+          </div>
+          <small class="dim" data-i18n="proxyHint">SOCKS5 走 socks5h（远端解析 DNS），可对接 v2rayN 的 10808 端口</small>
+
+          <h3 class="sec-title" data-i18n="secMisc">集成与界面</h3>
+
+          <div class="fld">
+            <span data-i18n="browserInt">浏览器集成</span>
+            <div class="inline">
+              <button id="openExtDir" class="ghost"><span data-i18n="openExtDir">打开扩展目录</span></button>
+              <span class="dim" data-i18n="browserIntHint">把里面的 vgrab-extension 文件夹加载到 Chrome / Edge 扩展页面即可</span>
+            </div>
+            <small class="dim" data-i18n="browserIntHint2">装好后在网页上右键 → 「用 VGrab 下载」即可把链接发给本程序（走 vgrab:// 协议）。</small>
+          </div>
+
+          <label class="fld">
+            <span data-i18n="language">界面语言</span>
+            <select id="setLanguage">
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+
+          <label class="fld">
+            <span><span data-i18n="theme">外观主题</span> <em class="dim" data-i18n="themeHint">(深色 / 浅色 / 跟随系统，立即生效)</em></span>
+            <select id="setTheme">
+              <option value="system" data-i18n="themeSystem">跟随系统</option>
+              <option value="dark" data-i18n="themeDark">深色</option>
+              <option value="light" data-i18n="themeLight">浅色</option>
+            </select>
+          </label>
+
+          <div class="actions settings-actions">
+            <button id="saveSettings" class="primary"><span data-i18n="save">保存设置</span></button>
+            <button id="restoreDefaults" class="ghost"><span data-i18n="restoreDefaults">恢复默认</span></button>
+            <button id="cancelSettings" class="ghost"><span data-i18n="cancel">取消</span></button>
+            <span id="setDefaultHint" class="dim"></span>
+            <span id="saveHint" class="dim"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <footer class="statusbar">
+    <span id="statusTasks">0 个任务</span>
+    <span class="sb-sep">|</span>
+    <span><span data-i18n="totalSpeed">总速度</span>: <b id="statusSpeed">0 B/s</b></span>
+    <span class="spacer"></span>
+    <button id="clearFinished" class="link-btn"><span data-i18n="clearFinished">清除已结束</span></button>
+    <span class="sb-sep" id="selSep"></span>
+    <span id="statusSelected" class="dim"></span>
+    <div id="healthDot" class="health" title="环境检查中"></div>
+  </footer>
+
+  <!-- 添加 URL（原来的「下载页」整块搬进来当弹窗）。
+       TDM Fast 里添加链接是弹窗，主界面留给列表；VGrab 原来把它当一整个页签，
+       和新的「侧边栏 + 中框列表」结构冲突，所以改成弹窗。 -->
+  <div id="addOverlay" class="overlay hidden">
+    <div class="dialog dialog-wide">
+      <div class="dialog-head">
+        <h3 data-i18n="addUrlTitle">添加 URL</h3>
+      </div>
+
+      <div class="urlrow">
+        <input id="urlInput" type="text" data-i18n-ph="urlPlaceholder" placeholder="粘贴链接：视频页（抖音 / B站 / YouTube…）或任意直链（.zip / .mp4 / .iso…）" spellcheck="false" />
+        <button id="parseBtn" class="primary"><span data-i18n="parse">解析</span></button>
+      </div>
+
+      <div id="healthBanner" class="banner hidden"></div>
+      <div id="parseError" class="banner error hidden"></div>
+
+      <!-- 手动新建下载：不解析，直接按直链下载（IDM 的核心入口） -->
+      <details id="newDownload" class="media-card">
+        <summary class="nd-summary"><span data-i18n="ndSummary">手动新建下载</span> <span class="dim" data-i18n="ndSummaryHint">（已有下载地址，不想先解析时用这个）</span></summary>
+
+        <div class="fmt-head nd-row">
+          <label data-i18n="ndUrlLabel">下载地址</label>
+          <input id="ndUrl" type="text" placeholder="https://example.com/file.zip" spellcheck="false" />
+        </div>
+
+        <div class="fmt-head nd-row">
+          <label><span data-i18n="filenameLabel">保存文件名</span> <em class="dim" data-i18n="filenameOptionalHint">（可选，留空自动识别）</em></label>
+          <input id="ndFilename" type="text" spellcheck="false" />
+        </div>
+
+        <div class="nd-grid">
+          <div class="fmt-head nd-row">
+            <label data-i18n="threadsLabel">下载线程数</label>
+            <select id="ndThreads"></select>
+          </div>
+
+          <div class="fmt-head nd-row">
+            <label data-i18n="saveToLabel">保存到</label>
+            <div class="inline">
+              <input id="ndDir" type="text" data-i18n-ph="ndDirPlaceholder" placeholder="留空 = 使用设置里的默认目录" spellcheck="false" />
+              <button id="ndPickDir" class="ghost"><span data-i18n="pickDirBtn">选择…</span></button>
+            </div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="ndStart" class="primary"><span data-i18n="startDownload">开始下载</span></button>
+          <span class="dim" data-i18n="ndHint">不解析直接下载，适合已知地址的直链</span>
+        </div>
+      </details>
+
+      <div id="mediaCard" class="media-card hidden">
+        <div class="media-head">
+          <img id="mediaThumb" class="thumb" alt="" />
+          <div class="media-meta">
+            <h2 id="mediaTitle"></h2>
+            <div class="sub">
+              <span id="mediaExtractor" class="chip"></span>
+              <span id="mediaUploader" class="dim"></span>
+              <span id="mediaDuration" class="dim"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="fmt-head">
+          <label data-i18n="qualityLabel">选择清晰度</label>
+          <select id="formatSelect"></select>
+        </div>
+        <div id="fmtDetail" class="fmt-detail dim"></div>
+
+        <div class="actions">
+          <button id="downloadBtn" class="primary"><span data-i18n="startDownload">开始下载</span></button>
+          <span id="enqueueHint" class="dim"></span>
+        </div>
+      </div>
+
+      <!-- 直链卡片：非媒体站时显示 -->
+      <div id="directCard" class="media-card hidden">
+        <div class="media-head">
+          <div class="media-meta">
+            <h2 id="dTitle"></h2>
+            <div class="sub">
+              <span id="dMime" class="chip"></span>
+            </div>
+          </div>
+        </div>
+
+        <div id="dDetail" class="fmt-detail dim"></div>
+
+        <div class="fmt-head">
+          <label data-i18n="filenameLabel">保存文件名</label>
+          <input id="dFilenameInput" type="text" spellcheck="false" />
+        </div>
+
+        <div class="fmt-head">
+          <label data-i18n="threadsLabel">下载线程数</label>
+          <select id="dThreads"></select>
+        </div>
+
+        <div class="actions">
+          <button id="dDownloadBtn" class="primary"><span data-i18n="startDownload">开始下载</span></button>
+          <span class="dim" data-i18n="directHint">多线程分块下载，断点续传</span>
+        </div>
+      </div>
+
+      <div class="dialog-tip dim">
+        <span data-i18n="emptyTip1">支持两类链接：① 视频页面 —— 自动解析清晰度与音轨；② 任意 HTTP/HTTPS 直链 —— 多线程分块下载。</span>
+      </div>
+
+      <div class="actions dialog-actions">
+        <button id="addClose" class="ghost"><span data-i18n="close">关闭</span></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 关于 / 使用说明（同一个弹窗，换内容） -->
+  <div id="infoOverlay" class="overlay hidden">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h3 id="infoTitle">关于 VGrab</h3>
+      </div>
+      <div id="infoBody" class="dialog-body"></div>
+      <div class="actions dialog-actions" id="infoActions">
+        <button id="infoPrimary" class="primary hidden"><span id="infoPrimaryText"></span></button>
+        <button id="infoClose" class="primary"><span data-i18n="close">关闭</span></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 另存为弹窗（浏览器 vgrab:// 入口） -->
+  <div id="saveAsOverlay" class="overlay hidden">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h3 data-i18n="saveAsTitle">另存为</h3>
+        <span id="saKind" class="chip hidden"></span>
+      </div>
+      <div id="saUrl" class="dialog-url" title=""></div>
+      <div id="saStatus" class="dim"></div>
+
+      <div id="saBody" class="dialog-body hidden">
+        <label class="fld">
+          <span data-i18n="filenameLabel">保存文件名</span>
+          <input id="saFilename" type="text" spellcheck="false" />
+        </label>
+        <label class="fld">
+          <span data-i18n="saveToLabel">保存到</span>
+          <div class="inline">
+            <input id="saDir" type="text" spellcheck="false" />
+            <button id="saPickDir" class="ghost"><span data-i18n="pickDirBtn">选择…</span></button>
+          </div>
+        </label>
+        <div class="nd-grid">
+          <label class="fld hidden" id="saQualityRow">
+            <span data-i18n="qualityLabel">清晰度</span>
+            <select id="saQuality"></select>
+          </label>
+          <label class="fld hidden" id="saThreadsRow">
+            <span data-i18n="threadsLabel">下载线程数</span>
+            <select id="saThreads"></select>
+          </label>
+        </div>
+        <div id="saDetail" class="fmt-detail dim"></div>
+      </div>
+
+      <div class="actions dialog-actions">
+        <button id="saStart" class="primary" disabled><span data-i18n="startDownload">开始下载</span></button>
+        <button id="saCancel" class="ghost"><span data-i18n="cancel">取消</span></button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

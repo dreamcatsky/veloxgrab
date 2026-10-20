@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "VGrab 桌面端默认权限（主窗口 + 独立进度窗口）",
+  "windows": ["main", "progress"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:app:default",
+    "core:webview:default",
+    "dialog:default",
+    "opener:default"
+  ]
+}

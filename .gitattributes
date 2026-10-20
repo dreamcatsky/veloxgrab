@@ -1,0 +1,21 @@
+# 统一换行：仓库内存 LF，检出时 Windows 转 CRLF。
+# 二进制文件不做任何转换。
+* text=auto eol=lf
+
+*.rs   text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.ts   text eol=lf
+*.json text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.yml  text eol=lf
+*.nsi  text eol=lf
+
+*.png  binary
+*.ico  binary
+*.icns binary
+*.exe  binary

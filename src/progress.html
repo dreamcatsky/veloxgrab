@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>VGrab 进度</title>
+<link rel="stylesheet" href="styles.css" />
+<!-- 与主窗口同一份首帧主题脚本：进度窗口也会被单独打开，不能先闪一帧深色 -->
+<script src="theme.js"></script>
+</head>
+<body class="progress-body">
+  <!-- 独立进度窗口（对齐 IDM 的「打开进度窗口」）。
+       和主窗口一样是纯前端页面，靠 Tauri 事件拿进度，不共享主窗口的 JS 全局。 -->
+  <div class="pw-head">
+    <div class="pw-title" data-i18n="pwTitle">下载进度</div>
+    <button class="pw-close" id="pwClose" title="关闭" data-i18n-title="pwClose">×</button>
+  </div>
+
+  <div class="pw-summary" id="pwSummary">暂无进行中的任务</div>
+
+  <div class="pw-list" id="pwList">
+    <div class="pw-empty" id="pwEmpty" data-i18n="pwEmpty">当前没有正在下载的任务</div>
+  </div>
+
+  <script src="progress.js"></script>
+</body>
+</html>
