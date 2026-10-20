@@ -110,10 +110,10 @@ impl HistoryEntry {
     }
 }
 
-/// 历史文件路径：`<config_dir>/VGrab/history.json`
+/// 历史文件路径：`<config_dir>/VeloxGrab/history.json`
 fn history_path() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("VGrab").join("history.json")
+    base.join("VeloxGrab").join("history.json")
 }
 
 /// 历史文件大小上限（字节）。

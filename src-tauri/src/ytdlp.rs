@@ -49,7 +49,7 @@ static YTDLP_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static FFMPEG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// yt-dlp 可执行文件的定位策略：
-/// 1. 环境变量 VGRAB_YTDLP
+/// 1. 环境变量 VELOXGRAB_YTDLP
 /// 2. Tauri 资源目录（安装版）
 /// 3. 程序目录旁的 bin/yt-dlp.exe（便携/打包分发用）
 /// 4. PATH 中的 yt-dlp
@@ -58,12 +58,12 @@ pub fn resolve_ytdlp() -> Result<PathBuf, String> {
         .get_or_init(resolve_ytdlp_uncached)
         .clone()
         .ok_or_else(|| {
-            "未找到 yt-dlp。请把 yt-dlp.exe 放到程序目录，或设置环境变量 VGRAB_YTDLP 指向它。".to_string()
+            "未找到 yt-dlp。请把 yt-dlp.exe 放到程序目录，或设置环境变量 VELOXGRAB_YTDLP 指向它。".to_string()
         })
 }
 
 fn resolve_ytdlp_uncached() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("VGRAB_YTDLP") {
+    if let Ok(p) = std::env::var("VELOXGRAB_YTDLP") {
         let pb = PathBuf::from(p);
         if pb.is_file() {
             return Some(pb);
@@ -105,7 +105,7 @@ pub fn resolve_ffmpeg() -> Option<PathBuf> {
 }
 
 fn resolve_ffmpeg_uncached() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("VGRAB_FFMPEG") {
+    if let Ok(p) = std::env::var("VELOXGRAB_FFMPEG") {
         let pb = PathBuf::from(p);
         if pb.is_file() {
             return Some(pb);

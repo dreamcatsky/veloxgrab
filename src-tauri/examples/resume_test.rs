@@ -14,7 +14,7 @@ fn main() {
     let delay_ms: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(3000);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let out_dir = std::env::temp_dir().join("vgrab_resume_test");
+    let out_dir = std::env::temp_dir().join("veloxgrab_resume_test");
     let _ = std::fs::remove_dir_all(&out_dir);
     std::fs::create_dir_all(&out_dir).unwrap();
 
@@ -35,7 +35,7 @@ fn main() {
     }
     let s1 = Arc::clone(&seen);
     let t1 = Instant::now();
-    let r1 = rt.block_on(vgrab_lib::direct::download_direct(
+    let r1 = rt.block_on(veloxgrab_lib::direct::download_direct(
         &url,
         &out_dir,
         None,
@@ -44,7 +44,7 @@ fn main() {
         move |p| {
             s1.store(p.downloaded, Ordering::Relaxed);
         },
-        &vgrab_lib::settings::NetCfg::default(),
+        &veloxgrab_lib::settings::NetCfg::default(),
     ));
     match &r1 {
         Err(e) if e.contains("已取消") => {
@@ -60,7 +60,7 @@ fn main() {
         }
     }
 
-    let part = out_dir.join("bigtest.bin.vgrab-part");
+    let part = out_dir.join("bigtest.bin.veloxgrab-part");
     let meta_before: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&part).unwrap()).unwrap();
     let done_before: u64 = meta_before["segments_done"]
@@ -76,7 +76,7 @@ fn main() {
     let first_report = Arc::new(AtomicU64::new(u64::MAX));
     let fr = Arc::clone(&first_report);
     let t2 = Instant::now();
-    let r2 = rt.block_on(vgrab_lib::direct::download_direct(
+    let r2 = rt.block_on(veloxgrab_lib::direct::download_direct(
         &url,
         &out_dir,
         None,
@@ -91,7 +91,7 @@ fn main() {
                 Ordering::Relaxed,
             );
         },
-        &vgrab_lib::settings::NetCfg::default(),
+        &veloxgrab_lib::settings::NetCfg::default(),
     ));
     let elapsed2 = t2.elapsed();
     let start_from = first_report.load(Ordering::Relaxed);
@@ -124,7 +124,7 @@ fn main() {
     }
 
     if part.exists() {
-        println!("  ❌ 完成后 .vgrab-part 未清理");
+        println!("  ❌ 完成后 .veloxgrab-part 未清理");
         ok = false;
     } else {
         println!("  ✅ 临时元数据已清理");

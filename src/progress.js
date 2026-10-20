@@ -22,7 +22,7 @@
   // 用 .then 而不是 await：外层是普通 IIFE，不是 async 函数。
   invoke("get_settings")
     .then((s) => {
-      if (window.VGrabTheme) window.VGrabTheme.apply(s.theme || "system");
+      if (window.VeloxGrabTheme) window.VeloxGrabTheme.apply(s.theme || "system");
     })
     .catch(() => {
       // 拿不到就保持 theme.js 的缓存值，不值得为配色让窗口打不开

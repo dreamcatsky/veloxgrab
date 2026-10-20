@@ -1,4 +1,4 @@
-// VGrab 扩展弹窗逻辑
+// VeloxGrab 扩展弹窗逻辑
 //
 // 打开 popup 时做三件事：
 //   1. 把当前标签页的 URL 填进输入框；
@@ -25,7 +25,7 @@ async function init() {
   $("intercept").checked = cfg.intercept !== false;
   $("intercept").onchange = () => {
     chrome.storage.sync.set({ intercept: $("intercept").checked });
-    msg($("intercept").checked ? "已开启：网页下载将转给 VGrab" : "已关闭：网页下载走浏览器");
+    msg($("intercept").checked ? "已开启：网页下载将转给 VeloxGrab" : "已关闭：网页下载走浏览器");
   };
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -85,16 +85,16 @@ async function send(url) {
   msg("发送中…");
   try {
     const res = await chrome.runtime.sendMessage({
-      type: "vgrab-send",
+      type: "veloxgrab-send",
       url: url || target,
       dir,
       threads,
     });
     if (res && res.ok) {
-      msg("已发送给 VGrab");
+      msg("已发送给 VeloxGrab");
       setTimeout(() => window.close(), 700);
     } else {
-      msg("VGrab 没有响应，请确认它正在运行（托盘图标可见）", true);
+      msg("VeloxGrab 没有响应，请确认它正在运行（托盘图标可见）", true);
     }
   } catch (e) {
     msg("发送失败：" + String(e), true);

@@ -1,26 +1,26 @@
-//! `vgrab://` 自定义协议（浏览器集成的落点）。
+//! `veloxgrab://` 自定义协议（浏览器集成的落点）。
 //!
 //! ## 为什么需要它
 //!
 //! 用户最常见的入口是「网页/邮件里看到一个下载链接，点一下就想下」。
-//! 没有协议接管时只能：复制链接 → 切到 VGrab → 粘贴 → 点开始，四步。
-//! 有了 `vgrab://` 之后，浏览器扩展只需要把当前页面/选中链接改成
-//! `vgrab://add?url=...` 再导航，剩下的由本模块完成——一步。
+//! 没有协议接管时只能：复制链接 → 切到 VeloxGrab → 粘贴 → 点开始，四步。
+//! 有了 `veloxgrab://` 之后，浏览器扩展只需要把当前页面/选中链接改成
+//! `veloxgrab://add?url=...` 再导航，剩下的由本模块完成——一步。
 //!
 //! ## 注册方式
 //!
-//! Windows 上由 NSIS 安装包写入 HKCR\vgrab（见 `lib.rs` 里的
+//! Windows 上由 NSIS 安装包写入 HKCR\veloxgrab（见 `lib.rs` 里的
 //! `ensure_protocol_registered`）。不用 `tauri_plugin_deep_link::register()`
 //! 的原因：那个 API 在某些环境下会把自身目标写成 dev 时的 exe 路径，
-//! 而安装后的路径是 `%LOCALAPPDATA%\VGrab\vgrab.exe`，写错就静默失效。
+//! 而安装后的路径是 `%LOCALAPPDATA%\VeloxGrab\veloxgrab.exe`，写错就静默失效。
 //! 自己写注册表还能顺带把「未安装时点链接」的提示做对。
 //!
 //! ## 支持的形态
 //!
 //! ```text
-//! vgrab://add?url=<http链接>&name=<文件名>&dir=<目录>&threads=<n>
-//! vgrab://add?url=<...>              # 其余全部走默认
-//! vgrab://<http链接>                 # 例如 vgrab://https://a.com/x.zip
+//! veloxgrab://add?url=<http链接>&name=<文件名>&dir=<目录>&threads=<n>
+//! veloxgrab://add?url=<...>              # 其余全部走默认
+//! veloxgrab://<http链接>                 # 例如 veloxgrab://https://a.com/x.zip
 //! ```
 //!
 //! 只接受 `http` / `https` 目标：用户从网页上复制来的东西不一定干净，
@@ -54,9 +54,9 @@ fn hide_console(mut cmd: Command) -> Command {
 pub const EXTERNAL_LINK_EVENT: &str = "external-link";
 
 /// 协议名。注册表键与 URL scheme 都用它。
-pub const SCHEME: &str = "vgrab";
+pub const SCHEME: &str = "veloxgrab";
 
-/// 从一段 `vgrab://...` 文本里解析出下载请求。
+/// 从一段 `veloxgrab://...` 文本里解析出下载请求。
 ///
 /// 解析失败一律返回 `Err` 并由调用方 toast：用户点的是网页上的按钮，
 /// 链接形态不受我们控制，安静忽略会让用户以为「没反应」而反复点击。
@@ -77,7 +77,7 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
         return Err("链接里没有下载地址".into());
     }
 
-    // 形态一：vgrab://https://example.com/file.zip
+    // 形态一：veloxgrab://https://example.com/file.zip
     // 浏览器扩展对「整个 URL 就是要下载的东西」用这种形式，省去拼 query。
     let lb = body.to_ascii_lowercase();
     if lb.starts_with("http://") || lb.starts_with("https://") {
@@ -89,12 +89,12 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
         });
     }
 
-    // 形态二：vgrab://add?url=...&name=...
-    // 只认 add 这一条路径：将来要加别的动作（例如 vgrab://settings）
+    // 形态二：veloxgrab://add?url=...&name=...
+    // 只认 add 这一条路径：将来要加别的动作（例如 veloxgrab://settings）
     // 也得走显式分支，不能让任意单词都落到「下载」上。
     //
-    // 这里必须容忍 `add/`：浏览器把手写/改造过的 vgrab:// 链接按 URL 规则
-    // 规范化时会补一个斜杠（`vgrab://add?...` → `vgrab://add/?...`），
+    // 这里必须容忍 `add/`：浏览器把手写/改造过的 veloxgrab:// 链接按 URL 规则
+    // 规范化时会补一个斜杠（`veloxgrab://add?...` → `veloxgrab://add/?...`），
     // 于是朴素 split出来的 path 变成 "add/"、直接落到下面的「不支持的动作」。
     // 这是真实踩到的坑：网页里点扩展传来的链接时 100% 命中。
     let (path, query) = match body.split_once('?') {
@@ -159,7 +159,7 @@ pub struct LinkRequest {
     pub threads: Option<usize>,
 }
 
-/// 确保 HKCR\vgrab 指向当前可执行文件。
+/// 确保 HKCR\veloxgrab 指向当前可执行文件。
 ///
 /// 由安装后的首次启动调用。写注册表需要 HKCU 写权限，安装模式是 currentUser，
 /// 不需要管理员。
@@ -179,7 +179,7 @@ pub fn ensure_protocol_registered(exe: &std::path::Path) -> Result<(), String> {
 
     // 带 %1 才是协议处理程序：浏览器传来的完整 URL 会替换这个占位符
     let command = format!("\"{}\" \"%1\"", exe.display());
-    reg_add(&key, "", "URL:VGrab Download Link")?;
+    reg_add(&key, "", "URL:VeloxGrab Download Link")?;
     reg_add(&key, "URL Protocol", "")?;
     reg_add(&format!(r"{key}\DefaultIcon"), "", &exe.display().to_string())?;
     reg_add(
@@ -204,7 +204,7 @@ fn reg_query(key: &str, value: &str) -> Result<Option<String>, String> {
     }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     // reg query 的输出形如:
-    //     (默认)    REG_SZ    "C:\path\vgrab.exe" "%1"
+    //     (默认)    REG_SZ    "C:\path\veloxgrab.exe" "%1"
     // 值可能为空（DefaultIcon 写的就是路径，不是空串），按「最后一个字段」取
     for line in text.lines() {
         if let Some((_, rest)) = line.split_once("REG_SZ") {
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn parses_add_form_with_all_fields() {
         let r = parse_deep_link(
-            "vgrab://add?url=https%3A%2F%2Fexample.com%2Fa.zip&name=%E8%A7%86%E9%A2%91.mp4&dir=D%3A%5Cdl&threads=8",
+            "veloxgrab://add?url=https%3A%2F%2Fexample.com%2Fa.zip&name=%E8%A7%86%E9%A2%91.mp4&dir=D%3A%5Cdl&threads=8",
         )
         .unwrap();
         assert_eq!(r.url, "https://example.com/a.zip");
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn parses_bare_url_form() {
-        let r = parse_deep_link("vgrab://https://a.com/x.zip").unwrap();
+        let r = parse_deep_link("veloxgrab://https://a.com/x.zip").unwrap();
         assert_eq!(r.url, "https://a.com/x.zip");
         assert!(r.filename.is_none());
         assert!(r.threads.is_none());
@@ -267,20 +267,20 @@ mod tests {
 
     #[test]
     fn bare_url_is_case_insensitive() {
-        let r = parse_deep_link("VGRAB://HTTPS://A.COM/x.zip").unwrap();
+        let r = parse_deep_link("VELOXGRAB://HTTPS://A.COM/x.zip").unwrap();
         assert_eq!(r.url, "HTTPS://A.COM/x.zip");
     }
 
     #[test]
     fn threads_are_clamped() {
         // 上限跟 direct::MAX_THREADS 一致（64）：扩展传 9999 要被钳住
-        let r = parse_deep_link("vgrab://add?url=https://a.com/x&threads=9999").unwrap();
+        let r = parse_deep_link("veloxgrab://add?url=https://a.com/x&threads=9999").unwrap();
         assert_eq!(r.threads, Some(64));
     }
 
     #[test]
     fn empty_optional_fields_become_none() {
-        let r = parse_deep_link("vgrab://add?url=https://a.com/x&name=&dir=&threads=abc").unwrap();
+        let r = parse_deep_link("veloxgrab://add?url=https://a.com/x&name=&dir=&threads=abc").unwrap();
         assert!(r.filename.is_none());
         assert!(r.save_dir.is_none());
         assert!(r.threads.is_none());
@@ -289,27 +289,27 @@ mod tests {
     #[test]
     fn rejects_non_http_targets() {
         // file:// 与 javascript: 必须挡住
-        assert!(parse_deep_link("vgrab://add?url=file:///C:/Windows/x.exe").is_err());
-        assert!(parse_deep_link("vgrab://add?url=javascript:alert(1)").is_err());
+        assert!(parse_deep_link("veloxgrab://add?url=file:///C:/Windows/x.exe").is_err());
+        assert!(parse_deep_link("veloxgrab://add?url=javascript:alert(1)").is_err());
     }
 
     #[test]
     fn rejects_foreign_scheme_and_missing_url() {
         assert!(parse_deep_link("http://example.com").is_err());
-        assert!(parse_deep_link("vgrab://").is_err());
-        assert!(parse_deep_link("vgrab://add?name=x.mp4").is_err());
+        assert!(parse_deep_link("veloxgrab://").is_err());
+        assert!(parse_deep_link("veloxgrab://add?name=x.mp4").is_err());
     }
 
     #[test]
     fn rejects_unknown_action() {
-        let e = parse_deep_link("vgrab://settings?url=https://a.com/x").unwrap_err();
+        let e = parse_deep_link("veloxgrab://settings?url=https://a.com/x").unwrap_err();
         assert!(e.contains("不支持的动作"), "实际错误: {e}");
     }
 
     #[test]
     fn tolerates_trailing_slash_after_action() {
-        // 浏览器按 URL 规则规范化 vgrab://add?... 时会补slash，path 变成 add/
-        let r = parse_deep_link("vgrab://add/?url=https%3A%2F%2Fa.com%2Ff.zip&threads=4").unwrap();
+        // 浏览器按 URL 规则规范化 veloxgrab://add?... 时会补slash，path 变成 add/
+        let r = parse_deep_link("veloxgrab://add/?url=https%3A%2F%2Fa.com%2Ff.zip&threads=4").unwrap();
         assert_eq!(r.url, "https://a.com/f.zip");
         assert_eq!(r.threads, Some(4));
     }
@@ -317,15 +317,15 @@ mod tests {
     #[test]
     fn tolerates_url_containing_query_and_ampersand() {
         // 目标 URL 自带 query 时不能把 &id=2 当成外层参数
-        let r = parse_deep_link("vgrab://add?url=https%3A%2F%2Fa.com%2Ff%3Fid%3D2%26x%3D1").unwrap();
+        let r = parse_deep_link("veloxgrab://add?url=https%3A%2F%2Fa.com%2Ff%3Fid%3D2%26x%3D1").unwrap();
         assert_eq!(r.url, "https://a.com/f?id=2&x=1");
     }
 
     #[test]
     fn normalize_path_ignores_case_and_slashes() {
         assert_eq!(
-            normalize_path("\"C:\\Users\\A\\vgrab.exe\""),
-            normalize_path("c:/users/a/vgrab.exe")
+            normalize_path("\"C:\\Users\\A\\veloxgrab.exe\""),
+            normalize_path("c:/users/a/veloxgrab.exe")
         );
     }
 
@@ -336,14 +336,14 @@ mod tests {
     fn registry_style_argv_is_accepted() {
         // 模拟 reg_add 里写的 `"<exe>" "%1"`：链接带引号
         let argv = vec![
-            r"C:\Users\me\AppData\Local\VGrab\vgrab.exe".to_string(),
-            r#""vgrab://add?url=https%3A%2F%2Fexample.com%2Fa.zip&threads=8""#.to_string(),
+            r"C:\Users\me\AppData\Local\VeloxGrab\veloxgrab.exe".to_string(),
+            r#""veloxgrab://add?url=https%3A%2F%2Fexample.com%2Fa.zip&threads=8""#.to_string(),
         ];
         let link = argv
             .into_iter()
             .skip(1)
             .map(|a| a.trim().trim_matches('"').to_string())
-            .find(|a| a.to_ascii_lowercase().starts_with("vgrab://"))
+            .find(|a| a.to_ascii_lowercase().starts_with("veloxgrab://"))
             .expect("应该找到链接");
         let r = parse_deep_link(&link).unwrap();
         assert_eq!(r.url, "https://example.com/a.zip");
@@ -353,11 +353,11 @@ mod tests {
     #[test]
     fn argv_without_link_is_ignored() {
         // 用户正常双击图标启动时 argv 里没有链接，不能误触发
-        let argv = vec!["vgrab.exe".to_string()];
+        let argv = vec!["veloxgrab.exe".to_string()];
         let found = argv
             .into_iter()
             .skip(1)
-            .find(|a| a.to_ascii_lowercase().starts_with("vgrab://"));
+            .find(|a| a.to_ascii_lowercase().starts_with("veloxgrab://"));
         assert!(found.is_none());
     }
 }

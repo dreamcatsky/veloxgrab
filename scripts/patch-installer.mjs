@@ -18,7 +18,7 @@
  *   - 把 Section Install 里 extension\* 的 File 行搬进 SEC_EXT（只搬 File，Delete 留在卸载段）
  *   - 插入 MUI_PAGE_COMPONENTS（静默安装 SkipIfPassive 自动跳过）
  *   - 写 SimpChinese/English 的 SEC_EXT_DESC 语言串
- *   - SEC_EXT 选中时写 $INSTDIR\extension-installed.flag，供 VGrab 首启弹窗判断
+ *   - SEC_EXT 选中时写 $INSTDIR\extension-installed.flag，供 VeloxGrab 首启弹窗判断
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -103,7 +103,7 @@ function patchOne(nsiPath) {
   //     在 .onInit 用 ${GetOptions} $CMDLINE "/P" 解的，而 `/S` 不带 `/P`，
   //     实测一直是 0。
   //
-  // 最终做法：自己在 .onInit 里解 `/S` 写进 `$VgrabSilent`，Section 里判它。
+  // 最终做法：自己在 .onInit 里解 `/S` 写进 `$VeloxgrabSilent`，Section 里判它。
   // ${GetOptions} 找不到开关会把 Errors flag 置位但不改目标变量，所以先清零。
   //
   // flag 文件仍在写：只有 GUI 安装且用户勾了扩展才会有，`extension_installed()`
@@ -111,8 +111,8 @@ function patchOne(nsiPath) {
   const secExt =
 `; ---- 以下为 patch-installer.mjs 注入：可选「浏览器扩展」组件 ----
 Section /o "浏览器扩展" SEC_EXT
-  ; 静默安装不装扩展。/o 只影响 GUI 初始勾选，这里靠 $VgrabSilent 兜底。
-  \${If} $VgrabSilent = 1
+  ; 静默安装不装扩展。/o 只影响 GUI 初始勾选，这里靠 $VeloxgrabSilent 兜底。
+  \${If} $VeloxgrabSilent = 1
     Return
   \${EndIf}
   ; File 的 /oname 带子目录（extension\\xxx）时，目标目录必须已存在，
@@ -121,7 +121,7 @@ Section /o "浏览器扩展" SEC_EXT
   SetOutPath $INSTDIR
   CreateDirectory "$INSTDIR\\extension"
 ${movedBlock}
-  ; 给 VGrab 首启弹窗用的标记：用户勾了扩展
+  ; 给 VeloxGrab 首启弹窗用的标记：用户勾了扩展
   ; 寄存器必须用 $R0 —— File 指令内部会把 $0 当临时寄存器覆盖，
   ; 用 $0 的话 FileOpen 拿到的是被覆盖后的值，写不出来，而 ClearErrors
   ; 把错误吞了，表现为「文件装了但 flag 没有」。
@@ -147,19 +147,19 @@ SectionEnd
   ; /S 是 NSIS 的静默开关。GetOptions 失败会置 Errors 但不动目标变量，
   ; 所以每次都先 ClearErrors。
   ClearErrors
-  \${GetOptions} $CMDLINE "/S" $VgrabSilent
+  \${GetOptions} $CMDLINE "/S" $VeloxgrabSilent
   \${IfNot} \${Errors}
-    StrCpy $VgrabSilent 1
+    StrCpy $VeloxgrabSilent 1
   \${EndIf}
   ; ---- 注入结束 ----
 
   \${GetOptions} $CMDLINE "/P" $PassiveMode`
   );
 
-  // $VgrabSilent 声明成 Var
+  // $VeloxgrabSilent 声明成 Var
   nsi = nsi.replace(
     /(^|\r?\n)Var PassiveMode(\r?\n|$)/,
-    "$1Var PassiveMode$2Var VgrabSilent$2"
+    "$1Var PassiveMode$2Var VeloxgrabSilent$2"
   );
   // 插到 "Section WebView2" 前面
   const anchor = "Section WebView2";
@@ -233,7 +233,7 @@ const versionMatch = /^!define VERSION "([^"]+)"/m.exec(
   fs.readFileSync(path.join(dirs[0], "installer.nsi"), "utf8")
 );
 const version = versionMatch ? versionMatch[1] : "0.1.0";
-const outputExe = path.join(bundleDir, `VGrab_${version}_x64-setup.exe`);
+const outputExe = path.join(bundleDir, `VeloxGrab_${version}_x64-setup.exe`);
 
 let patched = 0;
 for (const d of dirs) {

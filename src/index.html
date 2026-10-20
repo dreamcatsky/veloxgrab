@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>VGrab</title>
+<title>VeloxGrab</title>
 <link rel="stylesheet" href="styles.css" />
 <!-- 主题必须在首帧前落定，所以是 <head> 里的同步脚本，不 defer -->
 <script src="theme.js"></script>
@@ -58,7 +58,7 @@
         <button class="menu-item" data-cmd="usage"><span data-i18n="miUsage">使用说明</span></button>
         <button class="menu-item" data-cmd="setupExt"><span data-i18n="miSetupExt">启用浏览器扩展…</span></button>
         <div class="menu-sep"></div>
-        <button class="menu-item" data-cmd="about"><span data-i18n="miAbout">关于 VGrab</span></button>
+        <button class="menu-item" data-cmd="about"><span data-i18n="miAbout">关于 VeloxGrab</span></button>
       </div>
     </div>
 
@@ -266,7 +266,7 @@
 
           <label class="fld checkbox">
             <input id="setPopupSaveAs" type="checkbox" />
-            <span><span data-i18n="popupSaveAs">浏览器 vgrab:// 下载先弹出「另存为」</span> <em class="dim" data-i18n="popupSaveAsHint">(关掉则直接存入默认目录)</em></span>
+            <span><span data-i18n="popupSaveAs">浏览器 veloxgrab:// 下载先弹出「另存为」</span> <em class="dim" data-i18n="popupSaveAsHint">(关掉则直接存入默认目录)</em></span>
           </label>
 
           <label class="fld checkbox">
@@ -286,7 +286,7 @@
 
           <label class="fld checkbox">
             <input id="setAutostart" type="checkbox" />
-            <span><span data-i18n="autostart">开机自动启动 VGrab</span> <em class="dim" data-i18n="autostartHint">(保存时写入注册表 Run 键)</em></span>
+            <span><span data-i18n="autostart">开机自动启动 VeloxGrab</span> <em class="dim" data-i18n="autostartHint">(保存时写入注册表 Run 键)</em></span>
           </label>
 
           <label class="fld checkbox">
@@ -356,9 +356,9 @@
             <span data-i18n="browserInt">浏览器集成</span>
             <div class="inline">
               <button id="openExtDir" class="ghost"><span data-i18n="openExtDir">打开扩展目录</span></button>
-              <span class="dim" data-i18n="browserIntHint">把里面的 vgrab-extension 文件夹加载到 Chrome / Edge 扩展页面即可</span>
+              <span class="dim" data-i18n="browserIntHint">把里面的 veloxgrab-extension 文件夹加载到 Chrome / Edge 扩展页面即可</span>
             </div>
-            <small class="dim" data-i18n="browserIntHint2">装好后在网页上右键 → 「用 VGrab 下载」即可把链接发给本程序（走 vgrab:// 协议）。</small>
+            <small class="dim" data-i18n="browserIntHint2">装好后在网页上右键 → 「用 VeloxGrab 下载」即可把链接发给本程序（走 veloxgrab:// 协议）。</small>
           </div>
 
           <label class="fld">
@@ -402,7 +402,7 @@
   </footer>
 
   <!-- 添加 URL（原来的「下载页」整块搬进来当弹窗）。
-       TDM Fast 里添加链接是弹窗，主界面留给列表；VGrab 原来把它当一整个页签，
+       TDM Fast 里添加链接是弹窗，主界面留给列表；VeloxGrab 原来把它当一整个页签，
        和新的「侧边栏 + 中框列表」结构冲突，所以改成弹窗。 -->
   <div id="addOverlay" class="overlay hidden">
     <div class="dialog dialog-wide">
@@ -521,7 +521,7 @@
   <div id="infoOverlay" class="overlay hidden">
     <div class="dialog">
       <div class="dialog-head">
-        <h3 id="infoTitle">关于 VGrab</h3>
+        <h3 id="infoTitle">关于 VeloxGrab</h3>
       </div>
       <div id="infoBody" class="dialog-body"></div>
       <div class="actions dialog-actions" id="infoActions">
@@ -531,7 +531,7 @@
     </div>
   </div>
 
-  <!-- 另存为弹窗（浏览器 vgrab:// 入口） -->
+  <!-- 另存为弹窗（浏览器 veloxgrab:// 入口） -->
   <div id="saveAsOverlay" class="overlay hidden">
     <div class="dialog">
       <div class="dialog-head">

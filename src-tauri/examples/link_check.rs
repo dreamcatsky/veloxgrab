@@ -1,4 +1,4 @@
-// 解析一批 vgrab:// 链接并打印结果。
+// 解析一批 veloxgrab:// 链接并打印结果。
 // 运行: cargo run --example link_check -- <cases.txt>
 // 每行一条链接。用途：改动 deeplink.rs 后确认各种浏览器形态都能正确解析。
 
@@ -23,7 +23,7 @@ fn main() {
         if link.is_empty() {
             continue;
         }
-        match vgrab_lib::deeplink::parse_deep_link(link) {
+        match veloxgrab_lib::deeplink::parse_deep_link(link) {
             Ok(r) => {
                 println!("OK   {link}");
                 println!(

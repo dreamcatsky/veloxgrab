@@ -1,11 +1,11 @@
 [package]
-name = "vgrab"
-version = "1.0.0"
+name = "veloxgrab"
+version = "1.1.0"
 description = "Video downloader built on yt-dlp"
 authors = ["dreamcatsky"]
 license = "MIT"
-repository = "https://github.com/dreamcatsky/vgrab"
-homepage = "https://github.com/dreamcatsky/vgrab"
+repository = "https://github.com/dreamcatsky/veloxgrab"
+homepage = "https://github.com/dreamcatsky/veloxgrab"
 readme = "../README.md"
 keywords = ["download", "yt-dlp", "tauri", "video", "downloader"]
 categories = ["multimedia::video", "download"]
@@ -13,7 +13,7 @@ edition = "2021"
 rust-version = "1.77"
 
 [lib]
-name = "vgrab_lib"
+name = "veloxgrab_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -49,7 +49,7 @@ windows-sys = { version = "0.52", features = [
 
 # 发布构建：LTO + 单 codegen unit 换更好的内联与更小的二进制。
 # 不设 panic = "abort"：SlotGuard 依赖 Drop 归还并发槽位，abort 会让它在 panic 时失效。
-# 协议关联（vgrab://）走自写的注册表逻辑（deeplink.rs），不引入 deep-link 插件：
+# 协议关联（veloxgrab://）走自写的注册表逻辑（deeplink.rs），不引入 deep-link 插件：
 # 那个插件在某些环境下会把自身目标写成 dev 期 exe 路径，安装后静默失效。
 [profile.release]
 lto = true

@@ -43,7 +43,7 @@ pub enum TaskState {
     /// 用户主动暂停。
     ///
     /// 与 `Canceled` 的区别是「能不能接着跑」：取消是终态，任务再也回不来；
-    /// 暂停保留断点（直链的 `.vgrab-part` / yt-dlp 的 `.part`），恢复时从原位置续传。
+    /// 暂停保留断点（直链的 `.veloxgrab-part` / yt-dlp 的 `.part`），恢复时从原位置续传。
     /// 所以它**不能**算终态——否则「清除已结束」会把用户刚暂停的任务一起扫掉，
     /// 而且队列泵会把它当成已死任务跳过。
     Paused,
@@ -325,10 +325,10 @@ fn parse_size(token: &str) -> Option<u64> {
 }
 
 /// yt-dlp 的临时目录（`.part` / 分片 / 合并中间文件）：
-/// `<下载目录>/.vgrab-tmp/<format_id>-<url 哈希>`。
+/// `<下载目录>/.veloxgrab-tmp/<format_id>-<url 哈希>`。
 fn temp_dir_for(dir: &std::path::Path, task: &Task) -> std::path::PathBuf {
     let fmt_key = crate::util::sanitize_filename(&task.format_id.replace('+', "_"));
-    dir.join(".vgrab-tmp")
+    dir.join(".veloxgrab-tmp")
         .join(format!("{}-{}", fmt_key, crate::util::short_hash(&task.url)))
 }
 
@@ -347,8 +347,8 @@ pub fn cleanup_task_artifacts(dir: &std::path::Path, task: &Task) {
 /// `cleanup_task_artifacts` 只在用户手动「移除任务」时触发，但下面这些情况
 /// 根本不会产生「移除」动作，产物就永久留在下载目录里：
 ///
-/// - 下载中被取消、进程崩溃、直接关程序 → `<name>.vgrab-downloading` + `.vgrab-part`
-/// - yt-dlp 把成品移走后 → 空的 `.vgrab-tmp/<format_id>-<hash>/` 目录
+/// - 下载中被取消、进程崩溃、直接关程序 → `<name>.veloxgrab-downloading` + `.veloxgrab-part`
+/// - yt-dlp 把成品移走后 → 空的 `.veloxgrab-tmp/<format_id>-<hash>/` 目录
 /// - 任务失败后用户没点移除就关了窗口
 ///
 /// 只删超过 `max_age` 的，避免误伤另一个实例正在写的文件（单实例插件已经防了
@@ -374,18 +374,18 @@ pub fn cleanup_stale_artifacts(dir: &std::path::Path, max_age: std::time::Durati
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_partial = name.ends_with(".vgrab-downloading")
-                || name.ends_with(".vgrab-part")
-                || name.ends_with(".vgrab-part.tmp");
+            let is_partial = name.ends_with(".veloxgrab-downloading")
+                || name.ends_with(".veloxgrab-part")
+                || name.ends_with(".veloxgrab-part.tmp");
             if is_partial && is_stale(&path) {
                 let _ = std::fs::remove_file(&path);
             }
         }
     }
 
-    // 2) `.vgrab-tmp` 下的子目录：空目录，或内容全部陈旧，就整个删掉。
+    // 2) `.veloxgrab-tmp` 下的子目录：空目录，或内容全部陈旧，就整个删掉。
     //    正在下载的目录里必然有活跃的 `.part`，mtime 是新的，不会被误删。
-    let tmp_root = dir.join(".vgrab-tmp");
+    let tmp_root = dir.join(".veloxgrab-tmp");
     if let Ok(rd) = std::fs::read_dir(&tmp_root) {
         for entry in rd.flatten() {
             let path = entry.path();
@@ -401,7 +401,7 @@ pub fn cleanup_stale_artifacts(dir: &std::path::Path, max_age: std::time::Durati
             }
         }
     }
-    // 顺手把已经空掉的 `.vgrab-tmp` 本身删掉（非空时 remove_dir 会失败，无副作用）
+    // 顺手把已经空掉的 `.veloxgrab-tmp` 本身删掉（非空时 remove_dir 会失败，无副作用）
     let _ = std::fs::remove_dir(&tmp_root);
 }
 
@@ -426,8 +426,8 @@ fn find_recent_output(dir: &std::path::Path, title: &str) -> Option<String> {
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.starts_with(&stem)
             || name.ends_with(".part")
-            || name.ends_with(".vgrab-part")
-            || name.ends_with(".vgrab-downloading")
+            || name.ends_with(".veloxgrab-part")
+            || name.ends_with(".veloxgrab-downloading")
         {
             continue;
         }
@@ -1270,26 +1270,26 @@ mod tests {
 
     #[test]
     fn cleanup_removes_stale_artifacts_only() {
-        let root = std::env::temp_dir().join(format!("vgrab_cleanup_{}", crate::util::short_hash(
+        let root = std::env::temp_dir().join(format!("veloxgrab_cleanup_{}", crate::util::short_hash(
             &format!("{:?}", std::time::SystemTime::now())
         )));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
         // 半成品：三个都算陈旧
-        let stale_dl = root.join("movie.mp4.vgrab-downloading");
-        let stale_part = root.join("movie.mp4.vgrab-part");
-        let stale_ptmp = root.join("movie.mp4.vgrab-part.tmp");
+        let stale_dl = root.join("movie.mp4.veloxgrab-downloading");
+        let stale_part = root.join("movie.mp4.veloxgrab-part");
+        let stale_ptmp = root.join("movie.mp4.veloxgrab-part.tmp");
         // 陈旧但正常的成品文件，绝不能删
         let real_file = root.join("movie.mp4");
-        // 名字里带 vgrab 但不是我们的后缀，也不能删
-        let lookalike = root.join("notes.vgrab-downloading.bak");
+        // 名字里带 veloxgrab 但不是我们的后缀，也不能删
+        let lookalike = root.join("notes.veloxgrab-downloading.bak");
         for p in [&stale_dl, &stale_part, &stale_ptmp, &real_file, &lookalike] {
             std::fs::write(p, b"x").unwrap();
         }
 
         // 临时目录：一个空的、一个有陈旧内容的、一个带新鲜内容的
-        let tmp_root = root.join(".vgrab-tmp");
+        let tmp_root = root.join(".veloxgrab-tmp");
         let empty_dir = tmp_root.join("137-aaaaaaaa");
         let stale_dir = tmp_root.join("140-bbbbbbbb");
         let fresh_dir = tmp_root.join("22-cccccccc");

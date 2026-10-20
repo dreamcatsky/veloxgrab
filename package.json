@@ -1,7 +1,7 @@
 {
-  "name": "vgrab",
+  "name": "veloxgrab",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Video downloader built on yt-dlp",
   "scripts": {
     "tauri": "tauri",

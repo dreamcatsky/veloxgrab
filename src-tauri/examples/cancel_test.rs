@@ -20,7 +20,7 @@ fn main() {
     let threads: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let out_dir = std::env::temp_dir().join("vgrab_cancel_test");
+    let out_dir = std::env::temp_dir().join("veloxgrab_cancel_test");
     let _ = std::fs::remove_dir_all(&out_dir);
     std::fs::create_dir_all(&out_dir).unwrap();
     println!("========== 取消测试 ==========");
@@ -44,7 +44,7 @@ fn main() {
     });
 
     let started = Instant::now();
-    let result = rt.block_on(vgrab_lib::direct::download_direct(
+    let result = rt.block_on(veloxgrab_lib::direct::download_direct(
         &url,
         &out_dir,
         None,
@@ -55,7 +55,7 @@ fn main() {
                 *g = p.downloaded;
             }
         },
-        &vgrab_lib::settings::NetCfg::default(),
+        &veloxgrab_lib::settings::NetCfg::default(),
     ));
     let elapsed = started.elapsed();
     // 取消已经触发过了，这个句柄没别的用途；显式 drop 而不是 `let _ =`，
@@ -89,7 +89,7 @@ fn main() {
         }
     }
 
-    let part = out_dir.join("bigtest.bin.vgrab-part");
+    let part = out_dir.join("bigtest.bin.veloxgrab-part");
     if part.exists() {
         let text = std::fs::read_to_string(&part).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();

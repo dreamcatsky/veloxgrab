@@ -31,7 +31,7 @@ pub struct Settings {
     pub hf_token: String,
     /// 嗅探到视频时弹出清晰度选择（否则自动最高画质）
     pub popup_quality: bool,
-    /// 浏览器 vgrab:// 链接先弹「另存为」（目录/文件名/线程 → 开始下载/取消）；
+    /// 浏览器 veloxgrab:// 链接先弹「另存为」（目录/文件名/线程 → 开始下载/取消）；
     /// 关掉则静默存入默认目录
     pub popup_save_as: bool,
     /// 全局限速 KB/s，0 = 不限
@@ -60,7 +60,7 @@ impl Default for Settings {
     fn default() -> Self {
         let dir = dirs::download_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("VGrab")
+            .join("VeloxGrab")
             .to_string_lossy()
             .to_string();
         Self {
@@ -94,7 +94,7 @@ impl Default for Settings {
 
 fn settings_path() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("VGrab").join("settings.json")
+    base.join("VeloxGrab").join("settings.json")
 }
 
 pub fn load_settings(state: &AppState) -> Settings {
@@ -186,12 +186,12 @@ pub fn apply_autostart(enable: bool) -> Result<(), String> {
         let status = if enable {
             let cmd = format!("\"{}\"", exe.display());
             Command::new("reg")
-                .args(["add", key, "/v", "VGrab", "/d", &cmd, "/f"])
+                .args(["add", key, "/v", "VeloxGrab", "/d", &cmd, "/f"])
                 .creation_flags(0x0800_0000)
                 .status()
         } else {
             Command::new("reg")
-                .args(["delete", key, "/v", "VGrab", "/f"])
+                .args(["delete", key, "/v", "VeloxGrab", "/f"])
                 .creation_flags(0x0800_0000)
                 .status()
         }
@@ -206,7 +206,7 @@ pub fn apply_autostart(enable: bool) -> Result<(), String> {
 }
 
 /// 出厂默认设置，供前端「恢复默认」按钮取用（不落盘，用户点保存才写）。
-/// 下载目录例外：默认值是「系统下载目录/VGrab」，不能像 serde::default 那样
+/// 下载目录例外：默认值是「系统下载目录/VeloxGrab」，不能像 serde::default 那样
 /// 固化成 "."，否则恢复默认会把用户导到程序目录里去。
 #[tauri::command]
 pub fn default_settings() -> Settings {
@@ -215,11 +215,11 @@ pub fn default_settings() -> Settings {
     s
 }
 
-/// 默认下载目录：系统「下载」文件夹下的 VGrab，拿不到时退回当前目录。
+/// 默认下载目录：系统「下载」文件夹下的 VeloxGrab，拿不到时退回当前目录。
 pub(crate) fn default_download_dir() -> String {
     dirs::download_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("VGrab")
+        .join("VeloxGrab")
         .to_string_lossy()
         .to_string()
 }

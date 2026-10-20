@@ -1,4 +1,4 @@
-// VGrab 前端逻辑
+// VeloxGrab 前端逻辑
 // 注意：这里不 import任何打包器，直接用全局 window.__TAURI__（Tauri 2 的 withGlobalTauri 行为）
 (function () {
   "use strict";
@@ -11,7 +11,7 @@
     // 浅色主题下对比度不够，看不清。
     document.body.innerHTML =
       '<div style="padding:40px;font-family:sans-serif;color:var(--err)">' +
-      "无法连接 Tauri 运行时。请通过 VGrab 桌面程序启动，而不是用浏览器打开本页面。</div>";
+      "无法连接 Tauri 运行时。请通过 VeloxGrab 桌面程序启动，而不是用浏览器打开本页面。</div>";
     return;
   }
 
@@ -86,8 +86,8 @@
   // 错误主题。所以先用 localStorage 的缓存值上色（可能旧一帧但绝不闪），
   // 等真值到了再纠正。二者一致时这个纠正完全看不出来。
   function applyTheme(theme) {
-    if (!window.VGrabTheme) return;
-    window.VGrabTheme.apply(theme);
+    if (!window.VeloxGrabTheme) return;
+    window.VeloxGrabTheme.apply(theme);
   }
 
   let toastTimer = null;
@@ -188,7 +188,7 @@
     hfTokenHint: "(optional, hf_xxx)",
     rateLimit: "Global speed limit",
     rateLimitHint: "(KB/s, 0 = off)",
-    popupSaveAs: 'Browser vgrab:// downloads ask "Save as" first',
+    popupSaveAs: 'Browser veloxgrab:// downloads ask "Save as" first',
     popupSaveAsHint: "(off: save straight to the default folder)",
     popupQuality: "Video sites: popup quality chooser",
     popupQualityHint: "(off: auto best quality)",
@@ -214,8 +214,8 @@
     proxyHint: "SOCKS5 uses socks5h (remote DNS); works with v2rayN port 10808",
     browserInt: "Browser integration",
     openExtDir: "Open extension folder",
-    browserIntHint: "Load the vgrab-extension folder there into Chrome / Edge extensions",
-    browserIntHint2: 'Then right-click a page → "Download with VGrab" sends the link to this app (vgrab:// protocol).',
+    browserIntHint: "Load the veloxgrab-extension folder there into Chrome / Edge extensions",
+    browserIntHint2: 'Then right-click a page → "Download with VeloxGrab" sends the link to this app (veloxgrab:// protocol).',
     language: "Language",
     theme: "Appearance",
     themeHint: "(dark / light / follow system — applies immediately)",
@@ -248,7 +248,7 @@
     miProgress: "Open progress window",
     miUsage: "How to use",
     miSetupExt: "Enable browser extension…",
-    miAbout: "About VGrab",
+    miAbout: "About VeloxGrab",
     selectAll: "All",
     paused: "Paused",
   };
@@ -1283,7 +1283,7 @@
            <p><b>批量操作</b>：勾选行首复选框后，用工具栏或「下载」菜单里的
               恢复 / 暂停 / 删除；Ctrl+A 全选，Del 删除。</p>
            <p><b>浏览器集成</b>：菜单「帮助 → 启用浏览器扩展」会把扩展目录和
-              edge://extensions 一起给你，加载一次后网页点下载就会自动转给 VGrab。</p>
+              edge://extensions 一起给你，加载一次后网页点下载就会自动转给 VeloxGrab。</p>
            <p><b>暂停与恢复</b>：暂停保留断点，点「继续」从原位置接着下；
               「取消」才会真正放弃。</p>`
         );
@@ -1300,7 +1300,7 @@
         if (active) {
           showInfo(
             "浏览器扩展已在运行",
-            `<p>扩展已经加载并在工作：网页点下载会自动转给 VGrab。</p>
+            `<p>扩展已经加载并在工作：网页点下载会自动转给 VeloxGrab。</p>
              <p class="dim">如果没生效，检查扩展弹窗里「接管浏览器下载」是否被关掉了。</p>`
           );
           break;
@@ -1332,12 +1332,12 @@
           // 拿不到版本号不影响「关于」本身，留空即可
         }
         showInfo(
-          "关于 VGrab",
-          `<p><b>VGrab</b> ${ver ? "v" + ver : ""}</p>
+          "关于 VeloxGrab",
+          `<p><b>VeloxGrab</b> ${ver ? "v" + ver : ""}</p>
            <p>基于 Rust + Tauri 的下载器，任务调度与断点续传自研，
               视频解析使用 yt-dlp，音视频合并使用 ffmpeg。</p>
            <p class="dim">支持 HTTP/HTTPS 直链多线程分块下载、视频站点自动解析、
-              代理与限速、浏览器 vgrab:// 协议集成。</p>`
+              代理与限速、浏览器 veloxgrab:// 协议集成。</p>`
         );
         break;
       }
@@ -1584,7 +1584,7 @@
   }
 
   // ---------- 外部链接（浏览器集成的落点） ----------
-  // 用户在网页/邮件里点了 vgrab:// 链接时，Rust 侧（deeplink.rs）把解析结果
+  // 用户在网页/邮件里点了 veloxgrab:// 链接时，Rust 侧（deeplink.rs）把解析结果
   // 放进待取队列，再发一个**空载荷**的唤醒事件。
   //
   // 为什么不直接用事件载荷：webview 还没执行 JS 时 emit 会被静默丢弃，
@@ -1940,7 +1940,7 @@
          <li>点「加载解压缩的扩展」，选中下面这个目录</li>
        </ol>
        ${dirLine}
-       <p style="margin:8px 0 0" class="dim">加载成功后扩展列表里会出现「VGrab Downloader」，工具栏上也有图标。之后网页点下载就会自动转给 VGrab，不用再管。</p>`,
+       <p style="margin:8px 0 0" class="dim">加载成功后扩展列表里会出现「VeloxGrab Downloader」，工具栏上也有图标。之后网页点下载就会自动转给 VeloxGrab，不用再管。</p>`,
       {
         text: `打开 ${pageName}`,
         onClick: () => {
@@ -1987,7 +1987,7 @@
       // 首次启动就把问题说清楚。提示条在「添加 URL」弹窗里，
       // 不自动弹出会把问题藏起来，所以先展开弹窗让用户看到。
       showError(
-        "缺少 yt-dlp。\n把 yt-dlp.exe 放到本程序所在目录，或设置环境变量 VGRAB_YTDLP 指向它，然后重启。"
+        "缺少 yt-dlp。\n把 yt-dlp.exe 放到本程序所在目录，或设置环境变量 VELOXGRAB_YTDLP 指向它，然后重启。"
       );
       openAddUrl();
     }

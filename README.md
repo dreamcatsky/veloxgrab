@@ -1,6 +1,7 @@
-# VGrab
+# VeloxGrab
 
 一个基于 **yt-dlp** 的桌面视频下载器 + 通用多线程 HTTP 下载器，用 Tauri 2 + Rust 构建。
+（别名 VeloGrab——两个拼写都指本项目；本项目曾用名 VGrab。）
 
 > 本项目是一个独立的开源实现，仅通过调用 yt-dlp 的公共命令行接口工作。
 > 请遵守目标网站的服务条款与著作权法律，仅下载你有权获取的内容。
@@ -21,14 +22,14 @@
   主题在首帧之前就落定，切换系统配色时不会闪一下（见下方「主题为什么不闪」）
 - **设置持久化** —— 下载目录、并发数、分片数、Cookie 来源、合并策略
 - **单实例运行** —— 重复启动会把已有窗口拉到前台
-- **浏览器集成** —— `vgrab://` 协议 + Chrome/Edge 扩展，网页里点一下链接就能下载
+- **浏览器集成** —— `veloxgrab://` 协议 + Chrome/Edge 扩展，网页里点一下链接就能下载
   （见下方「浏览器集成」）
 
 ### 通用直链（走内置 HTTP 引擎，不依赖 yt-dlp）
 
 - **自动分流** —— 同一个输入框：识别为媒体站走 yt-dlp，其余按 HTTP 直链处理
 - **多线程分块** —— 用 `Range` 请求把文件切成 N 段并行拉取，1/2/4/8/16 线程可选
-- **断点续传** —— 每段已写偏移周期性落盘到 `<文件名>.vgrab-part`；
+- **断点续传** —— 每段已写偏移周期性落盘到 `<文件名>.veloxgrab-part`；
   即使进程被强杀，下次启动也能从断点继续
 - **不支持 Range 自动降级** —— 服务端若忽略 `Range` 头，自动退回单流顺序下载
 - **体积/类型探测** —— 显示文件大小、MIME 类型，可自定义保存文件名
@@ -53,17 +54,17 @@
 | `ffmpeg.exe` | 音视频合并/转码（可选但强烈建议） | <https://ffmpeg.org/download.html> |
 
 **关于打包**：`yt-dlp.exe` 会作为 Tauri 资源随安装包一起分发，安装后位于
-`%LOCALAPPDATA%\VGrab\bin\yt-dlp.exe`。`ffmpeg.exe` 默认不打包（体积较大），
-请自行安装到 PATH，或放到程序目录 / 设置环境变量 `VGRAB_FFMPEG`。
+`%LOCALAPPDATA%\VeloxGrab\bin\yt-dlp.exe`。`ffmpeg.exe` 默认不打包（体积较大），
+请自行安装到 PATH，或放到程序目录 / 设置环境变量 `VELOXGRAB_FFMPEG`。
 
 查找顺序（yt-dlp）：
 
-1. 环境变量 `VGRAB_YTDLP` 指向的文件
+1. 环境变量 `VELOXGRAB_YTDLP` 指向的文件
 2. Tauri 资源目录下的 `bin/yt-dlp.exe` 或 `yt-dlp.exe`（安装版走这条）
 3. 程序所在目录的 `yt-dlp.exe` 或 `bin/yt-dlp.exe`
 4. `PATH` 中的 `yt-dlp`
 
-ffmpeg 同理，环境变量为 `VGRAB_FFMPEG`。
+ffmpeg 同理，环境变量为 `VELOXGRAB_FFMPEG`。
 
 > 若缺少依赖，程序启动时顶栏指示灯会变红并给出明确提示，不会静默失败。
 
@@ -164,7 +165,7 @@ Tauri 会按 12 项清单逐个校验，缺任何一项都会删除整个目录�
 │  ytdlp.rs     解析（yt-dlp -J）与格式枚举             │
 │  engine.rs    子进程管理、进度解析、取消、直链任务     │
 │  direct.rs    内置 HTTP 引擎：Range 探测/分块/续传     │
-│  deeplink.rs  vgrab:// 协议解析与注册表写入           │
+│  deeplink.rs  veloxgrab:// 协议解析与注册表写入           │
 │  history.rs   下载记录持久化                         │
 │  settings.rs  配置读写与边界校验                       │
 └───────────┬───────────────────────────┬───────────────┘
@@ -174,7 +175,7 @@ Tauri 会按 12 项清单逐个校验，缺任何一项都会删除整个目录�
 └───────────────────────────┘  └────────────────────────┘
 ```
 
-外部入口（浏览器扩展、地址栏、命令行）通过 `vgrab://` 进入，由
+外部入口（浏览器扩展、地址栏、命令行）通过 `veloxgrab://` 进入，由
 `deeplink.rs` 解析成 `LinkRequest` 压入 `AppState.pending_links`，再以
 `external-link` 事件唤醒前端；前端 `take_pending_deep_links()` 取走后，
 与手动新建下载共用同一条 `create_direct_task` 路径入队。
@@ -198,14 +199,14 @@ Tauri 会按 12 项清单逐个校验，缺任何一项都会删除整个目录�
 
 ## 浏览器集成
 
-网页里看到一个下载链接，点一下就下——这是 IDM 的核心体验，VGrab 用
-**`vgrab://` 协议 + Chrome/Edge 扩展**做到。
+网页里看到一个下载链接，点一下就下——这是 IDM 的核心体验，VeloxGrab 用
+**`veloxgrab://` 协议 + Chrome/Edge 扩展**做到。
 
 ```
 网页/邮件里的链接
    ↓ 扩展右键菜单或 popup
-vgrab://add?url=...&name=...&dir=...&threads=...
-   ↓ 浏览器按注册表把它交给 vgrab.exe
+veloxgrab://add?url=...&name=...&dir=...&threads=...
+   ↓ 浏览器按注册表把它交给 veloxgrab.exe
 single_instance（已在跑）或 argv（冷启动）
    ↓ deeplink.rs 解析
 前端 external-link 事件 → invoke new_download → 入队
@@ -214,29 +215,29 @@ single_instance（已在跑）或 argv（冷启动）
 ### 协议注册
 
 首次启动时 `deeplink::ensure_protocol_registered()` 写
-`HKCU\Software\Classes\vgrab`：
+`HKCU\Software\Classes\veloxgrab`：
 
 | 值 | 内容 |
 | --- | --- |
-| `(默认)` | `URL:VGrab Download Link` |
+| `(默认)` | `URL:VeloxGrab Download Link` |
 | `URL Protocol` | 空串（有这个值 Windows 才认它是协议） |
-| `DefaultIcon` | vgrab.exe 路径 |
-| `shell\open\command` | `"<安装目录>\vgrab.exe" "%1"` |
+| `DefaultIcon` | veloxgrab.exe 路径 |
+| `shell\open\command` | `"<安装目录>\veloxgrab.exe" "%1"` |
 
 写的是 **HKCU**，不需要管理员权限。已指向自己时跳过，不会每次启动都重写。
 
 **为什么不用 `tauri-plugin-deep-link`**：那个 API 在某些环境下会把自身目标写成
-dev 期的 exe 路径，而安装后路径是 `%LOCALAPPDATA%\VGrab\vgrab.exe`——
+dev 期的 exe 路径，而安装后路径是 `%LOCALAPPDATA%\VeloxGrab\veloxgrab.exe`——
 写错了协议关联静默失效，用户点了链接什么都不会发生，且没有任何报错。
 自写注册表能保证指向的是 `current_exe()`，也就是真正在跑的这个文件。
 
 ### 扩展
 
-位于 `extension/`，随安装包分发到 `%LOCALAPPDATA%\VGrab\extension\`。
+位于 `extension/`，随安装包分发到 `%LOCALAPPDATA%\VeloxGrab\extension\`。
 在 `chrome://extensions` 里开「开发者模式」→「加载已解压的扩展程序」选该目录即可。
 
-- 右键链接 → 用 VGrab 下载此链接
-- 右键图片/视频/音频 → 用 VGrab 下载此媒体
+- 右键链接 → 用 VeloxGrab 下载此链接
+- 右键图片/视频/音频 → 用 VeloxGrab 下载此媒体
 - 点工具栏图标 → 弹窗，可改目录与线程数，并列出当前页的媒体一键发送
 
 **已知限制**：Chrome/Edge 不允许扩展随意拉起自定义协议。用户手势内的
@@ -248,9 +249,9 @@ dev 期的 exe 路径，而安装后路径是 `%LOCALAPPDATA%\VGrab\vgrab.exe`�
 ### 支持的链接形态
 
 ```text
-vgrab://add?url=<http链接>&name=<文件名>&dir=<目录>&threads=<n>
-vgrab://add/?url=<...>                        # add 后面多一个斜杠也认
-vgrab://https://example.com/file.zip         # 整个 body 就是目标 URL
+veloxgrab://add?url=<http链接>&name=<文件名>&dir=<目录>&threads=<n>
+veloxgrab://add/?url=<...>                        # add 后面多一个斜杠也认
+veloxgrab://https://example.com/file.zip         # 整个 body 就是目标 URL
 ```
 
 参数名做了兼容（`url`/`u`、`name`/`filename`/`f`、`dir`/`d`、`threads`/`t`），
@@ -267,12 +268,12 @@ vgrab://https://example.com/file.zip         # 整个 body 就是目标 URL
 
 **两个必须知道的不对称**：
 
-1. `add` 后面带斜杠也要认。浏览器按 URL 规则规范化 `vgrab://add?...` 时会补一个
+1. `add` 后面带斜杠也要认。浏览器按 URL 规则规范化 `veloxgrab://add?...` 时会补一个
    `/`，path 从 `add` 变成 `add/`。不兼容的话网页里点扩展传来的链接 100% 失败，
    报「不支持的动作：add/」。
 2. 扩展拼链接时**不能**把 `URLSearchParams.toString()` 的结果直接当 query 用。
-   它会把 `:` 编码成 `%3A`，浏览器解析 `vgrab://` 时会把 scheme 的分隔语义吃掉
-   ——实测 `vgrab://https://a.com/x.zip` 会被规范化成 `vgrab://https//a.com/x.zip`，
+   它会把 `:` 编码成 `%3A`，浏览器解析 `veloxgrab://` 时会把 scheme 的分隔语义吃掉
+   ——实测 `veloxgrab://https://a.com/x.zip` 会被规范化成 `veloxgrab://https//a.com/x.zip`，
    裸链接形态整个废掉。手工 `encodeURIComponent` 逐项拼才安全。
 
 ### 链接投递：为什么是「先存后取」而不是「直接发事件」
@@ -285,7 +286,7 @@ Rust 侧解析完链接后，**先把结果压进 `AppState.pending_links`，再
 
 - Tauri 的 `emit` 对还没有 `listen` 的 webview 是**静默丢弃**，不排队、不回放。
 - 冷启动时 webview2 首帧要一秒以上，而 `emit` 在 `setup` 后只等了 300ms。
-- 症状极具误导性：进程命令行里明明带着 `vgrab://add/?url=…`（`Win32_Process.CommandLine`
+- 症状极具误导性：进程命令行里明明带着 `veloxgrab://add/?url=…`（`Win32_Process.CommandLine`
   可见），任务列表却一条都没有，也没有任何报错。
 
 队列方案把「数据面」和「通知面」拆开了：事件丢了只影响及时性，不影响正确性。
@@ -326,17 +327,17 @@ cargo run --release --example resume_test -- "https://example.com/big.bin" 4500
 
 ```powershell
 # 关闭程序后执行 → 冷启动路径
-Start-Process 'vgrab://add/?url=http%3A%2F%2F127.0.0.1%3A8000%2Ff.bin&name=a.bin&threads=4'
+Start-Process 'veloxgrab://add/?url=http%3A%2F%2F127.0.0.1%3A8000%2Ff.bin&name=a.bin&threads=4'
 
 # 程序已在运行时执行 → 热启动路径（single_instance 回调）
-Start-Process 'vgrab://add/?url=http%3A%2F%2F127.0.0.1%3A8000%2Ff.bin&name=b.bin&threads=8'
+Start-Process 'veloxgrab://add/?url=http%3A%2F%2F127.0.0.1%3A8000%2Ff.bin&name=b.bin&threads=8'
 
 # 裸链接形态
-Start-Process 'vgrab://http://127.0.0.1:8000/f.bin'
+Start-Process 'veloxgrab://http://127.0.0.1:8000/f.bin'
 ```
 
 三种形态都应该在「记录」页出现一条 `done` 记录，且下载文件与源 MD5 一致。
-如果命令行里能看到 `vgrab://…` 但记录页空着，说明卡在**投递**环节而不是协议注册
+如果命令行里能看到 `veloxgrab://…` 但记录页空着，说明卡在**投递**环节而不是协议注册
 ——先查 `take_pending_deep_links` 有没有被前端调用到（见上一节）。
 
 ### 一个容易踩的坑：探测请求别串行等 HEAD

@@ -22,7 +22,7 @@ async fn main() {
     println!("URL: {url}");
 
     // 故意配置一个读不出来的浏览器 Cookie 来源
-    let settings = vgrab_lib::settings::Settings {
+    let settings = veloxgrab_lib::settings::Settings {
         cookies_from_browser: "chrome".to_string(),
         cookies_file: String::new(),
         ..Default::default()
@@ -34,7 +34,7 @@ async fn main() {
     println!("（Chrome 127+ 启用了 App-Bound Encryption，直接带这个 Cookie 会报错）\n");
 
     let t = Instant::now();
-    let result = vgrab_lib::ytdlp::probe(&url, &settings).await;
+    let result = veloxgrab_lib::ytdlp::probe(&url, &settings).await;
     let elapsed = t.elapsed();
 
     match &result {

@@ -12,7 +12,7 @@
 (function () {
   "use strict";
 
-  var KEY = "vgrab.theme";
+  var KEY = "veloxgrab.theme";
   var VALUES = ["system", "light", "dark"];
 
   function matchLight() {
@@ -75,7 +75,7 @@
     }
   }
 
-  window.VGrabTheme = {
+  window.VeloxGrabTheme = {
     KEY: KEY,
     apply: apply,
     cached: cached,

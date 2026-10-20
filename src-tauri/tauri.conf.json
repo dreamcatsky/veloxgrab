@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "VGrab",
-  "version": "1.0.0",
-  "identifier": "com.vgrab.desktop",
+  "productName": "VeloxGrab",
+  "version": "1.1.0",
+  "identifier": "com.veloxgrab.desktop",
   "build": {
     "beforeDevCommand": "",
     "devUrl": null,
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "VGrab",
+        "title": "VeloxGrab",
         "width": 1040,
         "height": 720,
         "minWidth": 820,

@@ -27,7 +27,7 @@ pub struct AppState {
     pub pump_lock: Arc<Mutex<()>>,
     /// 用于按时间戳生成 id
     pub counter: AtomicU64,
-    /// 启动阶段收到的 `vgrab://` 链接，等前端来取。
+    /// 启动阶段收到的 `veloxgrab://` 链接，等前端来取。
     ///
     /// 为什么不用 `emit` 直接推：webview 的 JS 还没执行完时 `emit` 发出去的事件
     /// 会被静默丢弃（没有监听者就没有回放）。冷启动点协议链接时 300ms 的延迟
@@ -95,7 +95,7 @@ pub async fn open_extension_dir() -> Result<String, String> {
 
 /// 把 PathBuf 变成用户能直接粘贴进对话框的路径。
 ///
-/// Tauri 在 Windows 上给出的 resource_dir 带 `\\?\` verbatim 前缀（`\\?\D:\Tools\VGrab`）。
+/// Tauri 在 Windows 上给出的 resource_dir 带 `\\?\` verbatim 前缀（`\\?\D:\Tools\VeloxGrab`）。
 /// 那个前缀是给 Win32 API 用的，**浏览器「加载解压缩的扩展」对话框不认**——
 /// 粘进去会报「清单文件缺失或不可读取」。所以这里把前缀剥掉再返回。
 /// UNC 路径（`\\?\UNC\server\share`）要还原成 `\\server\share`，不能简单砍四个字符。
@@ -666,7 +666,7 @@ pub async fn pause_task(state: tauri::State<'_, AppState>, id: String) -> Result
 
 /// 恢复：把暂停/失败/排队中的任务重新送进队列。
 ///
-/// 断点续传靠的是各下载器自己的临时文件（直链 `.vgrab-part` + `.vgrab-meta`、
+/// 断点续传靠的是各下载器自己的临时文件（直链 `.veloxgrab-part` + `.veloxgrab-meta`、
 /// yt-dlp 的 `.part`），所以恢复不需要我们搬数据，只要重新跑一遍同一个任务。
 #[tauri::command]
 pub async fn resume_task(
@@ -792,7 +792,7 @@ pub async fn new_download(
     .await
 }
 
-/// `new_download` 与 `vgrab://` 深链共用的建任务逻辑。
+/// `new_download` 与 `veloxgrab://` 深链共用的建任务逻辑。
 ///
 /// 单独抽出来是因为深链进来时没有「前端表单」可依赖：扩展只传一个 URL，
 /// 其余全靠这里兜。两条入口必须走同一条路径，否则会出现「网页点能下、
@@ -988,7 +988,7 @@ pub async fn cancel_all(state: &AppState) {
     }
 }
 
-/// 取走启动阶段收到的 `vgrab://` 链接（取走即清空）。
+/// 取走启动阶段收到的 `veloxgrab://` 链接（取走即清空）。
 ///
 /// 前端在 boot() 结束时、以及每次收到 `external-link` 唤醒事件时调用它。
 /// 用「前端主动拉」而不是「后端往前推」，是为了绕开 webview 还没执行 JS
@@ -1289,7 +1289,7 @@ async fn remove_one(state: &AppState, id: &str) -> bool {
 
     if let Some(task) = &snapshot {
         // 删除时清临时文件：用户删掉任务就是要它彻底消失，
-        // 留着 .vgrab-part 下次同名下载会莫名其妙地续上一个旧进度。
+        // 留着 .veloxgrab-part 下次同名下载会莫名其妙地续上一个旧进度。
         // 目录必须用任务自己的 save_dir：单独设过目录的任务，
         // 用全局默认目录去找会扑空，残片就永远留在那儿。
         let settings = load_settings(state);
@@ -1414,7 +1414,7 @@ pub async fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
     }
 
     WebviewWindowBuilder::new(&app, "progress", WebviewUrl::App("progress.html".into()))
-        .title("VGrab 进度")
+        .title("VeloxGrab 进度")
         .inner_size(560.0, 420.0)
         .min_inner_size(420.0, 260.0)
         .resizable(true)

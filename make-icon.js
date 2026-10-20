@@ -1,4 +1,4 @@
-// 生成 VGrab 应用图标：1024x1024 PNG，纯手写，无外部依赖
+// 生成 VeloxGrab 应用图标：1024x1024 PNG，纯手写，无外部依赖
 const fs = require("fs");
 const path = require("path");
 const zlib = require("zlib");

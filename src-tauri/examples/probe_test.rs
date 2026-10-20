@@ -5,10 +5,10 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "https://www.bilibili.com/video/BV1GJ411x7h7".to_string());
 
-    let settings = vgrab_lib::settings::Settings::default();
+    let settings = veloxgrab_lib::settings::Settings::default();
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    match rt.block_on(vgrab_lib::ytdlp::probe(&url, &settings)) {
+    match rt.block_on(veloxgrab_lib::ytdlp::probe(&url, &settings)) {
         Ok(info) => {
             println!("========== 探测成功 ==========");
             println!("标题     : {}", info.title);

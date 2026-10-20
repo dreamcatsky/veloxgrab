@@ -39,7 +39,7 @@ pub fn setup(app: &tauri::AppHandle) {
 
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
-        .tooltip("VGrab")
+        .tooltip("VeloxGrab")
         // 右键弹菜单是 Windows 惯例；左键设为显示窗口，符合「点一下就回来」的直觉。
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {

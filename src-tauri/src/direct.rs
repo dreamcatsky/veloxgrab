@@ -4,7 +4,7 @@
 //! - 先发 HEAD（失败则退化为带 Range 的 GET）探测：是否支持 Range、总大小、文件名、MIME
 //! - 支持 Range 时把文件切成 N 段，每段一个连接并发拉取，各自 seek 写入同一个文件
 //! - 不支持 Range 时退化为单流顺序下载
-//! - 断点续传：每段已写偏移定期落盘到 `<文件名>.vgrab-part`，重启后按偏移继续
+//! - 断点续传：每段已写偏移定期落盘到 `<文件名>.veloxgrab-part`，重启后按偏移继续
 //! - 取消通过共享 AtomicBool 实现，不依赖 reqwest 的取消机制
 
 use futures_util::StreamExt;
@@ -26,7 +26,7 @@ const MIN_MULTI_THREAD_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
 /// 端口耗尽、被站点限流、fd 打满。
 const MAX_THREADS: usize = 64;
 /// 下载中的临时文件后缀。完成后再 rename 成最终名字。
-const TEMP_SUFFIX: &str = ".vgrab-downloading";
+const TEMP_SUFFIX: &str = ".veloxgrab-downloading";
 
 /// 直链探测结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +57,7 @@ pub struct DirectProgress {
 /// 构造 HTTP 客户端。`proxy` 是 settings.proxy_url() 的结果（None = 直连）。
 fn client_with(proxy: Option<&str>) -> Result<reqwest::Client, String> {
     let mut b = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) VGrab/0.1")
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) VeloxGrab/0.1")
         .connect_timeout(Duration::from_secs(20))
         // 这里绝对不能用 `timeout()`：reqwest 的 timeout 是「总超时」，从连接建立
         // 一直算到响应体读完。10 GB 文件在 2 MB/s 的线路上要 85 分钟，超过 1 小时
@@ -376,7 +376,7 @@ async fn probe_uncached(url: &str, proxy: Option<&str>) -> Result<DirectProbe, S
     })
 }
 
-/// 断点续传元数据（与目标文件同目录，名为 `<文件名>.vgrab-part`）
+/// 断点续传元数据（与目标文件同目录，名为 `<文件名>.veloxgrab-part`）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PartMeta {
     pub url: String,
@@ -392,7 +392,7 @@ impl PartMeta {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        p.set_file_name(format!("{name}.vgrab-part"));
+        p.set_file_name(format!("{name}.veloxgrab-part"));
         p
     }
 
@@ -410,7 +410,7 @@ impl PartMeta {
             return;
         };
         let path = Self::path_for(target);
-        let tmp = path.with_extension("vgrab-part.tmp");
+        let tmp = path.with_extension("veloxgrab-part.tmp");
         if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
@@ -672,7 +672,7 @@ fn has_real_extension(name: &str) -> bool {
     }
 }
 
-/// 最终路径对应的临时文件路径（`movie.mp4` → `movie.mp4.vgrab-downloading`）。
+/// 最终路径对应的临时文件路径（`movie.mp4` → `movie.mp4.veloxgrab-downloading`）。
 fn temp_path_for(target: &Path) -> PathBuf {
     let name = target
         .file_name()
@@ -695,7 +695,7 @@ fn finish_download(temp: &Path, target: &Path) -> Result<PathBuf, String> {
 /// 清理某个直链任务在下载目录里留下的临时产物。
 ///
 /// 只删「以该标题开头 + 以我们的后缀结尾」的文件，不会碰用户的其他文件。
-/// 任务被移除后 `.vgrab-downloading` / `.vgrab-part` 否则会永久留在目录里。
+/// 任务被移除后 `.veloxgrab-downloading` / `.veloxgrab-part` 否则会永久留在目录里。
 pub fn cleanup_artifacts(dir: &Path, name_hint: &str) {
     let stem = crate::util::sanitize_filename(name_hint);
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -714,7 +714,7 @@ pub fn cleanup_artifacts(dir: &Path, name_hint: &str) {
         if !rest.starts_with('.') {
             continue;
         }
-        if rest.ends_with(TEMP_SUFFIX) || rest.ends_with(".vgrab-part") {
+        if rest.ends_with(TEMP_SUFFIX) || rest.ends_with(".veloxgrab-part") {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -1236,14 +1236,14 @@ mod tests {
     /// 否则取消时会留下一个「名字和大小都正常」的残缺文件。
     #[test]
     fn downloads_go_through_temp_file() {
-        let dir = std::env::temp_dir().join(format!("vgrab_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("veloxgrab_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let target = dir.join("movie.mp4");
         let temp = temp_path_for(&target);
         assert_eq!(
             temp.file_name().unwrap().to_string_lossy(),
-            "movie.mp4.vgrab-downloading"
+            "movie.mp4.veloxgrab-downloading"
         );
 
         std::fs::write(&temp, b"hello").unwrap();

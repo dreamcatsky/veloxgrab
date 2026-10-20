@@ -1,11 +1,11 @@
-//! 浏览器扩展 ↔ VGrab 的本地传输桥。
+//! 浏览器扩展 ↔ VeloxGrab 的本地传输桥。
 //!
 //! ## 为什么需要它
 //!
-//! `vgrab://` 协议本身是通的（注册表、单实例回调、冷启动 argv 都验证过），
+//! `veloxgrab://` 协议本身是通的（注册表、单实例回调、冷启动 argv 都验证过），
 //! 但**扩展拉不起来它**：Chrome/Edge 会静默拦截扩展发起的自定义协议导航
-//! （`chrome.tabs.update({url: "vgrab://..."})` 不报错，就是不发生）。
-//! 于是「网页点下载 → 交给 VGrab」这条链路在真实浏览器里 100% 断掉。
+//! （`chrome.tabs.update({url: "veloxgrab://..."})` 不报错，就是不发生）。
+//! 于是「网页点下载 → 交给 VeloxGrab」这条链路在真实浏览器里 100% 断掉。
 //!
 //! Native Messaging 是官方方案，但代价是：扩展 ID 必须固定（要往
 //! manifest 里塞 RSA 公钥）、要额外注册
@@ -23,12 +23,12 @@
 //!
 //! 1. 只接受 `Origin` 为 `chrome-extension://` 的请求。网页 JS 发起的请求
 //!    Origin 一定是 `http(s)://...`，浏览器不允许伪造，这一条挡住了「任意
-//!    网页偷偷让 VGrab 下东西」。
+//!    网页偷偷让 VeloxGrab 下东西」。
 //! 2. 请求体上限 64 KiB、请求头上限 8 KiB，防止本机程序用超长行把内存吃满。
 //! 3. 只解析 `/add` 一个路径，其它一律 404——桥不是通用 RPC。
 //!
 //! 注意 `Origin` 缺失时**也放行**：curl / 手工测试不会带 Origin，而能连上
-//! 127.0.0.1 的本机程序本来就已经能直接调 `vgrab://`，拦它没有意义。
+//! 127.0.0.1 的本机程序本来就已经能直接调 `veloxgrab://`，拦它没有意义。
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -65,13 +65,13 @@ const MAX_BODY: usize = 64 * 1024;
 ///
 /// 失败只打日志不阻断启动：端口被占（比如用户开了两个实例、或者别的程序
 /// 正好占了 58943）时，程序其余功能必须照常可用，扩展侧会自动退回
-/// `vgrab://` 协议路径。
+/// `veloxgrab://` 协议路径。
 pub fn spawn(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let listener = match TcpListener::bind(("127.0.0.1", PORT)) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[bridge] 无法监听 127.0.0.1:{PORT}: {e}（扩展将退回 vgrab:// 协议）");
+                eprintln!("[bridge] 无法监听 127.0.0.1:{PORT}: {e}（扩展将退回 veloxgrab:// 协议）");
                 return;
             }
         };
@@ -129,7 +129,7 @@ fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
     }
 
     // 扩展刚启动时打一次 /ping，只为了上报「我活着」。见 EXT_SEEN 注释：
-    // 扩展在后台 SW 里启动就 ping，用户就算从没下载过，VGrab 也能知道扩展已加载。
+    // 扩展在后台 SW 里启动就 ping，用户就算从没下载过，VeloxGrab 也能知道扩展已加载。
     if path == "/ping" {
         let _ = respond(&mut stream, 200, "{\"ok\":true}");
         return;
@@ -146,7 +146,7 @@ fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
             }
         }
     } else {
-        format!("vgrab://add?{query}")
+        format!("veloxgrab://add?{query}")
     };
 
     // 交给既有的协议分发路径：入队 + 唤醒事件 + 把窗口拉到前台。
@@ -226,7 +226,7 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, String, Optio
     Ok((method, path, query, origin, body))
 }
 
-/// 把 POST 的 JSON body 转成 `vgrab://add?...` 链接。
+/// 把 POST 的 JSON body 转成 `veloxgrab://add?...` 链接。
 fn build_link_from_json(body: &str) -> Result<String, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("body 不是合法 JSON: {e}"))?;
@@ -248,7 +248,7 @@ fn build_link_from_json(body: &str) -> Result<String, String> {
     if let Some(t) = v.get("threads").and_then(|x| x.as_u64()) {
         parts.push(format!("threads={t}"));
     }
-    Ok(format!("vgrab://add?{}", parts.join("&")))
+    Ok(format!("veloxgrab://add?{}", parts.join("&")))
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {

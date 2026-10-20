@@ -3,13 +3,13 @@
 // 运行: cargo run --example direct_test -- <url> [线程数] [期望SHA256]
 //
 // 第三个参数是期望的内容 SHA256。留空则只校验大小与续传一致性。
-// 输出目录固定为 %TEMP%\vgrab_direct_test，不占用参数位。
+// 输出目录固定为 %TEMP%\veloxgrab_direct_test，不占用参数位。
 //
 // 覆盖：
 // 1. 探测（是否支持 Range、总大小、文件名）
 // 2. 多线程分块下载 + 进度回调
 // 3. 下载结果的大小校验 + SHA256 校验
-// 4. 断点续传（构造 .vgrab-part 后重跑，验证只补缺失部分且内容正确）
+// 4. 断点续传（构造 .veloxgrab-part 后重跑，验证只补缺失部分且内容正确）
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -105,7 +105,7 @@ fn main() {
     let expect_sha256: Option<String> = args.next().filter(|s| !s.trim().is_empty());
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let out_dir = std::env::temp_dir().join("vgrab_direct_test");
+    let out_dir = std::env::temp_dir().join("veloxgrab_direct_test");
     let _ = std::fs::create_dir_all(&out_dir);
 
     println!("========== 直链下载测试 ==========");
@@ -114,10 +114,10 @@ fn main() {
     println!("输出目录 : {}", out_dir.display());
 
     // ---- 1. 探测 ----
-    let probe = match rt.block_on(vgrab_lib::direct::probe_direct(
+    let probe = match rt.block_on(veloxgrab_lib::direct::probe_direct(
         &url,
         None,
-        &vgrab_lib::settings::NetCfg::default(),
+        &veloxgrab_lib::settings::NetCfg::default(),
     )) {
         Ok(p) => p,
         Err(e) => {
@@ -134,10 +134,10 @@ fn main() {
     println!("最终 URL     : {}", probe.final_url);
 
     let target = out_dir.join(&probe.filename);
-    // 下载全程只写临时文件（`<name>.vgrab-downloading`），成功后 rename 成最终名。
+    // 下载全程只写临时文件（`<name>.veloxgrab-downloading`），成功后 rename 成最终名。
     // 续传元数据挂在**临时文件**旁边，所以路径要跟着临时名走。
-    let temp = out_dir.join(format!("{}.vgrab-downloading", probe.filename));
-    let part = out_dir.join(format!("{}.vgrab-downloading.vgrab-part", probe.filename));
+    let temp = out_dir.join(format!("{}.veloxgrab-downloading", probe.filename));
+    let part = out_dir.join(format!("{}.veloxgrab-downloading.veloxgrab-part", probe.filename));
     if target.exists() {
         let _ = std::fs::remove_file(&target);
     }
@@ -150,7 +150,7 @@ fn main() {
     let cancel = Arc::new(AtomicBool::new(false));
     let last_pct = Arc::new(Mutex::new(-1i32));
     let lp = last_pct.clone();
-    let cb = move |p: vgrab_lib::direct::DirectProgress| {
+    let cb = move |p: veloxgrab_lib::direct::DirectProgress| {
         let pct = p.progress as i32;
         // 只在整数百分比变化时打印，避免刷屏
         let mut guard = match lp.lock() {
@@ -169,14 +169,14 @@ fn main() {
         }
     };
 
-    let result = rt.block_on(vgrab_lib::direct::download_direct(
+    let result = rt.block_on(veloxgrab_lib::direct::download_direct(
         &url,
         &out_dir,
         None,
         threads,
         cancel.clone(),
         cb,
-        &vgrab_lib::settings::NetCfg::default(),
+        &veloxgrab_lib::settings::NetCfg::default(),
     ));
 
     let path = match result {
@@ -230,7 +230,7 @@ fn main() {
         // 构造一个「下载到一半」的现场。
         //
         // 注意两个前提，早期版本都踩过：
-        // 1. 文件必须写成**临时名** `xxx.vgrab-downloading` —— R3 之后下载器只认临时文件，
+        // 1. 文件必须写成**临时名** `xxx.veloxgrab-downloading` —— R3 之后下载器只认临时文件，
         //    直接写最终名会被当成「没有断点」，从零重下。
         // 2. 内容校验必须有独立基准。旧脚本用 `%TEMP%\bigtest.bin` 当基准，但它和
         //    当前 URL 毫无关系，比对必然失败——那是脚本的 bug，不是下载器的问题。
@@ -280,15 +280,15 @@ fn main() {
         std::fs::write(&part, meta_json.to_string()).unwrap();
 
         let cancel2 = Arc::new(AtomicBool::new(false));
-        let cb2 = move |_p: vgrab_lib::direct::DirectProgress| {};
-        match rt.block_on(vgrab_lib::direct::download_direct(
+        let cb2 = move |_p: veloxgrab_lib::direct::DirectProgress| {};
+        match rt.block_on(veloxgrab_lib::direct::download_direct(
             &url,
             &out_dir,
             None,
             segs,
             cancel2,
             cb2,
-            &vgrab_lib::settings::NetCfg::default(),
+            &veloxgrab_lib::settings::NetCfg::default(),
         )) {
             Ok(p2) => {
                 println!("✅ 续传完成: {}", p2.display());

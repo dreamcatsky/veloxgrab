@@ -21,9 +21,9 @@ use tauri::{Emitter, Manager, RunEvent};
 /// 处理函数会在「prevent_exit → exit → 再次 ExitRequested → prevent_exit」之间死循环。
 static EXIT_CLEANED: AtomicBool = AtomicBool::new(false);
 
-/// 从进程参数里找出第一个 `vgrab://` 链接。
+/// 从进程参数里找出第一个 `veloxgrab://` 链接。
 ///
-/// Windows 上协议处理程序的启动方式是 `vgrab.exe "%1"`，用户点的 URL
+/// Windows 上协议处理程序的启动方式是 `veloxgrab.exe "%1"`，用户点的 URL
 /// 会作为**第一个**命令行参数出现。热启动时（已有实例在跑）这个参数
 /// 由 `single_instance` 回调拿到，冷启动时只能自己从 `args()` 里翻。
 ///
@@ -40,7 +40,7 @@ where
         .find(|a| a.to_ascii_lowercase().starts_with(&prefix))
 }
 
-/// 把一条 `vgrab://` 链接交给前端：先进待取队列，再发一个唤醒事件。
+/// 把一条 `veloxgrab://` 链接交给前端：先进待取队列，再发一个唤醒事件。
 ///
 /// 解析失败的链接也照样入队，让前端 toast 出原因：用户点的是网页上的按钮，
 /// 链接长什么样不受我们控制，静默丢弃会让用户以为按钮坏了。
@@ -48,7 +48,7 @@ where
 /// 为什么是「入队 + 唤醒」而不是「直接把 payload 塞进事件」：
 /// Tauri 的 `emit` 对还没挂 `listen` 的 webview 是**静默丢弃**，而冷启动时
 /// webview2 首帧要一秒以上。原先只发事件的写法在冷启动路径上 100% 丢链接
-/// （实测：进程命令行里明明带着 `vgrab://…`，任务列表却一条都没有）。
+/// （实测：进程命令行里明明带着 `veloxgrab://…`，任务列表却一条都没有）。
 /// 现在事件退化成纯唤醒信号（空 payload），数据一律由前端主动
 /// invoke `take_pending_deep_links` 拉取，取走即清空，天然不会重复处理。
 pub(crate) fn dispatch_external_link(app: &tauri::AppHandle, link: String) {
@@ -93,7 +93,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            // 第二个实例启动意味着用户又点了一个 vgrab:// 链接（或手动开了第二个窗口）。
+            // 第二个实例启动意味着用户又点了一个 veloxgrab:// 链接（或手动开了第二个窗口）。
             // 链接必须在这里消费掉：新进程马上就会退出，不处理就白点一次。
             if let Some(link) = deep_link_from_args(argv) {
                 dispatch_external_link(app, link);
@@ -111,7 +111,7 @@ pub fn run() {
                 ytdlp::set_resource_dir(dir);
             }
 
-            // 接管 vgrab:// 协议。写 HKCU\Software\Classes\vgrab 指向本 exe。
+            // 接管 veloxgrab:// 协议。写 HKCU\Software\Classes\veloxgrab 指向本 exe。
             // 安装后首次启动时做一次：NSIS 只负责拷文件，协议关联要在程序侧补。
             // 失败不阻塞启动——只是网页点击会退化成「无法识别的链接」。
             // 放独立线程：reg.exe 是外部进程，同步跑会拖慢窗口显示。
@@ -150,7 +150,7 @@ pub fn run() {
             tray::setup(app.handle());
 
             // 浏览器扩展的传输桥（127.0.0.1:58943）。
-            // 扩展拉不起 vgrab://（Chrome 静默拦截自定义协议导航），
+            // 扩展拉不起 veloxgrab://（Chrome 静默拦截自定义协议导航），
             // 这条回环 HTTP 是真正能用的那条路。失败不阻断启动。
             bridge::spawn(app.handle().clone());
 
