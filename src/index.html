@@ -58,6 +58,8 @@
         <button class="menu-item" data-cmd="usage"><span data-i18n="miUsage">使用说明</span></button>
         <button class="menu-item" data-cmd="setupExt"><span data-i18n="miSetupExt">启用浏览器扩展…</span></button>
         <div class="menu-sep"></div>
+        <button class="menu-item" data-cmd="checkUpdate"><span data-i18n="miCheckUpdate">检查更新…</span></button>
+        <div class="menu-sep"></div>
         <button class="menu-item" data-cmd="about"><span data-i18n="miAbout">关于 VeloxGrab</span></button>
       </div>
     </div>
@@ -569,6 +571,25 @@
       <div class="actions dialog-actions">
         <button id="saStart" class="primary" disabled><span data-i18n="startDownload">开始下载</span></button>
         <button id="saCancel" class="ghost"><span data-i18n="cancel">取消</span></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 更新对话框：发现新版本 / 下载进度共用一个壳，正文随状态切换 -->
+  <div id="updateOverlay" class="overlay hidden">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h3 id="upTitle">发现新版本</h3>
+        <span id="upVer" class="chip hidden"></span>
+      </div>
+      <div id="upBody" class="dialog-body"></div>
+      <div id="upBarWrap" class="hidden" style="margin-top:14px">
+        <div class="bar"><div class="bar-fill" id="upBar"></div></div>
+        <div id="upPct" class="fmt-detail dim"></div>
+      </div>
+      <div class="actions dialog-actions">
+        <button id="upInstall" class="primary hidden"><span data-i18n="upInstall">立即更新</span></button>
+        <button id="upLater" class="ghost"><span data-i18n="upLater">以后再说</span></button>
       </div>
     </div>
   </div>

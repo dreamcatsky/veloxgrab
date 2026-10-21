@@ -248,7 +248,12 @@
     miProgress: "Open progress window",
     miUsage: "How to use",
     miSetupExt: "Enable browser extension…",
+    miCheckUpdate: "Check for updates…",
     miAbout: "About VeloxGrab",
+    upInstall: "Update now",
+    upLater: "Later",
+    upAvailable: "New version available",
+    upInstalling: "Installing…",
     selectAll: "All",
     paused: "Paused",
   };
@@ -1342,9 +1347,114 @@
         break;
       }
 
+      case "checkUpdate": {
+        // 手动检查：失败要出声（用户就是来问的），有更新弹对话框
+        try {
+          const info = await invoke("check_update");
+          if (info.error) {
+            toast(info.error, true);
+          } else if (info.available) {
+            showUpdateDialog(info);
+          } else {
+            toast(`已是最新版本（v${info.current}）`);
+          }
+        } catch (e) {
+          toast("检查更新失败：" + String(e), true);
+        }
+        break;
+      }
+
       default:
         break;
     }
+  }
+
+  // ---------- 应用内更新 ----------
+  //
+  // 两个入口共用一个对话框：启动后的静默检查（Rust 侧发 "update-available"
+  // 事件）和菜单「检查更新…」。同一时刻只允许一个更新对话框——启动检查
+  // 撞上用户手动检查时，后到的直接丢弃（前一个框里的信息并不过期）。
+  let updateInfoShown = null;
+
+  function fmtMB(bytes) {
+    if (!bytes) return "";
+    const mb = bytes / (1024 * 1024);
+    return (mb >= 10 ? mb.toFixed(0) : mb.toFixed(1)) + " MB";
+  }
+
+  function showUpdateDialog(info) {
+    if (!$("updateOverlay").classList.contains("hidden")) return; // 已开着
+    updateInfoShown = info;
+    $("upTitle").textContent = "发现新版本";
+    $("upVer").textContent = `v${info.current} → v${info.latest}`;
+    $("upVer").classList.remove("hidden");
+    // release 说明是 GitHub 上的 markdown：不渲染、截前几行、textContent 注入。
+    // 半可信来源当纯文本处理，不给它任何 HTML 执行面。
+    const lines = String(info.notes || "").split("\n").filter((l) => l.trim()).slice(0, 6);
+    $("upBody").innerHTML =
+      "<p></p><p class=\"dim\" style=\"margin-top:10px\">更新会重启程序，正在下载的任务会被中断（断点保留，更新后可继续）。</p>";
+    $("upBody").firstChild.textContent = lines.join(" ") || "查看更新内容见发布页。";
+    $("upBarWrap").classList.add("hidden");
+    $("upBar").style.width = "0";
+    $("upPct").textContent = "";
+    const btn = $("upInstall");
+    btn.classList.remove("hidden");
+    btn.disabled = false;
+    btn.querySelector("span").textContent = `下载并安装（${fmtMB(info.asset_size)}）`;
+    $("updateOverlay").classList.remove("hidden");
+  }
+
+  async function startUpdate() {
+    const info = updateInfoShown;
+    if (!info || !info.download_url) return;
+    const btn = $("upInstall");
+    btn.disabled = true;
+    btn.querySelector("span").textContent = "下载中…";
+    $("upBarWrap").classList.remove("hidden");
+    $("upPct").textContent = "准备下载…";
+    try {
+      // 成功后 Rust 侧会直接退出本进程去安装，这里不会有返回值可言
+      await invoke("update_now", { url: info.download_url });
+    } catch (e) {
+      $("upPct").textContent = "";
+      btn.disabled = false;
+      btn.querySelector("span").textContent = "重试";
+      toast("更新失败：" + String(e), true);
+    }
+  }
+
+  function hideUpdateDialog() {
+    // 「以后再说」：本次运行内不再自动弹（启动检查只在开机时发一次事件，
+    // 这里只是把语义写死：关掉 = 这轮不追）。手动「检查更新」不受影响。
+    $("updateOverlay").classList.add("hidden");
+  }
+
+  $("upInstall").onclick = startUpdate;
+  $("upLater").onclick = hideUpdateDialog;
+  $("updateOverlay").addEventListener("click", (e) => {
+    if (e.target === $("updateOverlay")) hideUpdateDialog();
+  });
+
+  if (listen) {
+    listen("update-progress", (evt) => {
+      const p = evt.payload;
+      const bar = $("upBar");
+      if (p.total > 0) {
+        const pct = Math.min(100, (p.downloaded / p.total) * 100);
+        bar.style.width = pct.toFixed(1) + "%";
+        $("upPct").textContent =
+          pct >= 99.5
+            ? "下载完成，正在安装——程序会自动重启…"
+            : `${pct.toFixed(0)}%  ·  ${fmtMB(p.downloaded)} / ${fmtMB(p.total)}`;
+      } else {
+        $("upPct").textContent = `已下载 ${fmtMB(p.downloaded)}…`;
+      }
+    });
+    // 启动后的静默检查发现新版本：直接弹框。不打扰式轮询——一次启动只弹一次，
+    // 用户点了「以后再说」这次运行就不再自动弹（手动「检查更新」不受此限）。
+    listen("update-available", (evt) => {
+      showUpdateDialog(evt.payload);
+    });
   }
 
   function showInfo(title, html) {
@@ -1435,6 +1545,7 @@
       closeMenus();
       $("infoOverlay").classList.add("hidden");
       closeAddUrl();
+      if (!$("updateOverlay").classList.contains("hidden")) hideUpdateDialog();
       if (!$("saveAsOverlay").classList.contains("hidden")) closeSaveAs();
     }
   });

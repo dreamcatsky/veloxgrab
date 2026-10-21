@@ -7,6 +7,7 @@ pub mod engine;
 pub mod history;
 pub mod settings;
 pub mod tray;
+pub mod update;
 pub mod util;
 pub mod ytdlp;
 
@@ -154,6 +155,24 @@ pub fn run() {
             // 这条回环 HTTP 是真正能用的那条路。失败不阻断启动。
             bridge::spawn(app.handle().clone());
 
+            // 启动后 6 秒查一次新版本（错开首帧渲染与扩展引导弹窗）。
+            // 结果经 "update-available" 事件交给前端：有更新才弹窗，
+            // 检查失败静默——网络不畅时不该为「查不到有没有新版」打扰用户。
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                    let current = handle.package_info().version.to_string();
+                    let proxy = handle
+                        .try_state::<AppState>()
+                        .and_then(|s| crate::settings::load_settings(s.inner()).proxy_url());
+                    let info = update::fetch_latest(proxy.as_deref(), &current).await;
+                    if info.available {
+                        let _ = handle.emit("update-available", &info);
+                    }
+                });
+            }
+
             // 点窗口的「×」不退出，只隐藏——下载还在跑。真正退出的入口是
             // 托盘菜单里的「退出」，它会走 RunEvent::ExitRequested 的清理流程。
             if let Some(win) = app.get_webview_window("main") {
@@ -207,6 +226,8 @@ pub fn run() {
             settings::save_settings,
             settings::set_theme,
             settings::default_settings,
+            update::check_update,
+            update::update_now,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
