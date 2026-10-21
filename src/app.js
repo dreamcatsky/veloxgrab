@@ -1390,7 +1390,12 @@
     $("upVer").classList.remove("hidden");
     // release 说明是 GitHub 上的 markdown：不渲染、截前几行、textContent 注入。
     // 半可信来源当纯文本处理，不给它任何 HTML 执行面。
-    const lines = String(info.notes || "").split("\n").filter((l) => l.trim()).slice(0, 6);
+    // 顺手把 markdown 记号洗掉（## 标题、** 加粗、` 代码），界面上留裸符号很难看。
+    const lines = String(info.notes || "")
+      .split("\n")
+      .map((l) => l.replace(/^#+\s*/, "").replace(/\*\*(.+?)\*\*/g, "$1").replace(/`/g, "").trim())
+      .filter((l) => l)
+      .slice(0, 6);
     $("upBody").innerHTML =
       "<p></p><p class=\"dim\" style=\"margin-top:10px\">更新会重启程序，正在下载的任务会被中断（断点保留，更新后可继续）。</p>";
     $("upBody").firstChild.textContent = lines.join(" ") || "查看更新内容见发布页。";

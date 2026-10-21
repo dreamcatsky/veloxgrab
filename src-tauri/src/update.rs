@@ -84,7 +84,14 @@ pub fn is_newer(current: &str, latest: &str) -> bool {
 /// 从 GitHub releases/latest 的 JSON 组装 UpdateInfo。
 /// 纯函数，单独拿出来是为了能带着真实响应样例跑测试。
 pub fn parse_release(v: &serde_json::Value, current: &str) -> UpdateInfo {
-    let tag = v.get("tag_name").and_then(|x| x.as_str()).unwrap_or("");
+    // tag 常见写法是 "v1.2.0"，前端展示时统一自己加 v，这里先剥掉，
+    // 否则拼出来是 "vv1.2.0"（E2E 测试抓到过）。
+    let tag = v
+        .get("tag_name")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim_start_matches('v')
+        .to_string();
     let notes = v.get("body").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let release_url = v.get("html_url").and_then(|x| x.as_str()).unwrap_or("").to_string();
 
@@ -113,7 +120,7 @@ pub fn parse_release(v: &serde_json::Value, current: &str) -> UpdateInfo {
     };
 
     UpdateInfo {
-        available: is_newer(current, tag) && !download_url.is_empty(),
+        available: is_newer(current, &tag) && !download_url.is_empty(),
         current: current.to_string(),
         latest: tag.to_string(),
         notes,
@@ -260,10 +267,12 @@ pub async fn update_now(
     {
         use std::os::windows::process::CommandExt;
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        // 2 秒延迟等本进程退出 → 静默安装（等它完成）→ 拉起新版本。
+        // 5 秒延迟等本进程退出 → 静默安装（等它完成）→ 拉起新版本。
+        // 退出清理（杀下载子进程，上限 2 秒）+ 进程真正死透需要时间，
+        // NSIS 覆盖运行中的 exe 会静默失败，延迟必须给足。
         // start 的第一个 "" 是窗口标题占位，不能省，否则带空格的路径会被当标题吃掉。
         let chain = format!(
-            "ping -n 4 127.0.0.1 >nul & start \"\" /wait \"{}\" /S & start \"\" \"{}\"",
+            "ping -n 6 127.0.0.1 >nul & start \"\" /wait \"{}\" /S & start \"\" \"{}\"",
             tmp.display(),
             exe.display()
         );
@@ -280,9 +289,15 @@ pub async fn update_now(
     }
 
     let _ = app.emit("update-progress", Prog { downloaded, total, done: true, error: None });
-    // 给事件与前端一点收尾时间，再走退出清理（ExitRequested 会杀掉在跑的任务）
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    app.exit(0);
+    // 退出必须挪到独立线程：app.exit() 会**同步**派发 ExitRequested，
+    // 而那个处理器里有 block_on(cancel_all)（E2E 实测：直接在 async 命令里
+    // 调 app.exit，处理器跑进 tokio worker 线程，block_on 死锁，进程卡死不退出，
+    // 安装链等不到文件解锁）。普通线程不在运行时上，block_on 安全。
+    // 400ms 延迟给进度条收尾和事件送达留时间。
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        app.exit(0);
+    });
     Ok(())
 }
 
@@ -318,7 +333,7 @@ mod tests {
         });
         let info = parse_release(&v, "1.1.0");
         assert!(info.available);
-        assert_eq!(info.latest, "v1.1.1");
+        assert_eq!(info.latest, "1.1.1"); // tag 的 v 前缀被剥掉，前端统一自己加
         assert_eq!(info.asset_size, 20850601);
         assert!(is_trusted_download(&info.download_url));
         // 当前已是最新 → 不提示
