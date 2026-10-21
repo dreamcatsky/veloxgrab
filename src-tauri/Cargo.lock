@@ -4474,7 +4474,7 @@ dependencies = [
 
 [[package]]
 name = "veloxgrab"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "dirs 5.0.1",
  "futures-util",

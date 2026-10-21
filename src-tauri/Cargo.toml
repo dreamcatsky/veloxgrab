@@ -1,6 +1,6 @@
 [package]
 name = "veloxgrab"
-version = "1.2.3"
+version = "1.2.4"
 description = "Video downloader built on yt-dlp"
 authors = ["dreamcatsky"]
 license = "MIT"

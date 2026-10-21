@@ -111,7 +111,15 @@ pub fn read_settings_from_disk() -> Settings {
         Err(_) => return Settings::default(),
     };
     match serde_json::from_str(&text) {
-        Ok(s) => s,
+        Ok(mut s) => {
+            // 产品改名（VGrab → VeloxGrab）的遗留路径迁移。老用户 settings.json
+            // 里存的默认下载目录还是 `...\Downloads\VGrab`——用户显式设置过的值
+            // 优先于出厂默认，不迁移的话他们会一直往旧名目录里写。
+            if migrate_legacy_download_dir(&mut s) {
+                persist_migrated(&s);
+            }
+            s
+        }
         Err(e) => {
             // 不要把坏文件直接留在原地让下次继续失败，也不要静默覆盖掉：
             // 改名备份，用户至少还能从里面找回自己填过的路径。
@@ -123,6 +131,41 @@ pub fn read_settings_from_disk() -> Settings {
             );
             Settings::default()
         }
+    }
+}
+
+/// 把「末段恰好是 VGrab」的下载目录改成 VeloxGrab，返回是否发生了迁移。
+///
+/// 判据刻意收窄到路径末段的精确匹配：那是旧版默认目录的确切指纹
+/// （`<下载>\VGrab`）。用户自己起的含 VGrab 的名字（比如
+/// `D:\MyVGrabStuff`）不在此列，不碰。只改设置里的路径字符串，
+/// 不搬目录里的文件——旧目录里可能有已下载的内容，程序无权挪动
+/// 用户文件；新目录会在下次下载时自动创建。
+pub(crate) fn migrate_legacy_download_dir(s: &mut Settings) -> bool {
+    let trimmed = s.download_dir.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let p = std::path::Path::new(trimmed);
+    if p.file_name().and_then(|x| x.to_str()) != Some("VGrab") {
+        return false;
+    }
+    let Some(parent) = p.parent() else { return false };
+    s.download_dir = parent.join("VeloxGrab").to_string_lossy().to_string();
+    true
+}
+
+/// 迁移结果写回磁盘（原子写，与 save_settings 同一套路）。
+/// 写失败不致命：内存里已经是新值，本次运行正确；下次启动再迁一次即可（幂等）。
+fn persist_migrated(s: &Settings) {
+    let path = settings_path();
+    let Ok(text) = serde_json::to_string_pretty(s) else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
     }
 }
 
@@ -309,4 +352,43 @@ pub fn set_theme(state: tauri::State<'_, AppState>, theme: String) -> Result<Str
         guard.theme = normalized.clone();
     }
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_dir(d: &str) -> Settings {
+        let mut s = Settings::default();
+        s.download_dir = d.to_string();
+        s
+    }
+
+    #[test]
+    fn migrates_legacy_vgrab_default_dir() {
+        let mut s = with_dir(r"C:\Users\me\Downloads\VGrab");
+        assert!(migrate_legacy_download_dir(&mut s));
+        assert_eq!(s.download_dir, r"C:\Users\me\Downloads\VeloxGrab");
+    }
+
+    #[test]
+    fn migrates_regardless_of_case_and_separator() {
+        let mut s = with_dir("C:/Users/me/Downloads/VGrab");
+        assert!(migrate_legacy_download_dir(&mut s));
+        assert!(s.download_dir.replace('\\', "/").ends_with("Downloads/VeloxGrab"));
+    }
+
+    #[test]
+    fn leaves_user_chosen_dirs_alone() {
+        // 用户自己起的含 VGrab 的名字不碰：末段不是精确的 "VGrab"
+        let mut s = with_dir(r"D:\MyVGrabStuff");
+        assert!(!migrate_legacy_download_dir(&mut s));
+        assert_eq!(s.download_dir, r"D:\MyVGrabStuff");
+        // 已经是新名 → 幂等，不重复迁移
+        let mut t = with_dir(r"C:\Users\me\Downloads\VeloxGrab");
+        assert!(!migrate_legacy_download_dir(&mut t));
+        // 空目录（= 用出厂默认）不碰
+        let mut u = with_dir("  ");
+        assert!(!migrate_legacy_download_dir(&mut u));
+    }
 }
