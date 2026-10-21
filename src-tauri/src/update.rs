@@ -267,28 +267,33 @@ pub async fn update_now(
     {
         use std::os::windows::process::CommandExt;
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        // 延迟 5 秒等本进程退出 → 静默安装 → 拉起新版本。
-        // 退出清理（杀下载子进程，上限 2 秒）+ 进程死透需要时间，
-        // NSIS 覆盖运行中的 exe 会静默失败，延迟必须给足。
+        // 安装链写成 .bat 落盘再执行，而不是把命令内联传给 cmd：
+        // Rust 的 argv 转义用 \"，cmd 却按 "" 配对——内联引号过两道
+        // 不同规则的解析器必乱（E2E 实测：同一条链手工执行正常、
+        // 经 Rust spawn 后连日志重定向都没生效）。bat 文件内容由
+        // Rust 直接写盘，命令行上只剩一个路径 token，没有跨语言转义。
         //
-        // 安装用直接调用而不是 `start /wait`：cmd 对直接调用的 exe 本来就
-        // 是等它退出才走下一句，`start /wait` 多一层壳反而在 E2E 里观察到
-        // 挂死（cmd 停在 /wait 上，NSIS 已不在了）。
-        // 每步写 update.log：万一再挂，用户目录里能直接看到卡在哪一步。
+        // 延迟 5 秒等本进程退出：退出清理（杀下载子进程，上限 2 秒）+ 进程
+        // 死透需要时间，NSIS 覆盖运行中的 exe 会静默失败。
+        // 每步写 update.log：再出问题用户目录里能直接看到卡在哪一步。
         let log = dir.join("update.log");
-        // /V:ON + !errorlevel!：单行 & 链里 %errorlevel% 在解析期就展开（拿到旧值），
-        // 必须延迟展开才能记到安装器的真实退出码。
-        let chain = format!(
-            "(echo spawned & ping -n 6 127.0.0.1 >nul \
-             & echo installing & \"{}\" /S \
-             & echo rc=!errorlevel! & start \"\" \"{}\" \
-             & echo restarted) > \"{}\" 2>&1",
-            tmp.display(),
-            exe.display(),
-            log.display()
+        let bat = dir.join("install-chain.bat");
+        let bat_body = format!(
+            "@echo off\r\n\
+             echo spawned> \"{log}\"\r\n\
+             ping -n 6 127.0.0.1 >nul\r\n\
+             echo installing>> \"{log}\"\r\n\
+             \"{setup}\" /S\r\n\
+             echo rc=%errorlevel%>> \"{log}\"\r\n\
+             start \"\" \"{exe}\"\r\n\
+             echo restarted>> \"{log}\"\r\n",
+            log = log.display(),
+            setup = tmp.display(),
+            exe = exe.display(),
         );
+        std::fs::write(&bat, bat_body).map_err(|e| format!("写安装脚本失败: {e}"))?;
         std::process::Command::new("cmd")
-            .args(["/V:ON", "/C", &chain])
+            .args(["/C", &bat.to_string_lossy()])
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .spawn()
             .map_err(|e| format!("启动安装程序失败: {e}"))?;
