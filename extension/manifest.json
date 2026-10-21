@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "VeloxGrab Downloader",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "把网页里的下载链接、图片、视频直接发给 VeloxGrab 桌面程序下载。",
-  "permissions": ["activeTab", "contextMenus", "scripting", "storage", "downloads", "notifications"],
+  "permissions": ["activeTab", "contextMenus", "scripting", "storage", "downloads", "notifications", "alarms"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"

@@ -45,9 +45,41 @@ use std::time::Duration;
 /// 一个字节的标志不值得为它引入互斥量。
 static EXT_SEEN: AtomicBool = AtomicBool::new(false);
 
+/// 「扩展活跃」的**持久化**副本：`%APPDATA%\VeloxGrab\extension-seen.flag`。
+///
+/// 为什么内存标志不够：EXT_SEEN 随进程清零，而扩展的 ping 只在它的 service
+/// worker 醒来时打（浏览器启动、或用户操作扩展）。典型死锁场景——
+/// 浏览器一直开着（SW 早就睡下，不会再 ping），用户重启 VeloxGrab：
+/// 每次 boot() 查 `extension_active` 都是 false，于是每次启动都弹
+/// 「去加载扩展」引导，哪怕扩展明明装好并在工作。
+/// 落盘一份就彻底解决：收到过一次扩展请求 = 永久事实。
+fn seen_flag_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("VeloxGrab").join("extension-seen.flag"))
+}
+
+/// 首次确认扩展活跃时写盘。只在 false→true 的那一次写，ping 再多也不重复 IO；
+/// 写失败（目录权限等）不影响内存标志，只是下次启动还要靠 ping 重新确认。
+fn persist_seen() {
+    let Some(p) = seen_flag_path() else { return };
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&p, b"1");
+}
+
 /// 前端据此决定要不要继续提示用户去加载扩展。
+///
+/// 内存标志为假时回读一次磁盘（覆盖「扩展上次 ping 过、这次进程还没收到」的
+/// 重启场景），读到就把内存标志补上，避免每次查询都 stat 文件。
 pub fn extension_seen() -> bool {
-    EXT_SEEN.load(Ordering::Relaxed)
+    if EXT_SEEN.load(Ordering::Relaxed) {
+        return true;
+    }
+    let seen = seen_flag_path().map(|p| p.is_file()).unwrap_or(false);
+    if seen {
+        EXT_SEEN.store(true, Ordering::Relaxed);
+    }
+    seen
 }
 
 /// 监听端口。
@@ -125,7 +157,10 @@ fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
             return;
         }
         // 走到这里说明扩展真的在跑，记下来（见 EXT_SEEN 的注释）。
-        EXT_SEEN.store(true, Ordering::Relaxed);
+        // 只在首次翻转时落盘，避免每次 ping 都写文件。
+        if !EXT_SEEN.swap(true, Ordering::Relaxed) {
+            persist_seen();
+        }
     }
 
     // 扩展刚启动时打一次 /ping，只为了上报「我活着」。见 EXT_SEEN 注释：

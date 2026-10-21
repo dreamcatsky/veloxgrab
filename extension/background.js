@@ -30,13 +30,36 @@ const DEFAULTS = { threads: 4, dir: "", intercept: true, notify: true };
 
 chrome.runtime.onInstalled.addListener(() => {
   setupMenus();
+  ensureAlarm();
   chrome.storage.sync.get(Object.keys(DEFAULTS), (s) => {
     chrome.storage.sync.set({ ...DEFAULTS, ...s });
   });
 });
 
 // service worker 会被浏览器随时回收，重启后菜单和状态都得重建。
-chrome.runtime.onStartup.addListener(setupMenus);
+chrome.runtime.onStartup.addListener(() => {
+  setupMenus();
+  ensureAlarm();
+});
+
+// ---------- 心跳（alarms）----------
+//
+// 只在 SW 醒来时 ping 有一个盲区：浏览器长期不关、桌面程序却重启了——
+// 这时 SW 早已休眠、不会再醒，VeloxGrab 永远收不到 ping，就会反复弹
+// 「扩展未安装」引导（用户明明装好了）。alarms 是 MV3 里唯一能定时唤醒
+// SW 的合法机制：每 5 分钟醒一次打一发 ping，本机回环开销可以忽略。
+// 桌面程序侧配合把「见过扩展」落盘（bridge.rs persist_seen），双保险。
+const PING_ALARM = "veloxgrab-ping";
+
+function ensureAlarm() {
+  chrome.alarms.get(PING_ALARM, (a) => {
+    if (!a) chrome.alarms.create(PING_ALARM, { periodInMinutes: 5 });
+  });
+}
+
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === PING_ALARM) ping();
+});
 
 // 每次 SW 醒来都向 VeloxGrab 报一次「我在」。
 //
