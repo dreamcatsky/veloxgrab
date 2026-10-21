@@ -267,17 +267,28 @@ pub async fn update_now(
     {
         use std::os::windows::process::CommandExt;
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        // 5 秒延迟等本进程退出 → 静默安装（等它完成）→ 拉起新版本。
-        // 退出清理（杀下载子进程，上限 2 秒）+ 进程真正死透需要时间，
+        // 延迟 5 秒等本进程退出 → 静默安装 → 拉起新版本。
+        // 退出清理（杀下载子进程，上限 2 秒）+ 进程死透需要时间，
         // NSIS 覆盖运行中的 exe 会静默失败，延迟必须给足。
-        // start 的第一个 "" 是窗口标题占位，不能省，否则带空格的路径会被当标题吃掉。
+        //
+        // 安装用直接调用而不是 `start /wait`：cmd 对直接调用的 exe 本来就
+        // 是等它退出才走下一句，`start /wait` 多一层壳反而在 E2E 里观察到
+        // 挂死（cmd 停在 /wait 上，NSIS 已不在了）。
+        // 每步写 update.log：万一再挂，用户目录里能直接看到卡在哪一步。
+        let log = dir.join("update.log");
+        // /V:ON + !errorlevel!：单行 & 链里 %errorlevel% 在解析期就展开（拿到旧值），
+        // 必须延迟展开才能记到安装器的真实退出码。
         let chain = format!(
-            "ping -n 6 127.0.0.1 >nul & start \"\" /wait \"{}\" /S & start \"\" \"{}\"",
+            "(echo spawned & ping -n 6 127.0.0.1 >nul \
+             & echo installing & \"{}\" /S \
+             & echo rc=!errorlevel! & start \"\" \"{}\" \
+             & echo restarted) > \"{}\" 2>&1",
             tmp.display(),
-            exe.display()
+            exe.display(),
+            log.display()
         );
         std::process::Command::new("cmd")
-            .args(["/C", &chain])
+            .args(["/V:ON", "/C", &chain])
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .spawn()
             .map_err(|e| format!("启动安装程序失败: {e}"))?;
