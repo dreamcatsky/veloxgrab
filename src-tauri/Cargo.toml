@@ -45,6 +45,13 @@ windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    # DPAPI（hf_token / proxy_pass 落盘加密，见 dpapi.rs）。BOOL/HLOCAL/LocalFree
+    # 与 CryptProtectData/CryptUnprotectData 的 blob 类型分别来自 Foundation 与
+    # Security_Cryptography。
+    "Win32_Security_Cryptography",
+    # 把 yt-dlp 输出的 GBK/cp1252 字节按系统代码页解码（decode.rs）。
+    # 见 decode.rs 头注释：PYTHONUTF8 对打包版 yt-dlp.exe 不生效，实测仍吐 GBK。
+    "Win32_Globalization",
 ] }
 
 # 发布构建：LTO + 单 codegen unit 换更好的内联与更小的二进制。

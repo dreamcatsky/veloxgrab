@@ -1,10 +1,13 @@
 pub mod bridge;
 pub mod clipboard;
 pub mod commands;
+pub mod decode;
 pub mod deeplink;
+pub mod dpapi;
 pub mod direct;
 pub mod engine;
 pub mod history;
+pub mod save_dir;
 pub mod settings;
 pub mod tray;
 pub mod update;
