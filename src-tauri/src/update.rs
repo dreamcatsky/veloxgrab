@@ -278,18 +278,24 @@ pub async fn update_now(
         // 每步写 update.log：再出问题用户目录里能直接看到卡在哪一步。
         let log = dir.join("update.log");
         let bat = dir.join("install-chain.bat");
+        // bat 里所有路径都是 `"…" 括起来的，Rust 写盘时又不再转义——一个含
+        // `"` 的安装路径（合法文件名！便携包解压到这类目录完全可能）会闭合引号、
+        // 把后半截变成新命令。写 bat 前把双引号从路径里剥掉：宁可得到一个找不
+        // 到文件的失败步骤（update.log 停在 spawned），也绝不给路径内容开第二个
+        // 命令的位置。current_exe 来自系统而非用户输入，剥引号只是纵深防御。
+        let q = |p: &std::path::Path| p.display().to_string().replace('"', "");
+        let log_s = q(&log);
+        let setup_s = q(&tmp);
+        let exe_s = q(&exe);
         let bat_body = format!(
             "@echo off\r\n\
-             echo spawned> \"{log}\"\r\n\
+             echo spawned> \"{log_s}\"\r\n\
              ping -n 6 127.0.0.1 >nul\r\n\
-             echo installing>> \"{log}\"\r\n\
-             \"{setup}\" /S\r\n\
-             echo rc=%errorlevel%>> \"{log}\"\r\n\
-             start \"\" \"{exe}\"\r\n\
-             echo restarted>> \"{log}\"\r\n",
-            log = log.display(),
-            setup = tmp.display(),
-            exe = exe.display(),
+             echo installing>> \"{log_s}\"\r\n\
+             \"{setup_s}\" /S\r\n\
+             echo rc=%errorlevel%>> \"{log_s}\"\r\n\
+             start \"\" \"{exe_s}\"\r\n\
+             echo restarted>> \"{log_s}\"\r\n",
         );
         std::fs::write(&bat, bat_body).map_err(|e| format!("写安装脚本失败: {e}"))?;
         std::process::Command::new("cmd")
