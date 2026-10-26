@@ -92,6 +92,46 @@ fn truncate_keep_ext(s: &str, max: usize) -> String {
     format!("{base}{ext}")
 }
 
+/// 目录闸门的路径词法折叠：消化 `.`、就地折叠 `..`，并报告是否发生「上跳出根」。
+///
+/// 为什么必须有这一步：**尚未创建的目录 `canonicalize()` 会失败**，而深链
+/// 传进来的 `..\..\Windows\Start Menu\Programs\Startup` 恰恰常常不存在——
+/// 若因为「还没建」就跳过折叠，等于给逃逸开了正门。规则：
+/// - `.` 分量直接丢弃；
+/// - `..` 能吃掉前一个普通分量就吃掉（Pop 恰好只弹一个分量）；
+/// - 吃无可吃（头顶是根/盘符/UNC，或已经弹空还想再弹）时**保留 `..` 分量**
+///   并置 `escaped_up = true`：调用方据此判「想跳出给定的根」，宁拒不猜。
+///
+/// 这是纵深第一层（纯词法，可单测、不碰文件系统）；第二层在调用方：拿真实
+/// 文件系统 canonicalize 最近的存在祖先再做前缀比对，兜住软链/junction 重定向。
+/// 盘符与 UNC 前缀原样保留；相对路径保留相对性（相对根解析由调用方负责）。
+pub fn fold_path_lexically(p: &Path) -> (std::path::PathBuf, bool) {
+    use std::path::{Component, PathBuf};
+
+    let mut out = PathBuf::new();
+    let mut escaped_up = false;
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = out
+                    .components()
+                    .next_back()
+                    .map(|c| matches!(c, Component::Normal(_)))
+                    .unwrap_or(false);
+                if can_pop {
+                    out.pop();
+                } else {
+                    escaped_up = true;
+                    out.push(Component::ParentDir);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    (out, escaped_up)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
