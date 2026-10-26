@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::direct::{self, DirectProbe};
 use crate::engine::{self, CancelToken, Task, TaskState};
+use crate::save_dir;
 use crate::settings::load_settings;
 use crate::settings::Settings;
 use crate::ytdlp::{self, MediaInfo};
@@ -48,7 +49,10 @@ impl AppState {
         // 「下载记录」页面已经删掉（内容与「所有下载/正在下载/已完成」三个筛选
         // 重复），但 history.json 仍是唯一的持久化层：任务表本身只在内存里，
         // 不回灌的话用户每次重启都看到空列表，昨天下的文件一条都找不到。
-        // 回灌出来的都是终态任务，不进队列、不会自己开始下载。
+        //
+        // 回灌出来的任务一律不进队列、不会自己开始下载：终态供筛选和
+        // 「打开所在文件夹」；退出时活跃的（含暂停）回灌成 Paused，
+        // 断点文件还在盘上，用户点「继续」即续传。
         let mut tasks: HashMap<String, Task> = HashMap::new();
         for entry in crate::history::load_history() {
             let task = entry.to_task();
@@ -74,6 +78,96 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// 命令入口统一的「保存目录闸门」（高-1）。
+///
+/// `raw` 是用户/深链/扩展给的目录字符串（已去空白，None/空 = 未指定）。
+/// 返回**最终要存进任务并落盘的路径字符串**（None = 用全局默认目录）。
+///
+/// 判定分三档（见 save_dir 模块头的完整设计）：
+/// - 默认根子树内 → 放行（把相对写法解析成绝对、折叠掉 `..`，后面所有
+///   创建/清理都吃这个定稿路径）；
+/// - 根外但用户此前经原生框同意过 → 放行，不再打扰；
+/// - 根外且陌生 → 弹一次 **OS 级原生确认框**。不用 webview 弹窗：本闸门防的
+///   正是「被污染的页面想让下载写到哪写到哪」，在网页里问一遍等于问贼。
+///   同意后写入信任集（该目录从此不再问，且历史任务重启后仍能续传/清理）；
+///   拒绝返回 Err——**绝不静默改道**，「我说下载到 D 盘结果进了 C 盘」是比
+///   失败更难排查的坑。
+///
+/// 弹框用 blocking API 但挪进 spawn_blocking：这些命令跑在 tokio worker 上，
+/// 直接把原生模态摁在 runtime 线程里会饿死同 worker 的其它 future。
+///
+/// `src` 是原始输入（可能带 `..` 或相对写法），返回是**定稿的绝对路径字符串**
+/// 或 None（用全局默认）——调用方必须把返回值回填进任务，绝不再存原始值。
+async fn admit_save_dir(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    src: Option<String>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogResult};
+
+    let settings = load_settings(state);
+    let root = {
+        let d = settings.download_dir.trim();
+        if d.is_empty() {
+            std::path::PathBuf::from(crate::settings::default_download_dir())
+        } else {
+            std::path::PathBuf::from(d)
+        }
+    };
+    let outcome = save_dir::admit(src.as_deref(), &root, &settings.trusted_dirs);
+    let (cand, needs_prompt) = match outcome {
+        save_dir::Admit::NoDir => return Ok(None),
+        save_dir::Admit::Inside(p) | save_dir::Admit::Trusted(p) => (p, false),
+        save_dir::Admit::Outside(p) => (p, true),
+    };
+
+    // 定稿（canonicalize 或最近存在祖先拼回尾段）必须在**弹框之前**做掉：
+    // 确认框展示的路径要和最终写进任务/信任集的是同一个字符串，否则用户
+    // 批准了 `D:\x\..\y` 落盘的却是 `D:\y`——信任集会记住后者、框却显示前者。
+    // 注意顺序：先定稿再弹框。若在同意之后才定稿，定稿失败会把已获得的
+    // 用户同意作废，报错文案要如实反映「目录无效」而不是「被拒绝」。
+    let display = match save_dir::finalize(&cand) {
+        Ok(d) => d,
+        Err(e) => return Err(format!("保存目录无效：{e}")),
+    };
+    if needs_prompt {
+        let question = format!(
+            "网页/扩展请求把文件下载到默认下载目录之外：\n\n{display}\n\n\
+             确定要下载到这个位置吗？拒绝后将使用默认下载目录。"
+        );
+        let app2 = app.clone();
+        // 原生模态框只在这里弹一次；确认结果决定放行还是拒绝，没有第三条路。
+        // 超时不设：这是用户交互，等人做决定是正确行为而不是缺陷。
+        let accepted = tokio::task::spawn_blocking(move || {
+            match app2
+                .dialog()
+                .message(&question)
+                .title("VeloxGrab：确认下载位置")
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "下载到这里".into(),
+                    "拒绝".into(),
+                ))
+                .blocking_show_with_result()
+            {
+                // 按插件自己的布尔语义判 Yes/Ok；Custom 只在按钮文本被改写的
+                // 平台上出现（部分 Linux 桌面环境），这里 Windows 拿不到它，
+                // 兜底比较自定义文本，宁可保守：认不出来就当作拒绝。
+                MessageDialogResult::Ok | MessageDialogResult::Yes => true,
+                MessageDialogResult::Custom(s) => s == "下载到这里",
+                _ => false,
+            }
+        })
+        .await
+        .map_err(|e| format!("确认框异常: {e}"))?;
+
+        if !accepted {
+            return Err("已拒绝写入该目录；如要下载请改到默认下载目录内".into());
+        }
+        crate::settings::remember_trusted_dir(state, &display);
+    }
+    Ok(Some(display))
 }
 
 /// 打开浏览器扩展所在目录，返回目录路径供前端 reveal。
@@ -320,15 +414,25 @@ pub async fn enqueue_download(
     state: tauri::State<'_, AppState>,
     args: EnqueueArgs,
 ) -> Result<Task, String> {
+    // 与 probe_url / create_direct_task 同一道闸：只放行 http/https。
+    // yt-dlp 的选项注入已经被 `--` 挡住了，但它本身接受 file:// 与裸本地路径——
+    // 少这一句，视频入口就成了「把本机任意文件复制进下载目录」的原语。
+    let url = args.url.trim().to_string();
+    if url.is_empty() {
+        return Err("请输入下载地址".into());
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("地址必须以 http:// 或 https:// 开头".into());
+    }
+    // 保存目录闸门（高-1）：越界目录要经原生确认。定稿后的绝对路径直接回填进
+    // task.save_dir——后续 resolve_task_dir / 清理 / 重下吃的都是它，不再重复判定。
+    let save_dir = admit_save_dir(&app, state.inner(), args.save_dir).await?;
     // 先校验保存目录可写，避免任务排进去才失败。
     // 用任务自己的目录：用户指定的盘符不存在时，这里就该把话说清楚。
     {
         let settings = load_settings(&state);
-        let dir = args
-            .save_dir
+        let dir = save_dir
             .as_deref()
-            .map(str::trim)
-            .filter(|d| !d.is_empty())
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(&settings.download_dir));
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
@@ -341,7 +445,7 @@ pub async fn enqueue_download(
 
     let task = Task {
         id: id.clone(),
-        url: args.url,
+        url,
         title: args.title,
         thumbnail: args.thumbnail,
         duration: args.duration,
@@ -362,11 +466,9 @@ pub async fn enqueue_download(
         // 0 表示交给设置里的默认值；非 0 也夹到 64（与 direct::MAX_THREADS 一致），
         // 防止 IPC 传入离谱的并发数
         threads: args.threads.unwrap_or(0).min(64),
-        // 空串与 None 一视同仁，都表示「用全局默认目录」
-        save_dir: args
-            .save_dir
-            .map(|d| d.trim().to_string())
-            .filter(|d| !d.is_empty()),
+        // 闸门的定稿路径（None = 用全局默认目录）。原始 args.save_dir 不得
+        // 再往下传——那是未经折叠/校验的原始输入。
+        save_dir,
     };
 
     {
@@ -496,27 +598,47 @@ pub fn pump_queue(
             // Drop 也会把槽位还回去，不会泄漏。
             let slot = SlotGuard(ctx.running.clone());
 
-            // 从取出到启动之间，cancel_task 可能刚好把这个任务标成已取消
-            // （它这时已经不在队列里，走的是 token 分支）。这里做最后一次确认，
-            // 顺手把状态推到 Downloading——否则取消掉的任务还会被拉起来跑一遍。
-            let runnable = {
+            // 「置 Downloading」与「插令牌」必须在同一个 tasks 临界区内原子完成。
+            //
+            // 旧顺序是「置 Downloading → 释放锁 → 建令牌 → 插令牌」。在释放锁到
+            // 插令牌这段窗口里，任务已经不在队列（被本泵 pop 走）、又还没有令牌，
+            // cancel_task / pause_task 两头都查不到，只能走「无令牌」分支直接把状态
+            // 写成 Canceled/Paused；紧接着泵又插一个**全新的、未取消的**令牌并
+            // spawn，工作线程把刚被判死刑的任务又拉回 Downloading——界面上
+            // 「已取消」闪一下又变回下载中，排队→启动这一步的任务根本没法取消。
+            //
+            // 合并临界区后这个组合彻底不存在：持有 tasks 锁时「状态是 Downloading」
+            // 与「令牌不在表里」不可能同时出现，而停止命令同样先进这把锁——
+            // 它们要么看到 Queued（泵还没启动它），要么拿到真令牌去 cancel/pause。
+            // 嵌套顺序统一为 tasks → tokens；全代码没有任何「持 tokens 再拿 tasks」
+            // 的路径（worker 收尾摘令牌时不碰 tasks），因此不会形成锁序环。
+            //
+            // 判据用「== Queued」而不是「非终态且非暂停」：重试窗口里引擎会把状态
+            // 短暂写回 Queued 而旧 worker 还活着，表里那个令牌就是「有活着的
+            // worker」的唯一可靠凭证，见下面 contains_key 分支。
+            let token = Arc::new(CancelToken::new());
+            let started = {
                 let mut guard = ctx.tasks.lock().await;
                 match guard.get_mut(&next_id) {
-                    Some(t) if !t.state.is_terminal() && t.state != TaskState::Paused => {
-                        t.state = TaskState::Downloading;
-                        true
+                    Some(t) if t.state == TaskState::Queued => {
+                        let mut tks = ctx.tokens.lock().await;
+                        if tks.contains_key(&next_id) {
+                            // 状态 Queued 但表里有令牌 = 上一个 worker 还在
+                            // （yt-dlp 换 Cookie 重试的间隙），不能再起一轮，
+                            // 否则两个线程写同一份断点文件。这个 id 已被 pop 出
+                            // 队列，旧 worker 收尾后由下一次泵/恢复接手。
+                            false
+                        } else {
+                            t.state = TaskState::Downloading;
+                            tks.insert(next_id.clone(), token.clone());
+                            true
+                        }
                     }
                     _ => false,
                 }
             };
-            if !runnable {
-                continue; // 槽位随作用域释放
-            }
-
-            let token = Arc::new(CancelToken::new());
-            {
-                let mut t = ctx.tokens.lock().await;
-                t.insert(next_id.clone(), token.clone());
+            if !started {
+                continue; // 槽位随作用域释放；失败分支没插过令牌，无需回收
             }
 
             let settings = crate::settings::read_settings_from_disk();
@@ -549,8 +671,15 @@ pub fn pump_queue(
                         .await;
                     }
 
+                    // 只摘「这一轮自己的」令牌：resume→泵可能在本 worker 收尾之前
+                    // 已经给同一个 id 插了新令牌，无条件 remove 会把新轮的令牌
+                    // 偷走——之后的 cancel 查无令牌，只能干改状态，新轮下载变幽灵。
+                    // Arc::ptr_eq 不等就不摘，把归属还给表里的现任。
                     let mut t = ctx_c.tokens.lock().await;
-                    t.remove(&task_c.id);
+                    if t.get(&task_c.id).map(|cur| Arc::ptr_eq(cur, &token)).unwrap_or(false) {
+                        t.remove(&task_c.id);
+                    }
+                    drop(t);
                 }
 
                 // 关键：真正把后续排队任务泵起来。
@@ -819,14 +948,15 @@ pub(crate) async fn create_direct_task(
         .filter(|f| !f.is_empty())
         .map(|f| crate::util::sanitize_filename(&f));
 
+    // 保存目录闸门（高-1）：定稿绝对路径回填进 task.save_dir，后续
+    // resolve_task_dir / redo / remove 都吃它，不再重复判定。
+    let save_dir = admit_save_dir(app, state, save_dir).await?;
+
     // 目录校验前置：盘符不存在时立刻报错，而不是等下载失败
-    let save_dir = save_dir
-        .map(|d| d.trim().to_string())
-        .filter(|d| !d.is_empty());
     {
         let settings = load_settings(state);
         let dir = save_dir
-            .clone()
+            .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(&settings.download_dir));
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;

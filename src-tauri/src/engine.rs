@@ -470,10 +470,28 @@ fn output_template(dir: &str, task: &Task) -> String {
 /// 优先用任务自带的 `save_dir`（用户在新建下载时指定的），为空时退回全局默认。
 /// 目录不存在时创建：用户可能选了可移动磁盘/U 盘，当时在、重启后不在，
 /// 直接 create_dir_all 比报错更符合预期。
+///
+/// save_dir 的**可信性由建任务入口负责**（高-1 的 admit_save_dir：入口做过
+/// 词法折叠 + 根内/canonicalize/信任集判定，回填的是定稿绝对路径；弹框只
+/// 发生在入口那一次，本函数不弹）。但本函数还会在 redo/清理/进度收尾等
+/// 内部路径被反复调用，任务可能来自 history 回灌——持久层在威胁模型里算
+/// 不可信输入，所以这里做最后一次词法兜底：
+/// - 绝对且折叠后不含逃逸 → 使用折叠结果（正常路径，与入口定稿一致）；
+/// - 相对写法 / 折叠仍想上跳（脏数据）→ 落回默认根，绝不把带 `..` 的路径
+///   喂给 create_dir_all / 清理逻辑。位置退到安全根比让整个任务卡死好。
 pub fn resolve_task_dir(settings: &Settings, task: &Task) -> Result<std::path::PathBuf, String> {
+    let fallback = || std::path::PathBuf::from(&settings.download_dir);
     let dir = match task.save_dir.as_deref().map(str::trim) {
-        Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
-        _ => std::path::PathBuf::from(&settings.download_dir),
+        Some(d) if !d.is_empty() => {
+            let p = std::path::Path::new(d);
+            let (folded, esc) = crate::util::fold_path_lexically(p);
+            if p.is_absolute() && !esc {
+                folded
+            } else {
+                fallback()
+            }
+        }
+        _ => fallback(),
     };
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
     Ok(dir)
