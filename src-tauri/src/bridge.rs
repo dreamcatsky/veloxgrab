@@ -21,14 +21,20 @@
 //! 监听地址写死 `127.0.0.1`，外部网络根本连不到。真正的风险是**本机其它程序**
 //! 或恶意网页往这个端口灌下载任务，所以：
 //!
-//! 1. 只接受 `Origin` 为 `chrome-extension://` 的请求。网页 JS 发起的请求
-//!    Origin 一定是 `http(s)://...`，浏览器不允许伪造，这一条挡住了「任意
-//!    网页偷偷让 VeloxGrab 下东西」。
+//! 1. **Origin 必须是扩展来源**（`chrome-extension://` / `moz-extension://`）。
+//!    网页 JS 用 `fetch` 发请求时浏览器一定附上自己的 http(s) Origin → 403；
+//!    而 **不带 Origin 的请求同样拒绝**——这条是后补的洞：`<img src="http://127.0.0.1:58943/add?...">`
+//!    这类普通图片加载**从不发送 Origin**，旧实现把「无 Origin」当 curl 手工
+//!    测试放行，等于给任意网页留了一条静默灌任务的 CSRF 通道（能不能被 Chrome
+//!    的 PNA 提前掐掉取决于浏览器版本与页面自身分类，不能当依赖）。扩展走
+//!    POST + `Content-Type: application/json`，属于非简单请求，真实请求必然
+//!    带 Origin（预检也带），所以默认拒绝不伤正常路径。
 //! 2. 请求体上限 64 KiB、请求头上限 8 KiB，防止本机程序用超长行把内存吃满。
-//! 3. 只解析 `/add` 一个路径，其它一律 404——桥不是通用 RPC。
+//! 3. 只解析 `/add` 与 `/ping` 两个路径，其它一律 404——桥不是通用 RPC。
 //!
-//! 注意 `Origin` 缺失时**也放行**：curl / 手工测试不会带 Origin，而能连上
-//! 127.0.0.1 的本机程序本来就已经能直接调 `veloxgrab://`，拦它没有意义。
+//! curl 手工测试要带 `-H "Origin: chrome-extension://manual-test"`；能连上
+//! 127.0.0.1 的本机进程本来就能直接拉 `veloxgrab://`，这条闸防的是**浏览器
+//! 里的网页**，不是本机进程。
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -147,20 +153,20 @@ fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
         return;
     }
 
-    if let Some(o) = &origin {
-        if !o.starts_with("chrome-extension://") && !o.starts_with("moz-extension://") {
-            let _ = respond(
-                &mut stream,
-                403,
-                "{\"ok\":false,\"error\":\"only browser extensions may use this bridge\"}",
-            );
-            return;
-        }
-        // 走到这里说明扩展真的在跑，记下来（见 EXT_SEEN 的注释）。
-        // 只在首次翻转时落盘，避免每次 ping 都写文件。
-        if !EXT_SEEN.swap(true, Ordering::Relaxed) {
-            persist_seen();
-        }
+    // 安全门禁见文件头「安全边界」：Origin 缺失 = 拒绝（img 加载类无 Origin
+    // 请求曾是静默灌任务的 CSRF 通道）；带 Origin 但不是扩展来源 = 拒绝。
+    if !origin_is_extension(origin.as_deref()) {
+        let _ = respond(
+            &mut stream,
+            403,
+            "{\"ok\":false,\"error\":\"only browser extensions may use this bridge\"}",
+        );
+        return;
+    }
+    // 走到这里说明扩展真的在跑，记下来（见 EXT_SEEN 的注释）。
+    // 只在首次翻转时落盘，避免每次 ping 都写文件。
+    if !EXT_SEEN.swap(true, Ordering::Relaxed) {
+        persist_seen();
     }
 
     // 扩展刚启动时打一次 /ping，只为了上报「我活着」。见 EXT_SEEN 注释：
@@ -295,9 +301,10 @@ fn respond(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<(
         404 => "Not Found",
         _ => "Error",
     };
-    // Access-Control-Allow-Origin 给 * 是安全的：真正的门禁是上面的 Origin 校验，
-    // 而不是这条响应头。扩展拿 host_permissions 本来就跨域，这里加上是为了
-    // 将来用普通网页做测试页时不用改后端。
+    // Access-Control-Allow-Origin 给 * 是安全的：真正的门禁是请求侧的 Origin 校验
+    // （缺失即 403），不是这条响应头。它的存在只为让扩展的 POST JSON 预检
+    // （非简单请求）能顺利通过；网页就算预检过了，真实请求带的 http(s) Origin
+    // 一样被 403 挡住，响应里也没有可利用的信息。
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: application/json; charset=utf-8\r\n\
@@ -319,4 +326,31 @@ fn respond(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<(
 /// 把字符串转义成 JSON 字面量（只用于错误消息）。
 fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Origin 是否是「浏览器扩展」来源。None（请求里没有 Origin）同样拒绝：
+/// 恶意网页的 `<img>` / 顶层导航类请求恰恰是不带 Origin 的那批。
+/// 纯函数，便于单测这条门禁。
+fn origin_is_extension(origin: Option<&str>) -> bool {
+    match origin {
+        Some(o) => o.starts_with("chrome-extension://") || o.starts_with("moz-extension://"),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_gate_requires_extension_origin() {
+        assert!(origin_is_extension(Some("chrome-extension://abcdefghijklmnop")));
+        assert!(origin_is_extension(Some("moz-extension://1234-5678")));
+        // 网页来源、缺失 Origin、空 Origin、前缀伪装都不过
+        assert!(!origin_is_extension(Some("https://evil.example")));
+        assert!(!origin_is_extension(Some("http://localhost:3000")));
+        assert!(!origin_is_extension(None));
+        assert!(!origin_is_extension(Some("")));
+        assert!(!origin_is_extension(Some("xchrome-extension://fake")));
+    }
 }
