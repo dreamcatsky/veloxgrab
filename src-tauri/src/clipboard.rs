@@ -77,6 +77,89 @@ pub fn read_clipboard_text() -> String {
     String::new()
 }
 
+/// 把文本写进剪贴板。
+///
+/// 这是本程序**唯一**会修改系统共享状态的操作，所以收得很窄：只写
+/// CF_UNICODETEXT，清空后只放一份，不碰其它格式（用户复制过一张图片再来点
+/// 「复制链接」，不该顺手把他的图片剪贴内容丢掉）。
+///
+/// 内存所有权是这里最容易写错的地方：`SetClipboardData` 成功后句柄**归系统
+/// 所有**，再 GlobalFree 就是让系统拿着已释放内存；只有 Set 失败时句柄还归
+/// 我们，才必须自己释放。
+#[cfg(windows)]
+pub fn write_clipboard_text(text: &str) -> Result<(), String> {
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+
+    // CF_UNICODETEXT = 13（同读路径的注记：常量在 OLE 模块，为一个数字不值得引）。
+    const CF_UNICODETEXT: u32 = 13;
+
+    // 剪贴板可能被别的程序短暂占着，重试策略与读路径一致。
+    let mut opened = 0;
+    for i in 0..5 {
+        opened = unsafe { OpenClipboard(0) };
+        if opened != 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30 * (i + 1)));
+    }
+    if opened == 0 {
+        return Err("剪贴板正被其它程序占用，稍后再试".into());
+    }
+
+    let result = unsafe { write_locked(text, CF_UNICODETEXT) };
+    unsafe {
+        let _ = CloseClipboard();
+    }
+    result
+}
+
+/// 剪贴板已打开时的写入。调用方保证随后的 CloseClipboard。
+///
+/// # Safety
+/// 必须在 OpenClipboard 成功之后、CloseClipboard 之前调用。
+#[cfg(windows)]
+unsafe fn write_locked(text: &str, format: u32) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::System::DataExchange::{EmptyClipboard, SetClipboardData};
+    use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+
+    // UTF-16 + 结尾 NUL，按字节数分配
+    let mut utf16: Vec<u16> = text.encode_utf16().collect();
+    utf16.push(0);
+    let bytes = utf16.len() * std::mem::size_of::<u16>();
+
+    // 判空用 is_null：GlobalAlloc 返回 HGLOBAL（*mut c_void），不是整数。
+    let handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if handle.is_null() {
+        return Err("分配剪贴板内存失败".into());
+    }
+    let ptr = GlobalLock(handle);
+    if ptr.is_null() {
+        let _ = GlobalFree(handle);
+        return Err("锁定剪贴板内存失败".into());
+    }
+    std::ptr::copy_nonoverlapping(utf16.as_ptr() as *const u8, ptr as *mut u8, bytes);
+    let _ = GlobalUnlock(handle);
+
+    // EmptyClipboard 只释放**被清掉的那份**旧数据，不碰我们刚分配的 handle。
+    if EmptyClipboard() == 0 {
+        let _ = GlobalFree(handle);
+        return Err("清空剪贴板失败".into());
+    }
+    // SetClipboardData 收 HANDLE（isize），HGLOBAL 是裸指针，要显式转。
+    if SetClipboardData(format, handle as isize) == 0 {
+        // 只有 Set 失败时句柄还归我们
+        let _ = GlobalFree(handle);
+        return Err("写入剪贴板失败".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn write_clipboard_text(_text: &str) -> Result<(), String> {
+    Err("本平台未实现剪贴板写入".into())
+}
+
 /// 从剪贴板文本里挑出第一个像 URL 的东西。
 ///
 /// 用户复制的往往是「标题 + 换行 + 链接」或者一段带引号的分享文本，
