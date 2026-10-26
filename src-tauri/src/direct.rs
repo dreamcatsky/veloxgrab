@@ -64,7 +64,31 @@ fn client_with(proxy: Option<&str>) -> Result<reqwest::Client, String> {
         // 会被直接掐断。`read_timeout` 是空闲读超时——30 秒没有新数据才判定断流，
         // 正常的大文件下载不受总时长限制。
         .read_timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(10));
+        // 跳转不能只数次数：入口的 scheme 校验管的是「用户给的 URL」，管不到
+        // 「302 把我们带去哪」。恶意服务器可以一步跳进 169.254.169.254（云元数据），
+        // 或把 https 带签名的下载链降级到 http 明文。判据抽成 redirect_is_allowed
+        // 纯函数（Policy 闭包本身没法单测），这里只接线。
+        // 边界要诚实：只拦 URL 字面量级别的违规。域名解析到内网（true SSRF）不防——
+        // 每次跳转前做 DNS 预检既有 TOCTOU，又误伤「下载 NAS 上的文件」的正当用途：
+        // 局域网/回环是刻意放行的，桌面下载器对用户的内网没有默认敌意。
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("重定向次数过多");
+            }
+            // 先算判定再消费 attempt：previous()/url() 借用了 attempt，
+            // follow()/error() 要移动它，放在 match 分支里会撞上借用检查。
+            let ok = match attempt.previous().last() {
+                Some(from) => {
+                    redirect_is_allowed(from.as_str(), attempt.url().as_str()).is_ok()
+                }
+                None => true,
+            };
+            if ok {
+                attempt.follow()
+            } else {
+                attempt.error("重定向目标被安全策略拒绝")
+            }
+        }));
     if let Some(p) = proxy {
         b = b.proxy(
             reqwest::Proxy::all(p).map_err(|e| format!("代理配置无效: {e}"))?,
@@ -72,6 +96,61 @@ fn client_with(proxy: Option<&str>) -> Result<reqwest::Client, String> {
     }
     b.build()
         .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))
+}
+
+/// 一个 URL 作为下载目标是否放行（初始 URL 与每一跳共用）。
+///
+/// 纯函数：reqwest 的 Policy 闭包没法单测，判据拆开测。
+/// 只按 **字面量** 判：scheme 必须 http/https，host 若写成 IP 则不得是
+/// 链路本地/云元数据段（169.254.0.0/16、fe80::/10）或未指定地址（0.0.0.0、::）。
+/// 边界要诚实：域名解析到内网（true SSRF）不防——每次请求前做 DNS 预检既有
+/// TOCTOU，又误伤「下载 NAS 上的文件」这一正当用途：局域网/回环是刻意放行
+/// 的，桌面下载器对用户的内网没有默认敌意。
+pub(crate) fn url_target_guarded(u: &str) -> Result<(), String> {
+    let parsed = match reqwest::Url::parse(u) {
+        Ok(x) => x,
+        Err(_) => return Err("下载地址不是合法 URL".into()),
+    };
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("下载地址协议不支持: {scheme}"));
+    }
+    if let Some(host) = parsed.host_str() {
+        // url crate 对 IPv6 字面量返回**带方括号**的形式（`[fe80::1]`），
+        // 而 Ipv6Addr::from_str 不认括号——不剥就等于 IPv6 一律 parse 失败、
+        // 原样放行，这条闸就白装了。（回归测试抓到的就是这个。）
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+            if ip.is_link_local() || ip.is_unspecified() {
+                return Err("下载地址指向链路本地/保留地址".into());
+            }
+        } else if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+            // fe80::/10：顶部 10 位固定为 1111111010
+            let first = (u128::from(ip) >> 112) as u16;
+            if ip.is_unspecified() || first & 0xffc0 == 0xfe80 {
+                return Err("下载地址指向链路本地/保留地址".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 从 `from` 跳到 `to` 是否放行：目标本身要过关，且不许 https 降级 http。
+fn redirect_is_allowed(from: &str, to: &str) -> Result<(), String> {
+    url_target_guarded(to)?;
+    // https → http 降级：签名直链、token、Cookie 都可能随之掉进明文信道。
+    // （http → https 升级无害，放行。from 解析不了就不比——目标自己的闸已经过了。）
+    if let Ok(from_url) = reqwest::Url::parse(from) {
+        if from_url.scheme() == "https"
+            && reqwest::Url::parse(to).map(|t| t.scheme() == "http").unwrap_or(false)
+        {
+            return Err("重定向把 HTTPS 降级成了 HTTP".into());
+        }
+    }
+    Ok(())
 }
 
 /// 全局限速：固定 100ms 窗口，窗口内累计字节超预算就睡到下一窗口。
@@ -258,6 +337,11 @@ pub async fn probe_direct(
     cancel: Option<Arc<AtomicBool>>,
     net: &NetCfg,
 ) -> Result<DirectProbe, String> {
+    // 初始 URL 与每一跳过同一道闸（scheme + 字面量保留地址）。commands.rs 的
+    // http(s) 前缀检查只看字符串开头，`https://[fe80::1]/`、`http://0.0.0.0/`
+    // 这类"前缀合法、host 违规"的写法从这里漏过去；跳转后再拦也晚了——
+    // 第一跳就是元数据地址时请求已经发出去了。
+    url_target_guarded(url)?;
     let fut = tokio::time::timeout(PROBE_TIMEOUT, probe_uncached(url, net.proxy.as_deref()));
     let timed_out = || format!("探测超时（{} 秒），服务器响应过慢", PROBE_TIMEOUT.as_secs());
 
@@ -396,8 +480,21 @@ impl PartMeta {
         p
     }
 
+    /// 断点文件的可读上限（字节）。
+    ///
+    /// `.veloxgrab-part` 与目标文件同目录，而目录分量在威胁模型里可被外部
+    /// 写入（旧版本目录闸门缺失时已落盘的目录，以及 history 回灌路径）——
+    /// 一个 4 GB 的「断点文件」不报错、只是被 read_to_string 整个吸进内存。
+    /// 正常元数据 < 4 KiB（64 段 × 2 个 u64 数组 + url），256 KiB 已是十倍余量；
+    /// 超限按「不是断点、是垃圾」处理：返回 None → 调用方从头下。
+    const MAX_FILE_BYTES: u64 = 256 * 1024;
+
     fn load(target: &Path) -> Option<PartMeta> {
-        let text = std::fs::read_to_string(Self::path_for(target)).ok()?;
+        let path = Self::path_for(target);
+        if std::fs::metadata(&path).map(|m| m.len()).ok()? > Self::MAX_FILE_BYTES {
+            return None;
+        }
+        let text = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&text).ok()
     }
 
@@ -564,6 +661,29 @@ async fn download_segment(
             break;
         }
         let chunk = chunk.map_err(|e| format!("读取数据流失败: {e}"))?;
+
+        // 本段的上限是**声明过的** seg_len，一字节都不许多收：恶意/故障服务器
+        // 可以在 Content-Range 里谎报 10 MB、实际流 500 GB——不设闸的话循环会
+        // 一路写穿磁盘，直到文件系统报错才停（盘满期间还会连累别的任务与系统）。
+        // 超额时把「写到 seg_len 为止」的合法部分收进缓冲、落盘后按对端违规报错：
+        // 数据不多不少，续传状态也自洽（断点记到 seg_len），绝不静默截断成
+        // 「看起来成功」。
+        if (written + buf.len() as u64 + chunk.len() as u64) > seg_len {
+            let room = seg_len.saturating_sub(written + buf.len() as u64);
+            buf.extend_from_slice(&chunk[..room as usize]);
+            if !buf.is_empty() {
+                file.write_all(&buf)
+                    .await
+                    .map_err(|e| format!("写入失败: {e}"))?;
+                written += buf.len() as u64;
+                buf.clear();
+                counters.bytes[seg_index].store(written, Ordering::Relaxed);
+            }
+            let _ = file.flush().await;
+            return Err(format!(
+                "服务器发送的数据超出分块声明的范围（>{seg_len} 字节），已中断"
+            ));
+        }
         buf.extend_from_slice(&chunk);
 
         // 攒够一批、或距上次落盘超过 200ms 就写一次。
@@ -632,6 +752,40 @@ fn check_segment_len(seg_len: u64, written: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// 断点元数据与磁盘现状是否自洽。自洽才允许续传，否则整份作废从头下。
+///
+/// 纯函数：伪造的 `.veloxgrab-part` 是威胁模型里的输入，这条判据必须能单测。
+/// `file_len` 是临时文件的实际长度；`ranges` 是**本轮**的分段方案——分段按
+/// 线程数切，线程数一改边界就漂移，旧 done 套新 ranges 等于按错误偏移续传，
+/// 所以逐段比对 `segments_total` 与本轮段长，比「两数组长度相等」更严。
+///
+/// 盘上校验的判据是「每段的写入区间 [start, start+done) 必须完整落在 EOF 内」：
+/// 文件截短只会砍掉尾部——后段谎报的字节其实已经没了，而只查
+/// `done <= file_len` 会漏掉这种（第 4 段的 done 远小于文件偏移照样"过"）。
+/// 各段区间互不重叠地落在 [0, file_len) 内，天然蕴含 done 总和 <= file_len。
+fn resume_is_consistent(
+    m: &PartMeta,
+    url: &str,
+    total: u64,
+    ranges: &[(u64, u64)],
+    file_len: u64,
+) -> bool {
+    m.url == url
+        && (total == 0 || m.total == total)
+        && m.segments_done.len() == ranges.len()
+        && m.segments_total.len() == ranges.len()
+        // 每条声明段长必须等于本轮实际切出来的段长（分段方案没变）
+        && m.segments_total
+            .iter()
+            .zip(ranges)
+            .all(|(t, (s, e))| *t == e - s + 1)
+        // 任何一段都不能声称写得比段长还多；写入区间不得越过 EOF
+        && ranges
+            .iter()
+            .zip(&m.segments_done)
+            .all(|((s, e), d)| *d <= e - s + 1 && s.saturating_add(*d) <= file_len)
+}
+
 /// 决定最终落盘的文件名。
 ///
 /// `override_name` 来自界面上的「保存文件名」输入框。用户通常只写标题、不写
@@ -687,9 +841,48 @@ fn temp_path_for(target: &Path) -> PathBuf {
 ///
 /// 先写临时文件是必须的：分块下载会 `set_len(total)` 预分配，取消时文件已经是
 /// 最终名字 + 完整大小，用户双击得到的是一个黑屏/花屏文件，看不出没下完。
+///
+/// 改名必须走「不覆盖」语义：Windows 上 `std::fs::rename` 底层是
+/// `MOVEFILE_REPLACE_EXISTING`，目标已存在时**静默覆盖**。正常用户也会踩
+/// （同一目录里已有同名文件、或同一链接下第二次），恶意深链 `dir=` + 可预测
+/// 文件名时它就是定向摧毁用户成品的原语。这里改成浏览器「另存为」的惯例：
+/// 占用则递增 `name (1).ext`。
+///
+/// 已知残余窗口：exists 与 rename 之间别的进程刚好创建同名文件，Windows 上
+/// 仍会被替换。这个 TOCTOU 子窗口极小且需要主动竞争，相比改前「永远覆盖」
+/// 已经是质的收敛，暂不为此引入打开-重命名协议。
 fn finish_download(temp: &Path, target: &Path) -> Result<PathBuf, String> {
-    std::fs::rename(temp, target).map_err(|e| format!("重命名临时文件失败: {e}"))?;
-    Ok(target.to_path_buf())
+    let final_target = unique_target(target);
+    std::fs::rename(temp, &final_target).map_err(|e| format!("重命名临时文件失败: {e}"))?;
+    Ok(final_target)
+}
+
+/// 同名冲突时给出下一个空闲名：`movie.mp4` → `movie (1).mp4` → `movie (2).mp4` …
+///
+/// `Path::exists` 在 NTFS 上按 Windows 语义大小写不敏感，`movie.MP4` 也算占用。
+/// 递增到 9999 仍全被占用属于病态目录，返回兜底的时间戳名而不是覆盖——
+/// 数据永远优先于「名字好看」。
+fn unique_target(target: &Path) -> PathBuf {
+    if !target.exists() {
+        return target.to_path_buf();
+    }
+    let stem = target
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".into());
+    let ext = target
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 1..=9999u32 {
+        let cand = target.with_file_name(format!("{stem} ({n}){ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    // 兜底：带时间戳的名字，基本不可能再撞
+    let stamp = crate::commands::now_ms();
+    target.with_file_name(format!("{stem} (dl-{stamp}){ext}"))
 }
 
 /// 清理某个直链任务在下载目录里留下的临时产物。
@@ -757,18 +950,21 @@ pub async fn download_direct(
         }
     }
 
+    let ranges = split_ranges(total, threads);
+
     // 断点续传：元数据与磁盘文件必须互相印证才复用。
     //
-    // 只看 url / 总大小是不够的——用户删掉下到一半的文件、或把同名文件换成了别的内容，
-    // 各分块仍会按旧偏移从中间开始写，产出「长度正确、中间是空洞」的损坏文件，
-    // 而下面的长度校验发现不了（文件本来就被预分配成 total 字节）。
+    // 只看 url / 总大小是不够的。三种盘上损坏都要能拦住（threat：history.json
+    // 与 .veloxgrab-part 都在「不可信输入」清单里）：
+    //  - 文件被删/被截短——旧偏移跳过已写段，set_len 把短文件补回 total，
+    //    产出「长度正确、中间是空洞」的损坏文件，末尾校验发现不了；
+    //  - 某段进度谎报超过段长本身——该段被整体跳过却计入完成度；
+    //  - 分块数变了导致分段边界漂移——旧 done 套在新 ranges 上。
+    // 「同长度换内容」仍然拦不住（要靠哈希重下），注释不再声称能拦。
     let mut resume = PartMeta::load(&target);
     if let Some(m) = &resume {
-        let meta_ok = m.url == url
-            && (total == 0 || m.total == total)
-            && m.segments_done.len() == m.segments_total.len()
-            && m.segments_done.iter().sum::<u64>() <= total;
-        if !meta_ok || !target.is_file() {
+        let file_len = std::fs::metadata(&target).map(|md| md.len()).unwrap_or(0);
+        if !target.is_file() || !resume_is_consistent(m, url, total, &ranges, file_len) {
             resume = None;
             PartMeta::remove(&target);
         }
@@ -960,8 +1156,15 @@ pub async fn download_direct(
         if let Ok(written) = r {
             // 只能取 max。取消恰好发生在分块循环入口时，written 会小于
             // 进度线程已经记录的值，直接赋值会把续传进度回退。
+            //
+            // 取完 max 必须再夹一次段长：download_segment 的早退分支
+            // `already_done >= seg_len → Ok(already_done)` 原样回吐了（可能被
+            // 篡改过的）断点值，上面 final_done 的 min(seg_len) 会被这里重新
+            // 撑破——伪造 meta 把某段报成 >seg_len，本段被整体跳过、完成度却
+            // 已封顶，缺字节校验就形同虚设。夹逼收口在这最后一道写入处。
             if let Some(slot) = meta.segments_done.get_mut(i) {
-                *slot = (*slot).max(*written);
+                let seg_len = meta.segments_total.get(i).copied().unwrap_or(*slot);
+                *slot = (*slot).max(*written).min(seg_len);
             }
         }
     }
@@ -1034,6 +1237,27 @@ async fn download_single(
             return Err("已取消".into());
         }
         let chunk = chunk.map_err(|e| format!("读取数据流失败: {e}"))?;
+
+        // 与分块路径同一道闸：服务器声明了总长（Content-Length）却不守它，
+        // 多发的一律算对端违规，立即中断——不给谎报大小的远端写穿磁盘的机会。
+        // total == 0（无声明长度，如 chunked 且无头）时无从夹逼，原样接受。
+        if total > 0 && (downloaded + buf.len() as u64 + chunk.len() as u64) > total {
+            let room = total.saturating_sub(downloaded + buf.len() as u64);
+            buf.extend_from_slice(&chunk[..room as usize]);
+            if !buf.is_empty() {
+                // 这批是收尾写入，超额分支随后就 return Err，调用方不再读
+                // downloaded，这里不做累加（免得留「赋值未使用」的死存储）。
+                // 不抢限速闸门：马上要报错退出，扣这一批令牌没有意义。
+                file.write_all(&buf)
+                    .await
+                    .map_err(|e| format!("写入失败: {e}"))?;
+                buf.clear();
+            }
+            let _ = file.flush().await;
+            return Err(format!(
+                "服务器发送的数据超出声明的文件大小（>{total} 字节），已中断"
+            ));
+        }
         buf.extend_from_slice(&chunk);
 
         // 与分块路径一致：攒够 256 KiB 或距上次落盘超过 200ms 再写，
@@ -1256,6 +1480,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 回归（安全）：目标同名文件已存在时，改名必须递增避让，**绝不覆盖**。
+    /// 旧实现用 std::fs::rename，Windows 语义是静默替换——用户重复下同一链接
+    /// 会毁掉自己已有的成品；恶意深链配可预测文件名时是定向摧毁原语。
+    #[test]
+    fn finish_download_never_clobbers_existing_file() {
+        let dir = std::env::temp_dir().join(format!("veloxgrab_clobber_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let target = dir.join("movie.mp4");
+        std::fs::write(&target, b"IMPORTANT-USER-DATA").unwrap();
+
+        let temp = temp_path_for(&target);
+        std::fs::write(&temp, b"new-download").unwrap();
+        let out = finish_download(&temp, &target).unwrap();
+
+        // 用户原有文件一字未动
+        assert_eq!(out, dir.join("movie (1).mp4"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"IMPORTANT-USER-DATA");
+        assert_eq!(std::fs::read(&out).unwrap(), b"new-download");
+        assert!(!temp.exists(), "临时文件应该已经被改名");
+
+        // 再撞一次：继续递增到 (2)
+        let temp2 = temp_path_for(&target);
+        std::fs::write(&temp2, b"third").unwrap();
+        let out2 = finish_download(&temp2, &target).unwrap();
+        assert_eq!(out2, dir.join("movie (2).mp4"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 无扩展名 / 中文标题的递增命名同样落在 stem 之后、扩展位之前。
+    #[test]
+    fn unique_target_inserts_counter_before_extension() {
+        let dir = std::env::temp_dir().join(format!("veloxgrab_uname_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bare = dir.join("数据");
+        std::fs::write(&bare, b"x").unwrap();
+        assert_eq!(unique_target(&bare), dir.join("数据 (1)"));
+
+        let with_ext = dir.join("a.b.tar.gz");
+        std::fs::write(&with_ext, b"x").unwrap();
+        // file_stem("a.b.tar.gz") = "a.b.tar"，扩展位只切最后一段
+        assert_eq!(unique_target(&with_ext), dir.join("a.b.tar (1).gz"));
+
+        // 没有冲突时原样返回
+        assert_eq!(unique_target(&dir.join("fresh.mp4")), dir.join("fresh.mp4"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn segment_len_check_treats_written_as_cumulative() {
         // 全新下载：written 从 0 涨到 seg_len，通过。
@@ -1288,5 +1565,97 @@ mod tests {
         for pair in ranges.windows(2) {
             assert_eq!(pair[0].1 + 1, pair[1].0, "段与段之间不能有缝隙或重叠");
         }
+    }
+
+    /// 回归（M-3 断点互证）：伪造/损坏的 `.veloxgrab-part` 不能骗过续传判定。
+    ///
+    /// 判据是纯函数，逐条对应注释里列的三种盘上损坏 + 两种合法场景。
+    #[test]
+    fn resume_is_consistent_rejects_forged_or_stale_meta() {
+        let total = 10 * 1024 * 1024u64;
+        let ranges = split_ranges(total, 4);
+        let seg_len = ranges[0].1 - ranges[0].0 + 1;
+        let good = PartMeta {
+            url: "https://e.com/f.bin".into(),
+            total,
+            segments_total: ranges.iter().map(|(s, e)| e - s + 1).collect(),
+            segments_done: vec![seg_len; 4],
+        };
+        // 写满但文件短了三段：done 总和 > file_len，不成立
+        assert!(!resume_is_consistent(&good, "https://e.com/f.bin", total, &ranges, total - seg_len));
+        // 完整文件 + 全部写满 → 放行（已下完的边界，交给 merge 校验，无害）
+        assert!(resume_is_consistent(&good, "https://e.com/f.bin", total, &ranges, total));
+
+        // 某段谎报进度：done > seg_len（伪造）
+        let mut over = good.clone();
+        over.segments_done[0] = seg_len + 1024;
+        assert!(!resume_is_consistent(&over, "https://e.com/f.bin", total, &ranges, total));
+
+        // 文件被截短到只剩前 3 段：第 4 段声称写满，它的写入区间越过 EOF
+        assert!(!resume_is_consistent(
+            &good, "https://e.com/f.bin", total, &ranges, seg_len * 3
+        ));
+        // 前 3 段写满 + 第 4 段没写，盘长恰好 3 段：这是合法的中断续传
+        let mut three = good.clone();
+        three.segments_done[3] = 0;
+        assert!(resume_is_consistent(
+            &three, "https://e.com/f.bin", total, &ranges, seg_len * 3
+        ));
+        // 同样 meta 但文件被砍到 2 段半：第 3 段的尾部字节没了 → 拒绝
+        assert!(!resume_is_consistent(
+            &three, "https://e.com/f.bin", total, &ranges, seg_len * 2 + seg_len / 2
+        ));
+
+        // url 换人 / 总长换人 / 段数对不上 / 分段边界漂移
+        assert!(!resume_is_consistent(&good, "https://evil.com/f.bin", total, &ranges, total));
+        assert!(!resume_is_consistent(&good, "https://e.com/f.bin", total + 1, &ranges, total));
+        let shifted = split_ranges(total, 5); // 线程数变了，段长不同
+        assert!(!resume_is_consistent(&good, "https://e.com/f.bin", total, &shifted, total));
+        let fewer = split_ranges(total, 2);
+        assert!(!resume_is_consistent(&good, "https://e.com/f.bin", total, &fewer, total));
+
+        // 合法的中段续传：文件预分配成 total（长度够），每段各写了一半
+        let mut half = good.clone();
+        for d in half.segments_done.iter_mut() {
+            *d = seg_len / 2;
+        }
+        assert!(resume_is_consistent(&half, "https://e.com/f.bin", total, &ranges, total));
+        // 但如果文件本身被截短到连「后段写到一半」的区间都容不下，必须拒绝
+        assert!(!resume_is_consistent(
+            &half, "https://e.com/f.bin", total, &ranges, seg_len * 2
+        ));
+    }
+
+    /// M-1：URL 字面量闸门的逐分支判定。
+    #[test]
+    fn url_gate_blocks_metadata_literals_but_not_lan() {
+        // 正常公网 / 局域网 / 回环：放行（桌面下载器对用户内网没有默认敌意）
+        assert!(url_target_guarded("https://example.com/a.zip").is_ok());
+        assert!(url_target_guarded("http://192.168.1.10/share/x.bin").is_ok());
+        assert!(url_target_guarded("http://127.0.0.1:8000/local.mp4").is_ok());
+        // 云元数据 / 未指定地址：拦
+        assert!(url_target_guarded("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(url_target_guarded("http://169.254.1.1/x").is_err());
+        assert!(url_target_guarded("http://0.0.0.0/x").is_err());
+        assert!(url_target_guarded("http://[fe80::1]/x").is_err());
+        assert!(url_target_guarded("http://[::]/x").is_err());
+        // 非 http(s) scheme：拦（file:// 是「复制本机文件」原语）
+        assert!(url_target_guarded("file:///C:/Windows/win.ini").is_err());
+        assert!(url_target_guarded("gopher://x/y").is_err());
+        // 「前缀合法、host 违规」的写法——正是 commands.rs 字符串前缀检查漏掉的
+        assert!(url_target_guarded("https://[fe80::1]/x").is_err());
+    }
+
+    #[test]
+    fn redirect_rejects_https_downgrade_and_bad_targets() {
+        assert!(redirect_is_allowed("https://a.com/f", "https://cdn.b.com/f").is_ok());
+        // https → http 降级拦；http → https 升级放
+        assert!(redirect_is_allowed("https://a.com/f", "http://cdn.b.com/f").is_err());
+        assert!(redirect_is_allowed("http://a.com/f", "https://cdn.b.com/f").is_ok());
+        // 跳到元数据段 / 跳进 file://：一步都不许
+        assert!(redirect_is_allowed("https://a.com/f", "http://169.254.169.254/x").is_err());
+        assert!(redirect_is_allowed("https://a.com/f", "file:///C:/x").is_err());
+        // 目标解析不了 → 拒
+        assert!(redirect_is_allowed("https://a.com/f", "::::").is_err());
     }
 }
