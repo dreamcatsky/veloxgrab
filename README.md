@@ -30,7 +30,7 @@
 ### 通用直链（走内置 HTTP 引擎，不依赖 yt-dlp）
 
 - **自动分流** —— 同一个输入框：识别为媒体站走 yt-dlp，其余按 HTTP 直链处理
-- **多线程分块** —— 用 `Range` 请求把文件切成 N 段并行拉取，1/2/4/8/16 线程可选
+- **多线程分块** —— 用 `Range` 请求把文件切成 N 段并行拉取，1/2/4/8/16/32/64 线程可选
 - **断点续传** —— 每段已写偏移周期性落盘到 `<文件名>.veloxgrab-part`；
   即使进程被强杀，下次启动也能从断点继续
 - **不支持 Range 自动降级** —— 服务端若忽略 `Range` 头，自动退回单流顺序下载
@@ -257,7 +257,7 @@ veloxgrab://https://example.com/file.zip         # 整个 body 就是目标 URL
 ```
 
 参数名做了兼容（`url`/`u`、`name`/`filename`/`f`、`dir`/`d`、`threads`/`t`），
-值一律 `urlencoding` 解码，`threads` 超过 32 会被 clamp。只放行 `http`/`https`
+值一律 `urlencoding` 解码，`threads` 超过 64 会被 clamp。只放行 `http`/`https`
 目标——`file://`、`javascript:` 这类必须挡在外面。
 
 **文件名来源的优先级**：显式 `name` 参数 > `Content-Disposition` > URL 末段 > MIME 类型。
@@ -297,7 +297,7 @@ Rust 侧解析完链接后，**先把结果压进 `AppState.pending_links`，再
 
 ## 测试
 
-仓库内带四个自检程序，对着任意支持 Range 的地址跑端到端验证：
+仓库内带六个自检程序，对着任意支持 Range 的地址跑端到端验证：
 
 ```bash
 cd src-tauri
@@ -314,14 +314,22 @@ cargo run --release --example cancel_test -- "https://example.com/big.bin" 4000 
 
 # 4. 断点续传正确性（先取消一次，再续传比对）
 cargo run --release --example resume_test -- "https://example.com/big.bin" 4500
+
+# 5. Cookie 降级（浏览器 Cookie 读不到时，公开视频仍应解析成功）
+cargo run --release --example cookie_test -- "https://www.youtube.com/watch?v=..."
+
+# 6. 深链解析回归（一行一条 veloxgrab:// 链接，打印解析结果）
+cargo run --release --example link_check -- cases.txt
 ```
 
 `direct_test` 会打印探测结果（是否支持 Range、总大小、建议线程数），下载完成后
 逐字节校验内容，并额外跑一轮“删掉一部分再续传”的一致性检查。
 
-`cargo test --lib` 覆盖 34 个单测：URL 分流、Range 判据、分块切分、续传累计值语义、
+`cargo test --lib` 覆盖 69 个单测：URL 分流、Range 判据、分块切分、续传累计值语义、
 文件名清洗、进度行解析、音频打分、陈旧清理、历史只收终态、深链解析全部形态
-（含 `add` 带斜杠、裸 URL 形态、参数别名、非 http 目标拒绝、threads clamp）。
+（含 `add` 带斜杠、裸 URL 形态、参数别名、非 http 目标拒绝、threads clamp）、
+目录闸门（词法折叠、越界判定、可信集、可删文件校验）、代码页解码（真实 GBK 字节
+回归）、DPAPI 封装与旧明文兼容、本地桥 Origin 闸门、安装链引号剥离。
 
 ### 协议投递的手工验证
 
@@ -390,6 +398,39 @@ yt-dlp 把 Chromium 系浏览器统一按 Chrome 的库路径处理。
 2. **断点记录只能变大不能变小**。分块退出时写 `segments_done` 必须取
    `max(已有值, 本次写入)`。直接用 `*d = written` 赋值的话，取消恰好发生在
    循环刚入口时会把进度线程记好的几 MB 覆盖成 0，续传等于从头再来。
+
+## 安全姿态（已知边界与取舍）
+
+2026-10 全项目审查后的定稿姿态。已修项散见各模块注释，这里只记录**有意保留**
+的边界，避免后来者把「没修」当成「漏了」，也避免把「防线」建在不成立的假设上：
+
+- **威胁模型**：桌面单机应用，无服务端、无鉴权。不可信输入 = 深链/扩展传来的
+  URL 与文件名与目录、HTTP 响应头与响应体、磁盘上的 settings/history/part 文件
+  （手改或半截写）、以及**被 XSS 污染的 webview**——后者是命令层的假想敌，所以
+  命令参数一律按不可信对待（目录闸门、URL 闸门、断点互证），而前端靠
+  「不可信文本一律 textContent」纪律 + CSP 纵深守住注入面。
+- **目录闸门**（save_dir.rs）：默认下载目录子树内直接放行；越界目录首次弹
+  **OS 级原生确认框**（不是 webview 弹窗——XSS 下前端的确认不可信），同意后
+  记入信任集。**刻意放行局域网/回环**（下载 NAS 是正当用途）；「域名解析到
+  内网」的 true SSRF 不做 DNS 预检——有 TOCTOU 且误伤内网用户。重定向逐跳
+  过同一道闸（含拦 https→http 降级、云元数据字面量）。
+- **更新链维持「信任 GitHub 仓库」姿态，未做验签**（产品决定，2026-10-23）：
+  下载源锁死 github 官方三域 + TLS 校验开启 + 大小校验，信任边界与「人去网页
+  上点下载」一致；代价是**仓库账号被盗 = 可推送任意安装包**。要升级这个姿态
+  就引入 minisign（tauri-plugin-updater）或 release 附带 SHA-256 并校验。
+  安装链的 bat 路径做了引号剥离（合法文件名含 `"` 不致注入命令）。
+- **机密存储**：hf_token / proxy_pass 落盘前过 DPAPI（CryptProtectData，
+  用户+机器绑定），settings.json 里只有 `dpapi1:<hex>`；加密失败退回明文
+  （保存失败丢整个配置比不加密更糟），解密失败按未配置处理、绝不把密文漏进
+  请求头。不防同用户身份的进程（DPAPI 公开边界），也不防 XSS（那是 CSP 的活）。
+- **本地桥**（127.0.0.1:58943）：Origin 缺失即 403——只认浏览器扩展的
+  非简单请求；本机进程的利用面维持接受（它能直接拉 veloxgrab://，拦了没意义）。
+- 已知低危未修项：CSP `style-src 'unsafe-inline'` 保留（前端大量动态 style
+  赋值，收益配不上改造成本）；错误回显偶含绝对路径。
+- CSP 的 `script-src` 已收紧到 `'self'`：Tauri 对**自己注入**的初始化脚本自动
+  计算并附加 hash（`dangerous_disable_asset_csp_modification` 保持默认），项目
+  自有 HTML 无内联脚本/内联事件，去 unsafe-inline 零影响。若未来引入第三方
+  内联片段，宁可加显式 hash，不要再开 `unsafe-inline`。
 
 ## 许可
 
