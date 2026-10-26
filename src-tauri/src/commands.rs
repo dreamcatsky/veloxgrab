@@ -705,41 +705,70 @@ pub async fn cancel_task(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
+    cancel_one(&state, &id).await;
+    Ok(())
+}
+
+/// 取消内核（`cancel_task` 与 `remove_task`/`remove_one` 等「先停再删」路径共用）。
+///
+/// 与旧实现的关键区别：**「查令牌 + 落终态」合并进同一个 tasks 临界区**
+/// （令牌表嵌在 tasks 锁内读取，锁序 tasks→tokens 与泵一致，全代码没有反序嵌套）。
+/// 旧写法是「先拿 tokens 锁查一眼 → 放开 → 再拿 tasks 锁写 Canceled」，这两把锁
+/// 之间泵刚好原子提交（置 Downloading + 插新令牌）的话，写进去的 Canceled 会被
+/// 拿着**未取消新令牌**的工作线程踩回 Downloading——和泵自身的老 bug 同一类
+/// 幽灵下载，只是窗口更窄。合并后：泵提交前我们看到 Queued（直接落 Canceled，
+/// 泵随后在锁内复查到非 Queued 会跳过）；泵提交后我们看到真令牌（cancel 它，
+/// 线程自己收尾）。两种时序都不会出现「显示已取消却在下载」。
+async fn cancel_one(state: &AppState, id: &str) {
     // 排队中的任务：直接从队列移除并标记取消
     {
         let mut q = state.queue.lock().await;
-        if let Some(pos) = q.iter().position(|x| x == &id) {
+        if let Some(pos) = q.iter().position(|x| x == id) {
             let _ = q.remove(pos);
             let mut guard = state.tasks.lock().await;
-            if let Some(t) = guard.get_mut(&id) {
+            if let Some(t) = guard.get_mut(id) {
                 t.state = TaskState::Canceled;
                 t.error = Some("已取消".into());
                 // 入队即落盘的取消态也要记进历史
                 crate::history::upsert_entry(t);
             }
-            return Ok(());
+            return;
         }
     }
 
-    // 运行中的任务：置取消标志并杀掉进程树
-    let token = {
-        let t = state.tokens.lock().await;
-        t.get(&id).cloned()
+    // 运行中的任务（或还没被泵接手的）：置取消标志并杀掉进程树。
+    // kill_process_tree 是同步外部进程调用，必须放到锁外做。
+    let kill = {
+        let mut guard = state.tasks.lock().await;
+        let tks = state.tokens.lock().await;
+        if let Some(tok) = tks.get(id) {
+            tok.cancel();
+            // 只在还没进终态时覆盖：worker 摘令牌前会先写终态（Done/Failed），
+            // 那一瞬「令牌还在 + 状态已终」是无条件写会把「已完成」误改成
+            // 「已取消」的组合——断点还被 redo 当作要清理的作废产物，比状态
+            // 难看严重得多。与旧实现的 is_terminal 守卫保持同一判据。
+            if let Some(t) = guard.get_mut(id) {
+                if !t.state.is_terminal() {
+                    t.state = TaskState::Canceled;
+                    t.error = Some("已取消".into());
+                    crate::history::upsert_entry(t);
+                }
+            }
+            Some(tok.clone())
+        } else {
+            if let Some(t) = guard.get_mut(id) {
+                if !t.state.is_terminal() {
+                    t.state = TaskState::Canceled;
+                    t.error = Some("已取消".into());
+                }
+                crate::history::upsert_entry(t);
+            }
+            None
+        }
     };
-    if let Some(token) = token {
-        token.cancel();
-        engine::kill_process_tree(token.pid());
+    if let Some(tok) = kill {
+        engine::kill_process_tree(tok.pid());
     }
-
-    let mut guard = state.tasks.lock().await;
-    if let Some(t) = guard.get_mut(&id) {
-        if !t.state.is_terminal() {
-            t.state = TaskState::Canceled;
-            t.error = Some("已取消".into());
-        }
-        crate::history::upsert_entry(t);
-    }
-    Ok(())
 }
 
 /// 暂停：停止传输但保留断点。
@@ -750,47 +779,14 @@ pub async fn cancel_task(
 /// 2. 队列里的任务只出队不销毁，状态落成 Paused，留着等恢复。
 #[tauri::command]
 pub async fn pause_task(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    // 排队中的任务：直接出队，状态落成暂停
-    {
-        let mut q = state.queue.lock().await;
-        if let Some(pos) = q.iter().position(|x| x == &id) {
-            let _ = q.remove(pos);
-            let mut guard = state.tasks.lock().await;
-            if let Some(t) = guard.get_mut(&id) {
-                t.state = TaskState::Paused;
-                t.error = None;
-            }
-            return Ok(());
-        }
-    }
-
-    // 运行中的任务：置暂停标志并杀掉进程树。
-    // 这里必须先调 pause() 再 kill：pause() 会把 paused 置位，工作线程在
-    // `child.wait()` 返回后会读到它，从而把状态写成 Paused。
-    // 如果先 kill 再 pause，中间那段窗口足够让工作线程落成 Canceled，
-    // 用户点暂停却得到一条已取消的任务，断点还在但再也恢复不了。
-    let token = {
-        let t = state.tokens.lock().await;
-        t.get(&id).cloned()
-    };
-    if let Some(token) = token {
-        token.pause();
-        engine::kill_process_tree(token.pid());
-    } else {
-        // 没有 token 说明它既不在队列也没在跑（比如已经是终态）。
-        // 直接把状态写成暂停，让用户至少能看到意图落库。
-        let mut guard = state.tasks.lock().await;
-        if let Some(t) = guard.get_mut(&id) {
-            if !t.state.is_terminal() {
-                t.state = TaskState::Paused;
-                t.error = None;
-            }
-        }
-        return Ok(());
-    }
-
-    // 状态由工作线程收尾时写；这里不改，避免和它抢同一把锁造成状态回跳。
-    Ok(())
+    // 与 pause_tasks 共用内核。单任务版与批量版各写一遍「查令牌→落状态」迟早
+    // 分叉出「只有其中一条修好竞态」的坑，所以合并到 pause_one。
+    //
+    // pause_one 保留了原「先 pause() 再 kill、状态交给工作线程收尾」的时序：
+    // pause() 会先写 paused 再置 flag，工作线程在 child.wait() 返回后读到它，
+    // 从而落成 Paused 而不是 Canceled；反过来先 kill 会让工作线程抢跑成 Canceled，
+    // 断点虽在但任务再也恢复不了——那段注释讲的是真实踩过的坑，没动。
+    pause_one(&state, &id).await
 }
 
 /// 恢复：把暂停/失败/排队中的任务重新送进队列。
@@ -805,38 +801,9 @@ pub async fn resume_task(
 ) -> Result<(), String> {
     use tauri::Emitter;
 
-    // 先把它从队列里摘掉（如果还在），避免同一个 id 出现两次
-    {
-        let mut q = state.queue.lock().await;
-        q.retain(|x| x != &id);
-    }
-
-    {
-        let mut guard = state.tasks.lock().await;
-        match guard.get_mut(&id) {
-            Some(t) => {
-                if t.state.is_terminal() {
-                    return Err("该任务已结束，无法恢复".into());
-                }
-                // 先把状态改回排队，队列泵只认这个状态
-                t.state = TaskState::Queued;
-                t.error = None;
-            }
-            None => return Err("任务不存在".into()),
-        }
-    }
-
-    // 暂停期间它的取消令牌仍然带着 flag=true（甚至 paused=true），
-    // 直接复用会让新的一轮下载刚启动就立刻停止。摘掉，真正开跑时泵会新建。
-    {
-        let mut tokens = state.tokens.lock().await;
-        tokens.remove(&id);
-    }
-
-    {
-        let mut q = state.queue.lock().await;
-        q.push_back(id.clone());
-    }
+    // 与 resume_tasks 共用内核：旧单任务版在「置 Queued」与「摘旧令牌」之间
+    // 正好给泵留了一个能插新令牌的缝，随后无条件 remove 会把新轮令牌拆掉。
+    resume_one(&state, &id).await?;
 
     let _ = app.emit("tasks-changed", ());
 
@@ -846,44 +813,142 @@ pub async fn resume_task(
     Ok(())
 }
 
+/// 重新下载：对已取消/失败/暂停的任务重新入队。
+///
+/// 与 `resume_task` 的唯一区别：**已取消**任务先清掉旧断点再从头下。
+/// 取消是用户明确表达过「别下了」的终态，残留的 `.veloxgrab-part` /
+/// `.part` 属于作废产物——不清的话，重下会莫名续上上次被丢弃的半截数据。
+/// 失败 / 暂停的断点仍然有效，行为与恢复一致（原地续传）。
 #[tauri::command]
-pub async fn remove_task(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    // 先留一份快照：从任务表删掉之后就没有 title / kind / url，没法再清理临时文件了
-    let snapshot = {
-        let guard = state.tasks.lock().await;
-        guard.get(&id).cloned()
-    };
+pub async fn redo_task(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    use tauri::Emitter;
 
-    // 先取消再删。只从 map 里移除的话，正在跑的下载既停不下来，
-    // 界面上又已经没有这个任务，用户再也找不到取消入口——子进程会一直跑到结束。
-    {
-        let mut q = state.queue.lock().await;
-        q.retain(|x| x != &id);
-    }
-    let token = {
-        let t = state.tokens.lock().await;
-        t.get(&id).cloned()
+    redo_one(&state, &id).await?;
+
+    let _ = app.emit("tasks-changed", ());
+    let ctx = PumpCtx::from_state(&state);
+    tauri::async_runtime::spawn(pump_queue(app, ctx));
+    Ok(())
+}
+
+/// 单个任务的重下内核（`redo_task` 与 `redo_tasks` 共用）。
+async fn redo_one(state: &AppState, id: &str) -> Result<(), String> {
+    // 「查令牌 + 查状态 + 置 Queued + 入队」合并进一个 tasks 临界区（锁序
+    // tasks→tokens 与泵一致）。旧写法先单独查令牌再单独查状态，两次加锁之间
+    // 泵可以完成原子提交——拿着「还没启动」的结论却遇到已经在跑的 worker，
+    // 清断点与写盘打架；末尾那次无条件摘令牌又正好把泵刚插的新轮令牌拆掉。
+    // 合并后这些组合都不存在：要么看到真令牌拒绝，要么状态转换与令牌表一致。
+    let (task, running) = {
+        let guard = state.tasks.lock().await;
+        let running = state.tokens.lock().await.contains_key(id);
+        (guard.get(id).cloned(), running)
     };
-    if let Some(token) = token {
-        token.cancel();
-        engine::kill_process_tree(token.pid());
+    let Some(task) = task else {
+        return Err("任务不存在".into());
+    };
+    if running
+        || matches!(
+            task.state,
+            TaskState::Downloading | TaskState::Merging | TaskState::Queued
+        )
+    {
+        return Err("任务正在下载或排队中，请先取消再重新下载".into());
     }
+    match task.state {
+        // Done 拒绝的理由已经消失一半：finish_download 现在撞名递增避让，
+        // 不再静默覆盖成品。但重下同一个成品仍然会白跑一遍网络再原地多出一份
+        // 重复文件——对用户还是意外，维持拒绝。
+        TaskState::Done => return Err("任务已完成，如需再下请先移除后新建".into()),
+        TaskState::Canceled => {
+            // 清掉作废断点，让本轮真正从头开始。放在锁外做（磁盘 IO 不进临界区）：
+            // 此刻没有 worker 持有这个任务（上面刚验过），且泵要接手必须先在
+            // 锁内看到 Queued——本函数置 Queued 在清断点之后，顺序是安全的。
+            let settings = load_settings(state);
+            let dir = engine::resolve_task_dir(&settings, &task)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&settings.download_dir));
+            engine::cleanup_task_artifacts(&dir, &task);
+        }
+        _ => {}
+    }
+
     {
         let mut guard = state.tasks.lock().await;
-        guard.remove(&id);
+        match guard.get_mut(id) {
+            Some(t) => {
+                let was_canceled = t.state == TaskState::Canceled;
+                t.state = TaskState::Queued;
+                t.error = None;
+                if was_canceled {
+                    // 断点已清，进度必须同步归零，否则界面上还挂着旧进度。
+                    t.progress = 0.0;
+                    t.downloaded_bytes = 0;
+                    t.total_bytes = None;
+                    t.speed = None;
+                    t.eta = None;
+                }
+                // 状态变化即落盘（Queued 会记成 paused）：重下点完立刻退出，
+                // 重启后这条仍是待下任务，而不是历史里的旧终态。
+                crate::history::upsert_entry(t);
+            }
+            None => return Err("任务不存在".into()),
+        }
     }
-    // 历史里也删掉：启动时历史会回灌进任务表，只清内存的话下次启动它又回来了。
-    let _ = crate::history::remove_entry(&id);
+    // 入队放在 tasks 块之外：全局锁序是 queue→tasks→tokens（cancel_one 的
+    // 排队分支持 queue 再拿 tasks），若在 tasks 临界区里拿 queue 就成环。
+    // 「置 Queued」与「push_back」之间的间隙只延迟启动，不影响正确性：
+    // redo_task/redo_tasks 在内核返回后都会自己 spawn 一次泵。
+    {
+        let mut q = state.queue.lock().await;
+        if !q.iter().any(|x| x == id) {
+            q.push_back(id.to_string());
+        }
+    }
+    Ok(())
+}
 
-    // 只清理已经结束的任务：运行中的任务还在写文件，删掉也会被重新创建。
-    // 目录要用任务自己的 save_dir，不是全局默认目录——否则给任务单独设了目录
-    // 的用户，移除任务时半成品会留在原地没人管。
-    if let Some(t) = snapshot.filter(|t| t.state.is_terminal()) {
-        let settings = load_settings(&state);
-        let dir = engine::resolve_task_dir(&settings, &t)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&settings.download_dir));
-        engine::cleanup_task_artifacts(&dir, &t);
+/// 批量重新下载（菜单「重新下载选中」）。返回实际重下的条数，
+/// 正在跑/已完成/不存在的条目被跳过。
+#[tauri::command]
+pub async fn redo_tasks(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    args: IdsArgs,
+) -> Result<usize, String> {
+    let mut ok = 0;
+    for id in args.ids {
+        if redo_one(&state, &id).await.is_ok() {
+            ok += 1;
+        }
     }
+    if ok > 0 {
+        use tauri::Emitter;
+        let _ = app.emit("tasks-changed", ());
+        let ctx = PumpCtx::from_state(&state);
+        tauri::async_runtime::spawn(pump_queue(app, ctx));
+    }
+    Ok(ok)
+}
+
+#[tauri::command]
+pub async fn remove_task(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    // true = 连下载本体一起删（用户明确勾选）；缺省 / false = 只删任务记录，
+    // 成品文件留在盘上（与历史行为一致，避免升级后误删用户文件）。
+    // 注意这里是普通参数不是结构体字段，serde 属性放不了——缺省值靠
+    // Option: 前端不传就是 None → 按 false 处理。
+    delete_files: Option<bool>,
+) -> Result<(), String> {
+    // 与批量版共用内核。旧单任务版把「查令牌→取消→删条目」摊成四段各自加锁的
+    // 步骤，批量版又是另一份略有出入的实现——泵改成原子提交后，这种分叉极易
+    // 出现「只修好一边」的竞态，合并掉。
+    // 任务不存在也返回 Ok：「删除」对不存在的东西按幂等处理，
+    // 前端批量删除的计数在 remove_tasks 里统一给。
+    let _ = remove_one(&state, &id, delete_files.unwrap_or(false)).await;
     Ok(())
 }
 
@@ -1080,7 +1145,7 @@ pub async fn health_check() -> Result<HealthReport, String> {
             c.creation_flags(0x0800_0000);
             if let Ok(o) = c.output().await {
                 report.ytdlp_version =
-                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string());
+                    Some(crate::decode::decode_output(&o.stdout).trim().to_string());
             }
         }
         Err(e) => {
@@ -1106,16 +1171,64 @@ pub async fn health_check() -> Result<HealthReport, String> {
     Ok(report)
 }
 
-/// 取消所有任务（用于退出前清理）
+/// 退出前停掉一切（用于退出/自更新前的清理）。
+///
+/// 语义是「暂停」而不是「取消」：用户在下载中关掉程序，不该把任务打成
+/// 不可恢复的已取消——TDM/IDM 都是下次打开仍躺在列表里、可以接着下。
+/// pause() 之后工作线程会落成 Paused 并写历史，但退出只有 2 秒上限，
+/// 线程未必赶得上：所以这里同步把所有活跃任务直接拍成 Paused 并落历史，
+/// 两边写的是同一份状态，先后顺序不影响结果。
 pub async fn cancel_all(state: &AppState) {
-    let tokens = {
-        let t = state.tokens.lock().await;
-        t.values().cloned().collect::<Vec<_>>()
-    };
-    for token in tokens {
-        token.cancel();
-        engine::kill_process_tree(token.pid());
+    // 退出清理：先「暂停」所有活跃任务（令牌+状态原子处理），再清空令牌表。
+    //
+    // 与旧版的两个区别：
+    // 1. 查令牌与写状态在同一 tasks 临界区（锁序 tasks→tokens，与泵一致）。
+    //    旧版先快照令牌表、放开、再另起临界区写 Paused：两步之间泵可能刚好
+    //    原子提交一个任务（置 Downloading + 插新令牌）。新令牌不在快照里、
+    //    没人 pause() 它，状态却被拍成 Paused——2 秒退出窗口赶不上线程收尾，
+    //    future 被 drop 后 kill_on_drop 是否生效没有文档保证，子进程可能变孤儿
+    //    继续下载。合并后泵与我们在 tasks 锁上互斥，不会再出现「有活令牌但没
+    //    被 pause」的组合。
+    // 2. 结束后清空令牌表。lib.rs 拍成 Paused 后 app.exit(0)，worker 若没赶上
+    //    收尾，resume 类守卫会永远看到幽灵令牌——进程即将退出虽然无实害，但
+    //    把令牌与「活 worker」的对应关系保持干净，让本函数的语义自洽。
+    //    （worker 的摘除带 Arc::ptr_eq 守卫，表已清空时它什么也不做。）
+    let mut kill: Vec<Arc<CancelToken>> = Vec::new();
+    {
+        let mut guard = state.tasks.lock().await;
+        let mut tks = state.tokens.lock().await;
+        for (id, t) in guard.iter_mut() {
+            if matches!(
+                t.state,
+                TaskState::Queued | TaskState::Downloading | TaskState::Merging
+            ) {
+                if let Some(tok) = tks.get(id) {
+                    tok.pause();
+                    kill.push(tok.clone());
+                }
+                t.state = TaskState::Paused;
+                t.error = None;
+                t.speed = None;
+                t.eta = None;
+                crate::history::upsert_entry(t);
+            }
+        }
+        // 与 lib.rs 里「2 秒后 app.exit(0)」的退出语义配套：令牌随进程作废。
+        tks.clear();
     }
+    for tok in &kill {
+        engine::kill_process_tree(tok.pid());
+    }
+}
+
+/// 退出前把历史写线程里攒着的变化强制落盘。
+///
+/// cancel_all 逐条拍 Paused 时只投递给写线程（攒批模型），200ms 窗口可能还没到
+/// 进程就 exit(0) 了——「暂停任务重启后还在」正是靠这几条记录，必须在退出前
+/// flush。等待给 1 秒上限：磁盘卡住时丢的只是合并窗口内的状态（断点文件不受
+/// 影响），比把退出本身卡死好。
+pub fn shutdown_history_writer() {
+    crate::history::flush_blocking(std::time::Duration::from_secs(1));
 }
 
 /// 取走启动阶段收到的 `veloxgrab://` 链接（取走即清空）。
@@ -1163,36 +1276,59 @@ pub async fn start_all(
         return Ok(0);
     }
 
-    {
-        let mut q = state.queue.lock().await;
-        for id in &ids {
-            // 去重：已经在队列里的不要再塞一次，否则同一个任务会被启动两遍
-            if !q.iter().any(|x| x == id) {
-                q.push_back(id.clone());
-            }
-        }
-    }
-    {
+    // 顺序：先置 Queued、后入队。反过来的话，并发的泵可能在两个锁块之间
+    // pop 到状态还是 Failed/Paused 的 id——泵只从 Queued 启动，会把这条直接从
+    // 队列里丢掉，任务就永远躺在「排队中」没人再泵它。
+    //
+    // 置态时一并查令牌表（锁序 tasks→tokens，与泵一致）：表里有令牌 = 上一个
+    // 工作线程还没收尾（pause 之后 child.wait 还没返回，或 yt-dlp 换 Cookie 的
+    // 重试间隙）。这种任务必须跳过，不能像旧代码那样「无条件把令牌删掉再翻成
+    // Queued」——泵的新判据是「Queued 且无令牌即可启动」，删掉活线程的令牌
+    // 会让它对着同一个 id 再插一个新令牌 spawn 第二轮，两个线程写同一份断点。
+    // 等旧线程自己收尾（它摘令牌时会用 Arc::ptr_eq 只摘自己那一份）后，用户
+    // 再点一次「全部开始」即可。返回数以实际翻起的为准。
+    let started = {
         let mut guard = state.tasks.lock().await;
+        let tks = state.tokens.lock().await;
+        let mut ready: Vec<String> = Vec::with_capacity(ids.len());
         for id in &ids {
+            if tks.contains_key(id) {
+                continue;
+            }
             if let Some(t) = guard.get_mut(id) {
+                // 令牌缺席但状态已被别的命令改动（不再 is_resumable）时跳过，
+                // 不把 Downloading/Done 之类硬掰回 Queued。
+                if !t.state.is_resumable() {
+                    continue;
+                }
                 t.state = TaskState::Queued;
                 t.error = None;
+                // 入队要落盘：历史里旧的 paused 记录得跟着翻新，
+                // 否则用户在「全部开始」后立刻退出，重启看到的是暂停
+                crate::history::upsert_entry(t);
+                ready.push(id.clone());
             }
         }
-    }
-    // 暂停时留下的令牌带着 flag=true，不清掉会让重启的任务立刻停下
-    {
-        let mut tokens = state.tokens.lock().await;
-        for id in &ids {
-            tokens.remove(id);
+        // 出 tasks/tokens 临界区后再碰队列（全局锁序 queue→tasks→tokens），
+        // 与 pump 的 queue→tasks 嵌套方向保持一致。
+        drop(guard);
+        drop(tks);
+        {
+            let mut q = state.queue.lock().await;
+            for id in &ready {
+                // 去重：已经在队列里的不要再塞一次，否则同一个任务会被启动两遍
+                if !q.iter().any(|x| x == id) {
+                    q.push_back(id.clone());
+                }
+            }
         }
-    }
+        ready.len()
+    };
 
     let _ = app.emit("tasks-changed", ());
     let ctx = PumpCtx::from_state(&state);
     tauri::async_runtime::spawn(pump_queue(app, ctx));
-    Ok(ids.len())
+    Ok(started)
 }
 
 /// 全部暂停：把每个非终态任务停下去。
@@ -1225,32 +1361,38 @@ pub async fn pause_all(
         q.retain(|x| !set.contains(x));
     }
 
-    let tokens: Vec<(String, Arc<CancelToken>)> = {
-        let t = state.tokens.lock().await;
-        ids.iter()
-            .filter_map(|id| t.get(id).map(|tok| (id.clone(), tok.clone())))
-            .collect()
-    };
-    for (_, token) in &tokens {
-        token.pause();
-        engine::kill_process_tree(token.pid());
-    }
-
-    // 排队中（没有令牌）的任务不会被工作线程收尾，这里直接落状态；
-    // 运行中的交给工作线程写，避免两边抢锁导致状态回跳。
+    // 「查令牌 + 落状态」在一次 tasks 临界区内完成（锁序 tasks→tokens，与泵一致）。
+    // 分两步的旧写法有个真实窗口：快照令牌表之后、写状态之前，泵正好把某个
+    // 队列任务原子提交（置 Downloading + 插新令牌）。它不在快照里，于是被
+    // 直接写成 Paused——可新令牌没人 pause，线程照跑，又是一条「显示已暂停
+    // 却在下载」的幽灵。合并后要么见到真令牌（pause 它，状态交工作线程收尾，
+    // 避免和它抢锁造成状态回跳），要么根本无令牌（直接落 Paused）。
+    // kill_process_tree 是同步外部进程调用，必须挪出临界区再做。
+    let mut kill: Vec<Arc<CancelToken>> = Vec::new();
     {
         let mut guard = state.tasks.lock().await;
+        let tks = state.tokens.lock().await;
         for id in &ids {
-            if tokens.iter().any(|(tid, _)| tid == id) {
-                continue;
-            }
-            if let Some(t) = guard.get_mut(id) {
-                if !t.state.is_terminal() {
-                    t.state = TaskState::Paused;
-                    t.error = None;
+            match tks.get(id) {
+                Some(tok) => {
+                    tok.pause();
+                    kill.push(tok.clone());
+                }
+                None => {
+                    if let Some(t) = guard.get_mut(id) {
+                        if !t.state.is_terminal() {
+                            t.state = TaskState::Paused;
+                            t.error = None;
+                            crate::history::upsert_entry(t);
+                        }
+                    }
                 }
             }
         }
+    }
+    // 先 pause() 再 kill 的顺序在循环里就保证了（pause 在上面已做完）
+    for tok in &kill {
+        engine::kill_process_tree(tok.pid());
     }
 
     let _ = app.emit("tasks-changed", ());
@@ -1259,8 +1401,21 @@ pub async fn pause_all(
 
 /// 恢复选中 / 暂停选中 / 删除选中 的公共入参。
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdsArgs {
     pub ids: Vec<String>,
+    /// 仅「删除选中」使用：true = 连下载本体一起删。
+    ///
+    /// `#[serde(default)]` 是必须的——这个结构体同时给 resume_tasks /
+    /// pause_tasks / remove_tasks 用，那两条命令的调用方不会传这个字段。
+    /// 默认 false = 保守语义（只删任务记录），与升级前行为一致。
+    ///
+    /// `alias = "deleteFiles"`：项目里 Tauri 对**结构体字段**不做驼峰转换
+    /// （后端字段名就是 JSON 键，见 EnqueueArgs.format_id 的既有约定），
+    /// 前端如果写成 `deleteFiles` 会被 serde 当成未知字段、再由 default
+    /// 补成 false —— 静默变成「不删文件」，最难查的一类 bug。两边都收。
+    #[serde(default, alias = "deleteFiles")]
+    pub delete_files: bool,
 }
 
 /// 批量恢复。
@@ -1316,35 +1471,45 @@ async fn pause_one(state: &AppState, id: &str) -> Result<(), String> {
             if let Some(t) = guard.get_mut(id) {
                 t.state = TaskState::Paused;
                 t.error = None;
+                crate::history::upsert_entry(t);
             }
             return Ok(());
         }
     }
 
-    let token = {
-        let t = state.tokens.lock().await;
-        t.get(id).cloned()
-    };
-    match token {
-        Some(token) => {
-            token.pause();
-            engine::kill_process_tree(token.pid());
-            Ok(())
-        }
-        None => {
-            // 既不在队列也没令牌：可能已经结束，也可能还没启动。后者也允许暂停。
-            let mut guard = state.tasks.lock().await;
-            match guard.get_mut(id) {
-                Some(t) if !t.state.is_terminal() => {
-                    t.state = TaskState::Paused;
-                    t.error = None;
-                    Ok(())
+    // 「查令牌 + 落状态意图」同样合并进 tasks 临界区（锁序 tasks→tokens 与泵一致）。
+    // 分两步写的旧窗口：pause 查令牌时泵还没提交 → 走「无令牌」分支；泵随即原子
+    // 启动；pause 再把 Downloading 踩成 Paused——令牌没被暂停，线程照跑，
+    // 又是一个「显示已暂停却在下载」的幽灵。合并后互斥于泵，两种时序都收敛：
+    //   - 见到真令牌：只 pause()，状态交给工作线程收尾（沿用旧设计，避免和它
+    //     抢同一把锁造成状态回跳——这正是这里不直接写 Paused 的原因）；
+    //   - 没有令牌：非终态直接落 Paused。
+    let kill = {
+        let mut guard = state.tasks.lock().await;
+        let tks = state.tokens.lock().await;
+        match tks.get(id) {
+            Some(tok) => {
+                tok.pause();
+                Some(tok.clone())
+            }
+            None => {
+                match guard.get_mut(id) {
+                    Some(t) if !t.state.is_terminal() => {
+                        t.state = TaskState::Paused;
+                        t.error = None;
+                        crate::history::upsert_entry(t);
+                    }
+                    Some(_) => return Err("该任务已结束".into()),
+                    None => return Err("任务不存在".into()),
                 }
-                Some(_) => Err("该任务已结束".into()),
-                None => Err("任务不存在".into()),
+                None
             }
         }
+    };
+    if let Some(tok) = kill {
+        engine::kill_process_tree(tok.pid());
     }
+    Ok(())
 }
 
 /// 单个任务的恢复内核（`resume_task` 与 `resume_tasks` 共用）。
@@ -1353,23 +1518,37 @@ async fn resume_one(state: &AppState, id: &str) -> Result<(), String> {
         let mut q = state.queue.lock().await;
         q.retain(|x| x != id);
     }
+    // 「查令牌 + 置 Queued」合并进一个 tasks 临界区（锁序 tasks→tokens 与泵一致）。
+    // 表里还有令牌 = 上一个工作线程还没收尾（多半是 pause 之后、线程读到
+    // paused 标志之前的窗口，或 Cookie 重试间隙——后者状态就是 Queued）。
+    // 这时翻态入队会踩穿泵的新不变式：旧线程手里那个令牌与新一轮的写者
+    // 身份无法区分，两个线程会写同一份断点文件。与 redo_one 同一条判据：
+    // 拒绝，让旧线程收尾（它摘令牌时 Arc::ptr_eq 只摘自己那份），用户稍后
+    // 再点一次「继续」。旧设计是「摘掉旧令牌再入队」——泵的新判据下那等于
+    // 亲手制造双线程窗口，所以这里改成守卫而不是清理。
     {
         let mut guard = state.tasks.lock().await;
+        if state.tokens.lock().await.contains_key(id) {
+            return Err("上一次停止还在收尾，请稍后再试".into());
+        }
         match guard.get_mut(id) {
             Some(t) => {
-                if t.state.is_terminal() {
-                    return Err("该任务已结束，无法恢复".into());
+                // 与 resume_task 同一判据：Failed 可续传，Done/Canceled 拒绝。
+                if !t.state.is_resumable() {
+                    return Err(match t.state {
+                        TaskState::Done => "任务已完成，无需恢复".into(),
+                        TaskState::Canceled => "任务已取消，无法恢复".into(),
+                        _ => "该任务无法恢复".into(),
+                    });
                 }
                 t.state = TaskState::Queued;
                 t.error = None;
+                // 落盘覆盖旧记录：重启前这一刻如果进程没了，重启看到的
+                // 应该是排队中（历史记成 paused 回灌），而不是旧的失败态。
+                crate::history::upsert_entry(t);
             }
             None => return Err("任务不存在".into()),
         }
-    }
-    // 暂停期间留下的令牌仍有 flag=true，复用会让新一轮立刻停下
-    {
-        let mut tokens = state.tokens.lock().await;
-        tokens.remove(id);
     }
     {
         let mut q = state.queue.lock().await;
@@ -1378,61 +1557,193 @@ async fn resume_one(state: &AppState, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 批量删除的返回：区分「删了几个任务」和「真删掉了几个文件」。
+///
+/// 为什么不再只返回 usize：`delete_files=true` 时删文件可能**部分失败或
+/// 被安全判据拒绝**（文件被占用、路径不在任务目录、符号链接…）。旧实现
+/// 只把这些原因 eprintln 掉——release 版是 GUI 程序，eprintln 没有落点，
+/// 用户看到的就是「点了确认、任务没了、文件还在」。必须让失败可见。
+#[derive(serde::Serialize)]
+pub struct RemoveReport {
+    /// 实际移除的任务条数
+    pub removed: usize,
+    /// 实际从磁盘删掉的文件数
+    pub files_deleted: usize,
+    /// 逐条失败原因（已脱敏为「文件名 + 原因」）
+    pub errors: Vec<String>,
+}
+
 /// 批量删除：先杀进程、清临时文件，再从任务表移除。
 #[tauri::command]
 pub async fn remove_tasks(
     state: tauri::State<'_, AppState>,
     args: IdsArgs,
-) -> Result<usize, String> {
-    let mut ok = 0;
+) -> Result<RemoveReport, String> {
+    let mut report = RemoveReport {
+        removed: 0,
+        files_deleted: 0,
+        errors: Vec::new(),
+    };
     for id in args.ids {
-        if remove_one(&state, &id).await {
-            ok += 1;
+        let outcome = remove_one(&state, &id, args.delete_files).await;
+        if outcome.removed {
+            report.removed += 1;
+        }
+        if outcome.file_deleted {
+            report.files_deleted += 1;
+        }
+        if let Some(why) = outcome.file_error {
+            report.errors.push(why);
         }
     }
-    Ok(ok)
+    Ok(report)
 }
 
-/// 删除单个任务的完整流程，返回是否真的删掉了。
+/// `remove_one` 的结果：把「任务删没删」与「文件删没删」拆开报。
+///
+/// 分开报的理由：这两件事**可以一个成功一个失败**——目标文件被别的程序
+/// 占用、路径被判据拒绝、用户提前手删……。原来的实现是「先删任务记录、
+/// 再删文件」，文件删失败时记录已经没了，界面上只剩一条错误提示，用户
+/// **没有任何办法重试**。现在反过来：文件没删成就不动任务记录。
+struct RemoveOutcome {
+    removed: bool,
+    file_deleted: bool,
+    /// 面向用户的失败原因：文件名 + 原因，不含完整路径（日志/提示都不必暴露）
+    file_error: Option<String>,
+}
+
+/// 删除单个任务的完整流程。
 ///
 /// 与 `remove_task` 命令分开是为了让批量版不必重复实现「避免泄漏临时文件」
 /// 的那段逻辑——那段逻辑少一句就会在下载目录里留下半个 GB 的残片。
-async fn remove_one(state: &AppState, id: &str) -> bool {
-    // 还在跑就先停：不然删了任务表，进程还在写文件
-    if let Some(token) = {
-        let t = state.tokens.lock().await;
-        t.get(id).cloned()
-    } {
+///
+/// `delete_files`：是否连**已下载的成品**一起删。默认 false 时行为与历史一致
+/// （只清任务记录 + 临时残片，成品留在盘上）。为 true 时还要过
+/// `save_dir::check_deletable_file` 的把关——`output_path` 来自磁盘上的
+/// history.json，属于不可信输入，不能直接喂给 remove_file。
+///
+/// **顺序**：先删文件、成功了才删任务记录。失败则整个任务原样保留（只清掉
+/// 已经摘走的令牌，任务回到可重试状态），让用户能再点一次。
+async fn remove_one(state: &AppState, id: &str, delete_files: bool) -> RemoveOutcome {
+    let mut outcome = RemoveOutcome {
+        removed: false,
+        file_deleted: false,
+        file_error: None,
+    };
+
+    // 第一步：先把成品删掉。只读快照，不摘令牌——删文件失败时任务必须原样
+    // 留在表里，所以这一步不能有任何「已提交」的副作用。
+    if delete_files {
+        let snapshot = {
+            let guard = state.tasks.lock().await;
+            guard.get(id).cloned()
+        };
+        if let Some(task) = &snapshot {
+            // 正在下载的任务没有成品可言，交给下面正常移除
+            let running = { state.tokens.lock().await.contains_key(id) };
+            if !running {
+                let settings = load_settings(state);
+                let dir = engine::resolve_task_dir(&settings, task)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(&settings.download_dir));
+                if let Some(out) = task.output_path.as_deref() {
+                    match delete_output_file(out, &dir) {
+                        Ok(()) => outcome.file_deleted = true,
+                        Err(why) => {
+                            // 文件没删掉 → 任务一个字都不动，直接带着原因返回。
+                            // 用户重试时走的还是同一条路径，问题解决后即可成功。
+                            outcome.file_error = Some(why);
+                            return outcome;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 第二步：摘令牌 + 删任务记录（原子，锁序 tasks→tokens 与泵一致）。
+    //
+    // 泵只有两条可能时序，都收敛：
+    //  - 我们先抢到 tasks 锁：任务从表里消失，泵 pop 后 get None 直接 continue，
+    //    永远不会为已删除的任务插新令牌起 ghost 轮次；
+    //  - 泵先原子提交（置 Downloading + 插令牌）：我们看到真令牌，cancel + kill，
+    //    线程自己收尾。旧写法「查令牌」与「删条目」分两段加锁，两段之间提交的
+    //    轮次没人 cancel——删了任务文件却继续被下完，正是这个组合的产物。
+    // 快照与 remove 同区取得：清临时文件需要 kind/title/save_dir，条目删掉之后
+    // 就再也没有这些字段了。kill_process_tree 是同步外部进程调用，放锁外。
+    let (token, snapshot) = {
+        let mut guard = state.tasks.lock().await;
+        let mut tks = state.tokens.lock().await;
+        (tks.remove(id), guard.remove(id))
+    };
+    if let Some(token) = &token {
         token.cancel();
         engine::kill_process_tree(token.pid());
     }
+    outcome.removed = snapshot.is_some();
 
     {
         let mut q = state.queue.lock().await;
         q.retain(|x| x != id);
     }
 
-    let snapshot = {
-        let guard = state.tasks.lock().await;
-        guard.get(id).cloned()
-    };
+    // 历史也得删：启动时历史会回灌进任务表，只清内存的话下次启动它又回来了。
+    let _ = crate::history::remove_entry(id);
 
     if let Some(task) = &snapshot {
         // 删除时清临时文件：用户删掉任务就是要它彻底消失，
         // 留着 .veloxgrab-part 下次同名下载会莫名其妙地续上一个旧进度。
         // 目录必须用任务自己的 save_dir：单独设过目录的任务，
         // 用全局默认目录去找会扑空，残片就永远留在那儿。
-        let settings = load_settings(state);
-        let dir = engine::resolve_task_dir(&settings, task)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&settings.download_dir));
-        engine::cleanup_task_artifacts(&dir, task);
+        // 还在跑（摘到过令牌）的任务跳过：文件被工作线程的句柄锁着，
+        // Windows 上删除本来就失败，残片交给 7 天陈旧清理兜底。
+        // 成品文件在第一步就已经删掉了，这里只管残片。
+        if token.is_none() {
+            let settings = load_settings(state);
+            let dir = engine::resolve_task_dir(&settings, task)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&settings.download_dir));
+            engine::cleanup_task_artifacts(&dir, task);
+        }
     }
+    outcome
+}
 
-    let mut guard = state.tasks.lock().await;
-    let gone = guard.remove(id).is_some();
-    // 历史也得删：启动时历史会回灌进任务表，只清内存的话下次启动它又回来了。
-    let _ = crate::history::remove_entry(id);
-    gone
+/// 删除一个任务的成品文件，返回面向用户的失败原因。
+///
+/// 三层处理：精确路径 → 编码损坏的兜底查找 → 明确报错。
+/// 单独抽出来是因为它同时要照顾「路径合法但文件被占用」和
+/// 「路径本身是坏的（历史遗留 cp936 编码）」两类情况。
+fn delete_output_file(output_path: &str, task_dir: &std::path::Path) -> Result<(), String> {
+    let target = match save_dir::check_deletable_file(output_path, task_dir) {
+        Ok(p) => p,
+        Err(why) => {
+            // 精确路径不通时，先试「编码损坏的历史记录」救援路径。
+            // 老版本把 yt-dlp 的 cp936 输出当 UTF-8 解，中文名存成了问号，
+            // 这些任务的 output_path 指向一个不存在的文件。
+            match save_dir::find_file_for_broken_path(output_path, task_dir) {
+                Some(p) => p,
+                None => {
+                    let name = std::path::Path::new(output_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| output_path.to_string());
+                    return Err(format!("{name}：{why}"));
+                }
+            }
+        }
+    };
+
+    match std::fs::remove_file(&target) {
+        Ok(()) => Ok(()),
+        // 已经不在了：用户要的结果已经达成，不算失败
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            let name = target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "文件".into());
+            Err(format!("{name}：{e}（可能正被其他程序占用）"))
+        }
+    }
 }
 
 /// 清空所有任务（不分状态），同时删掉各自的临时文件。
@@ -1487,6 +1798,64 @@ pub async fn clear_all_tasks(
 pub async fn clipboard_url() -> Result<String, String> {
     let text = crate::clipboard::read_clipboard_text();
     Ok(crate::clipboard::extract_first_url(&text).unwrap_or_default())
+}
+
+/// 打开一个已完成任务的文件（右键菜单「打开」/ 双击行）。
+///
+/// 路径来自任务表，而任务表可被 history.json 回灌——持久层算不可信输入。
+/// 所以这里不只是「把字符串交给 shell」：
+/// - 必须存在且是文件（目录不走这条路，防「打开」变成「用默认程序打开随机目录」）；
+/// - 必须是本程序库内认知的文件（存在即可，因为用户本来就指定了任意目录下载）；
+/// - 用 opener 的 open_path（内部走 ShellExecuteW），不拼命令行，无注入面。
+///
+/// 故意**不**在此处做「下载目录闸门」：文件已经落在盘上了，打开它是用户对
+/// 自己文件的正当操作，与「往哪写」是两件事。
+#[tauri::command]
+pub async fn open_task_file(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let p = std::path::PathBuf::from(path.trim());
+    if p.as_os_str().is_empty() {
+        return Err("文件路径为空".into());
+    }
+    if !p.is_file() {
+        return Err("文件不存在或不是普通文件（可能已被移动/删除）".into());
+    }
+    app.opener()
+        .open_path(p.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| format!("打开文件失败: {e}"))
+}
+
+/// 在系统资源管理器里定位一个已完成文件（选中它）。
+///
+/// 与 `open_task_file` 的区别：这个只打开文件夹并高亮，不会启动文件关联的
+/// 程序——对「.exe/.bat 下载完」这类场景，定位比直接执行安全得多，所以右键
+/// 菜单的默认项用它。
+#[tauri::command]
+pub async fn reveal_task_file(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let p = std::path::PathBuf::from(path.trim());
+    if p.as_os_str().is_empty() {
+        return Err("文件路径为空".into());
+    }
+    if !p.exists() {
+        return Err("文件不存在（可能已被移动/删除）".into());
+    }
+    app.opener()
+        .reveal_item_in_dir(&p)
+        .map_err(|e| format!("定位文件失败: {e}"))
+}
+
+/// 复制文本到剪贴板（右键菜单「复制下载链接」/「复制文件路径」）。
+///
+/// 只写文本，格式固定 CF_UNICODETEXT，不碰其它格式——写剪贴板是本程序唯一
+/// 会**修改**系统共享状态的操作，越窄越好。最多重试几次（剪贴板被别的程序
+/// 短暂占用是常态），失败如实返回。
+#[tauri::command]
+pub async fn copy_text(text: String) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("没有可复制的内容".into());
+    }
+    crate::clipboard::write_clipboard_text(&text)
 }
 
 /// 打开下载文件夹（菜单「文件 → 打开下载文件夹」）。
