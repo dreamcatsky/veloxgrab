@@ -99,10 +99,25 @@ function setupMenus() {
       title: "把当前页面链接发给 VeloxGrab",
       contexts: ["page"],
     });
+    // 媒体右键发给**页面地址**而不是 srcUrl。
+    //
+    // 原因（实测）：视频站的 <video> 元素 src 多是 `blob:`（B 站、抖音、
+    // YouTube 的 MSE 播放都是），VeloxGrab 只接 http/https，发过去必然被拒；
+    // 即便 srcUrl 是真 https（个别站点的直链），它也只是**一段没有音轨的
+    // 视频流**，下下来是个哑片。
+    // 发页面地址则走 yt-dlp 解析，能拿到完整清晰度列表和音轨——这才是
+    // 用户右键「下载这个视频」真正想要的东西。
     chrome.contextMenus.create({
       id: "veloxgrab-media",
-      title: "用 VeloxGrab 下载此媒体",
+      title: "用 VeloxGrab 解析并下载此视频",
       contexts: ["image", "video", "audio"],
+    });
+    // 图片/音频的 src 常常就是可直接下载的原文件（没有 blob 化），
+    // 给它留一条「按媒体地址直下」的路，否则下图片会变成去解析图片页。
+    chrome.contextMenus.create({
+      id: "veloxgrab-media-direct",
+      title: "直接下载此媒体文件",
+      contexts: ["image", "audio"],
     });
   });
 }
@@ -191,6 +206,13 @@ function getConfig() {
 async function send(target) {
   if (!target || !target.url) return false;
 
+  // 0. 拦在源头：VeloxGrab 只处理 http/https。
+  //    blob: 是页面内存里的临时地址（MSE 播放），出不了浏览器进程；
+  //    data: 同理。发过去只会得到一句「必须以 http 或 https 开头」的后端错误，
+  //    而且用户还看不到（右键菜单是 fire-and-forget）。这里直接判否，
+  //    交给调用方给出可操作的提示。
+  if (!/^https?:/i.test(target.url)) return false;
+
   // 1. 本地桥
   try {
     const ctrl = new AbortController();
@@ -276,22 +298,64 @@ function notify(title, message) {
 
 // ---------- 右键菜单 ----------
 
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+/**
+ * 右键菜单的统一出口。
+ *
+ * `send()` 是异步的，而 `contextMenus.onClicked` 不会等它——原来这里直接
+ * 裸调 `send(...)` 不接 Promise，桥不通/协议被拦时的失败**完全静默**，
+ * 用户只觉得「点了没反应」。这里统一 await + catch + 通知。
+ */
+async function handleMenuClick(info, tab) {
   const cfg = await getConfig();
   const base = { threads: cfg.threads, dir: cfg.dir };
+  const pageUrl = info.pageUrl || (tab && tab.url) || "";
+
+  let target = null;
 
   if (info.menuItemId === "veloxgrab-link" && info.linkUrl) {
-    send({ ...base, url: info.linkUrl, filename: guessName(info.linkUrl) });
+    target = { ...base, url: info.linkUrl, filename: guessName(info.linkUrl) };
+  } else if (info.menuItemId === "veloxgrab-media") {
+    // 媒体右键 → 发页面地址，交给 VeloxGrab 用 yt-dlp 解析。
+    // 见 setupMenus 里关于 blob: 的说明。
+    if (pageUrl) {
+      target = { ...base, url: pageUrl, filename: "" };
+    }
+  } else if (info.menuItemId === "veloxgrab-media-direct" && info.srcUrl) {
+    // 只接受可直接下载的 http/https 地址；blob:/data: 明确拒绝并告诉用户
+    if (/^https?:/i.test(info.srcUrl)) {
+      target = { ...base, url: info.srcUrl, filename: guessName(info.srcUrl) };
+    } else {
+      notify(
+        "这个媒体无法直接下载",
+        "它是指向内存的临时地址（blob:/data:），请改用「解析并下载此视频」"
+      );
+      return;
+    }
+  } else if (info.menuItemId === "veloxgrab-page") {
+    if (pageUrl) target = { ...base, url: pageUrl, filename: guessName(pageUrl) };
+  }
+
+  if (!target) {
+    notify("没有可发送的链接", "这个位置没有可下载的地址");
     return;
   }
-  if (info.menuItemId === "veloxgrab-media" && info.srcUrl) {
-    send({ ...base, url: info.srcUrl, filename: guessName(info.srcUrl) });
+
+  let ok = false;
+  try {
+    ok = await send(target);
+  } catch (e) {
+    notify("发送失败", String(e).slice(0, 200));
     return;
   }
-  if (info.menuItemId === "veloxgrab-page") {
-    const url = info.pageUrl || (tab && tab.url);
-    if (url) send({ ...base, url, filename: guessName(url) });
+  if (!ok) {
+    notify("VeloxGrab 没有响应", "请确认 VeloxGrab 正在运行（托盘图标可见）");
   }
+}
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  handleMenuClick(info, tab).catch((e) => {
+    notify("发送失败", String(e).slice(0, 200));
+  });
 });
 
 // ---------- popup 消息 ----------
