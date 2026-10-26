@@ -172,6 +172,56 @@ body {
   padding-right: 4px;
 }
 
+/* ---------- 任务行右键菜单 ---------- */
+/* fixed 定位由 app.js 按鼠标坐标给 top/left，并按视口边界收拢，避免贴边溢出。
+   z-index 要高于 .menu-pop(50)，因为右键菜单可能在菜单展开时被唤起。 */
+.ctx-menu {
+  position: fixed;
+  min-width: 190px;
+  padding: 5px;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px var(--shadow);
+  z-index: 200;
+}
+
+.ctx-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: default;
+  white-space: nowrap;
+}
+
+.ctx-item:hover { background: var(--accent); color: var(--on-accent); }
+
+/* 不可用项：置灰且不吃鼠标事件。用 disabled 属性 + 这个类双保险，
+   因为 :hover 在 disabled 的 button 上某些 webview 版本仍会触发。 */
+.ctx-item[disabled] {
+  color: var(--dim);
+  opacity: .55;
+  pointer-events: none;
+}
+
+/* 破坏性操作（移除任务）用错误色，与普通项拉开距离 */
+.ctx-item.danger:not([disabled]) { color: var(--err); }
+.ctx-item.danger:hover { background: var(--err); color: #fff; }
+
+.ctx-sep {
+  height: 1px;
+  margin: 5px 8px;
+  background: var(--border);
+}
+
 /* ---------- 图标工具栏（第二排） ---------- */
 /* 对齐 TDM Fast：图标在上、文字在下，每个按钮等宽，靠左排列。
    工具栏不参与滚动，始终贴在菜单栏下方。 */
@@ -504,6 +554,15 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 .banner.error { border-color: var(--err); color: var(--err); }
 .banner.warn { border-color: var(--warn); color: var(--warn); }
+
+/* 破坏性操作按钮（「连文件一起删」）。用错误色边框而不是实心红：
+   这个弹窗的默认动作应该是「只删任务」，危险动作用边框示警即可，
+   实心红会把视觉权重抢过来，等于诱导用户点最危险的那个。 */
+.danger-btn { border-color: var(--err) !important; color: var(--err) !important; }
+.danger-btn:hover { background: var(--err) !important; color: #fff !important; }
+/* 删除确认弹窗里正文需要换行（任务名列表） */
+#delBody { line-height: 1.7; white-space: pre-wrap; user-select: text; }
+#delBody .dim { color: var(--dim); }
 
 .hidden { display: none !important; }
 

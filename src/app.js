@@ -240,6 +240,7 @@
     miOpenDir: "Open download folder",
     miFromClipboard: "Add URL from clipboard",
     miResumeSel: "Resume selected",
+    miRedoSel: "Redownload selected",
     miPauseSel: "Pause selected",
     miDeleteSel: "Delete selected",
     miClearAll: "Clear all tasks",
@@ -250,6 +251,15 @@
     miSetupExt: "Enable browser extension…",
     miCheckUpdate: "Check for updates…",
     miAbout: "About VeloxGrab",
+    cxOpen: "Open file",
+    cxReveal: "Show in folder",
+    cxCopyPath: "Copy file path",
+    cxCopyUrl: "Copy download link",
+    cxPause: "Pause",
+    cxResume: "Resume",
+    cxRedo: "Redownload",
+    cxRemove: "Remove task",
+    cxRemoveFile: "Delete task and file",
     upInstall: "Update now",
     upLater: "Later",
     upAvailable: "New version available",
@@ -323,7 +333,54 @@
   // ---------- 添加 URL 弹窗 ----------
   function openAddUrl() {
     $("addOverlay").classList.remove("hidden");
+    // 弹窗可能被复用：上次留下的解析结果还在，先按当前状态把入口收拢
+    syncStartButtons();
     setTimeout(() => $("urlInput").focus(), 30);
+  }
+
+  // ---------- 「开始下载」入口互斥 ----------
+  //
+  // 弹窗里本来有三个开始按钮：手动新建(#ndStart)、媒体卡片(#downloadBtn)、
+  // 直链卡片(#dDownloadBtn)。前两个语义不同（「别解析，直接下」vs「按这个
+  // 解析结果下」），合并成一个会丢信息；但同屏出现两个一模一样的按钮，
+  // 用户不知道该点哪个。
+  //
+  // 做法：同一时刻只让一个能用——
+  //   · 解析出结果（媒体/直链卡片可见）→ 收起并禁用手动新建区
+  //   · 没有解析结果 → 手动新建区可用
+  // 收起用 <details> 的 open 属性；禁用用 disabled（遮住「按钮还在但点了
+  // 没反应」的困惑——禁用态至少视觉上能看出不可点）。
+  function syncStartButtons() {
+    const resolved =
+      !$("mediaCard").classList.contains("hidden") ||
+      !$("directCard").classList.contains("hidden");
+
+    const nd = $("newDownload");
+    const ndStart = $("ndStart");
+    const ndHint = $("ndDisabledHint");
+
+    if (resolved) {
+      // 解析出结果了：收起手动新建，避免两个「开始下载」并排
+      if (nd) nd.open = false;
+      if (ndStart) ndStart.disabled = true;
+      if (ndHint) ndHint.classList.remove("hidden");
+    } else {
+      if (ndStart) ndStart.disabled = false;
+      if (ndHint) ndHint.classList.add("hidden");
+      // 没有解析结果时，手动新建就是主入口，展开它省一次点击。
+      // 直接在解析失败后自动展开会让用户以为「解析没生效」，
+      // 所以只在弹窗刚打开（无解析状态）时做——由 openAddUrl 调用。
+    }
+  }
+
+  // 用户一旦在手动新建区里动手（展开它、填地址），说明他想走直链路径，
+  // 就把解析结果清掉——否则又回到「两个按钮都能点」的状态。
+  function preferManualEntry() {
+    $("mediaCard").classList.add("hidden");
+    $("directCard").classList.add("hidden");
+    currentMedia = null;
+    currentDirect = null;
+    syncStartButtons();
   }
 
   function closeAddUrl() {
@@ -393,6 +450,7 @@
     $("directCard").classList.add("hidden");
     currentMedia = null;
     currentDirect = null;
+    syncStartButtons();
 
     const btn = $("parseBtn");
     btn.disabled = true;
@@ -460,6 +518,7 @@
 
     $("dFilenameInput").value = d.filename || "";
     $("directCard").classList.remove("hidden");
+    syncStartButtons();
   }
 
   async function doDirectDownload() {
@@ -568,6 +627,7 @@
     updateFmtDetail(info);
 
     $("mediaCard").classList.remove("hidden");
+    syncStartButtons();
   }
 
   function updateFmtDetail(info) {
@@ -637,11 +697,210 @@
   // 用 Set 而不是数组：菜单里「暂停选中」可能在几千条任务上跑，includes 是 O(n)。
   const selectedIds = new Set();
 
+  const ACTIVE_STATES = new Set(["queued", "downloading", "merging"]);
+
   function toggleSelect(id, on) {
     if (on) selectedIds.add(id);
     else selectedIds.delete(id);
     updateSelHint();
   }
+
+  // ---------- 任务行右键菜单 ----------
+  //
+  // 设计要点（三条都踩过坑才这么定）：
+  // 1. **右键作用于「这一行」还是「选中集合」**：IDM/浏览器下载器都是「右键
+  //    未选中项 → 只操作它；右键已选中项 → 操作整个选中集合」。这里照抄：
+  //    右键落在未选中行上会先把它变成唯一选中项，再按选中集合操作。
+  // 2. **菜单项按状态置灰而不是隐藏**：位置固定的菜单比忽长忽短的菜单好点。
+  // 3. **关闭时机**：点任意处 / 滚动 / 窗口失焦 / Esc 都要关，否则会有一个
+  //    永远挂在屏幕上的幽灵菜单（webview 里尤其明显）。
+
+  const ctxMenu = $("ctxMenu");
+  // 这次右键的目标任务 id（单条）。批量操作时仍以 selectedIds 为准。
+  let ctxTargetId = null;
+
+  function hideCtxMenu() {
+    if (ctxMenu) ctxMenu.classList.add("hidden");
+  }
+
+  function showCtxMenu(x, y, task) {
+    if (!ctxMenu || !task) return;
+    ctxTargetId = task.id;
+
+    // 右键菜单的「选中语义」：落在未选中行上 → 只选它。
+    // 落在已选中行上 → 保留现有选中集合（用户可能刚 Ctrl+A 想批量操作）。
+    if (!selectedIds.has(task.id)) {
+      selectedIds.clear();
+      selectedIds.add(task.id);
+      updateSelHint();
+      // 行高亮要跟着变：这里不能 refreshTasks 全量重建（会丢右键上下文），
+      // 只同步所有行的 selected 类。
+      document.querySelectorAll(".task-row").forEach((r) => {
+        r.classList.toggle("selected", selectedIds.has(r.dataset.id));
+        const cb = r.querySelector(".task-check");
+        if (cb) cb.checked = selectedIds.has(r.dataset.id);
+      });
+    }
+
+    // 菜单项可用性：按**主目标**（右键那一行）的状态决定，因为批量操作里
+    // 「打开文件/复制路径」只对已完成任务有意义，而主目标最能代表用户意图。
+    const done = task.state === "done" && !!task.output_path;
+    const acting = ACTIVE_STATES.has(task.state);
+    const paused = task.state === "paused" || task.state === "failed";
+    const setEnabled = (name, on) => {
+      const b = ctxMenu.querySelector(`[data-ctx="${name}"]`);
+      if (b) b.disabled = !on;
+    };
+    setEnabled("open", done);
+    setEnabled("reveal", done);
+    setEnabled("copyPath", done);
+    setEnabled("copyUrl", !!task.url);
+    setEnabled("pause", acting);
+    setEnabled("resume", paused);
+    setEnabled("redo", !acting && task.state !== "done");
+    setEnabled("remove", true);
+    // 「删除任务和文件」只在主目标是已完成且有成品时可用：其余情况删无可删，
+    // 灰掉比点了弹「没有可删的文件」更清楚。
+    setEnabled("removeWithFile", done);
+
+    // 先显示再量尺寸，才能按视口边界收拢（否则贴右下角的菜单会被切掉）
+    ctxMenu.classList.remove("hidden");
+    const rect = ctxMenu.getBoundingClientRect();
+    const pad = 6;
+    const maxX = window.innerWidth - rect.width - pad;
+    const maxY = window.innerHeight - rect.height - pad;
+    ctxMenu.style.left = Math.max(pad, Math.min(x, maxX)) + "px";
+    ctxMenu.style.top = Math.max(pad, Math.min(y, maxY)) + "px";
+  }
+
+  // 事件委托：行是动态重建的，逐行挂 contextmenu 会随 refreshTasks 反复增删监听。
+  $("taskList").addEventListener("contextmenu", (e) => {
+    const row = e.target.closest(".task-row");
+    if (!row) return;
+    const task = taskMap.get(row.dataset.id);
+    if (!task) return;
+    e.preventDefault();
+    showCtxMenu(e.clientX, e.clientY, task);
+  });
+
+  ctxMenu.addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-ctx]");
+    if (!btn || btn.disabled) return;
+    const action = btn.dataset.ctx;
+    const main = ctxTargetId ? taskMap.get(ctxTargetId) : null;
+    const picked = [...selectedIds]
+      .map((id) => taskMap.get(id))
+      .filter(Boolean);
+    hideCtxMenu();
+
+    try {
+      if (action === "open") {
+        const targets = picked.filter((t) => t.state === "done" && t.output_path);
+        if (!targets.length) return toast("选中的任务还没有可打开的文件", true);
+        // 多个文件时全开；Windows 默认程序会各自起窗口
+        for (const t of targets) {
+          await invoke("open_task_file", { path: t.output_path });
+        }
+      } else if (action === "reveal") {
+        const targets = picked.filter((t) => t.state === "done" && t.output_path);
+        if (!targets.length) return toast("选中的任务还没有完成的文件", true);
+        for (const t of targets) {
+          await invoke("reveal_task_file", { path: t.output_path });
+        }
+      } else if (action === "copyPath") {
+        const paths = picked
+          .filter((t) => t.state === "done" && t.output_path)
+          .map((t) => t.output_path);
+        if (!paths.length) return toast("没有可复制的文件路径", true);
+        // 多条时换行分隔：粘进资源管理器地址栏/记事本都能直接用
+        await invoke("copy_text", { text: paths.join("\n") });
+        toast(paths.length > 1 ? `已复制 ${paths.length} 个文件路径` : "已复制文件路径");
+      } else if (action === "copyUrl") {
+        const urls = picked.map((t) => t.url).filter(Boolean);
+        if (!urls.length) return toast("没有可复制的链接", true);
+        await invoke("copy_text", { text: urls.join("\n") });
+        toast(urls.length > 1 ? `已复制 ${urls.length} 个下载链接` : "已复制下载链接");
+      } else if (action === "pause") {
+        const n = await invoke("pause_tasks", { args: { ids: picked.map((t) => t.id) } });
+        toast(n > 0 ? `已暂停 ${n} 个任务` : "没有可暂停的任务");
+        refreshTasks();
+      } else if (action === "resume") {
+        const n = await invoke("resume_tasks", { args: { ids: picked.map((t) => t.id) } });
+        toast(n > 0 ? `已恢复 ${n} 个任务` : "没有可恢复的任务");
+        refreshTasks();
+      } else if (action === "redo") {
+        const n = await invoke("redo_tasks", { args: { ids: picked.map((t) => t.id) } });
+        toast(n > 0 ? `已重新下载 ${n} 个任务` : "没有可重下的任务");
+        refreshTasks();
+      } else if (action === "remove") {
+        const ids = picked.map((t) => t.id);
+        const ok = confirm(
+          `确定移除选中的 ${ids.length} 个任务吗？\n\n正在下载的任务会被中止，未完成的临时文件会被删除。\n（已下载完成的文件会保留在硬盘上；如需连文件一起删，请用「删除任务和文件」）`
+        );
+        if (!ok) return;
+        const r = await invoke("remove_tasks", { args: { ids } });
+        ids.forEach((id) => selectedIds.delete(id));
+        updateSelHint();
+        toast(`已移除 ${r.removed} 个任务`);
+        refreshTasks();
+      } else if (action === "removeWithFile") {
+        // 只对「有成品文件」的已完成任务生效，其余任务退回普通移除：
+        // 让用户在混合选区里点这一项时不必先筛一遍。
+        const ids = picked.map((t) => t.id);
+        const done = picked.filter((t) => t.state === "done" && t.output_path);
+        if (!done.length) {
+          toast("选中的任务里没有已下载完成的文件");
+          return;
+        }
+        const skip = ids.length - done.length;
+        const ok = confirm(
+          `确定删除 ${done.length} 个任务的下载文件吗？\n\n` +
+            `文件会从硬盘上永久删除，无法恢复。\n` +
+            (skip > 0 ? `另有 ${skip} 个未完成的任务只移除记录（没有成品文件）。\n` : "") +
+            `\n下载目录：${done[0].save_dir || "默认下载目录"}`
+        );
+        if (!ok) return;
+        // 返回值是 { removed, files_deleted, errors }：文件删除可能失败
+        // （被占用 / 判据拒绝）。后端现在**文件没删成就不动任务记录**，
+        // 所以失败时任务仍在列表里，用户能直接重试。
+        const r = await invoke("remove_tasks", { args: { ids, delete_files: true } });
+        if (r.errors && r.errors.length) {
+          // 失败的留着不勾掉，方便用户对着这几行再点一次
+          toast(
+            `${r.errors.length} 个文件未能删除，任务已保留，可稍后重试：\n${r.errors.join("\n")}`,
+            true
+          );
+        } else {
+          ids.forEach((id) => selectedIds.delete(id));
+          updateSelHint();
+          toast(`已删除 ${r.removed} 个任务及其文件（共 ${r.files_deleted} 个文件）`);
+        }
+        refreshTasks();
+      }
+    } catch (err) {
+      toast(String(err), true);
+    }
+  });
+
+  // 关闭时机：点击别处 / Esc / 滚动 / 窗口失焦 / 尺寸变化
+  document.addEventListener("mousedown", (e) => {
+    if (ctxMenu && !ctxMenu.contains(e.target)) hideCtxMenu();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") hideCtxMenu();
+  });
+  window.addEventListener("blur", hideCtxMenu);
+  window.addEventListener("resize", hideCtxMenu);
+  // 用捕获阶段：滚动事件不冒泡，挂在 document 上默认收不到
+  document.addEventListener("scroll", hideCtxMenu, true);
+  // 右键本身在别处按下时也要关（否则会同时开出两个菜单）
+  document.addEventListener(
+    "contextmenu",
+    (e) => {
+      if (ctxMenu && !e.target.closest(".task-row")) hideCtxMenu();
+    },
+    true
+  );
 
   function updateSelHint() {
     const n = selectedIds.size;
@@ -659,11 +918,12 @@
     hint.classList.toggle("hidden", n === 0);
 
     // 全选框跟着走：只剩部分选中时用 indeterminate，
-    // 让用户一眼看出「不是全选也不是没选」。
+    // 让用户一眼看出「不是全选也不是没选」。基数用**当前视图可见集**——
+    // 用 taskMap 全量的话，在「已完成」里全选完勾选框会一直卡在半选态。
     const all = $("selectAll");
     if (all) {
-      const total = taskMap.size;
-      all.checked = n > 0 && n === total;
+      const total = visibleIds().length;
+      all.checked = n > 0 && n >= total;
       all.indeterminate = n > 0 && n < total;
     }
   }
@@ -817,6 +1077,20 @@
         }
       };
       actCell.appendChild(r);
+    } else if (t.state === "canceled") {
+      // 取消是终态：断点作废，所以这里给「重下」而不是「继续」——
+      // 后端会先清掉 .veloxgrab-part / .part 再从头入队。
+      const r = el("button", "icon-btn", "重下");
+      r.title = "重新下载（清除旧断点，从头开始）";
+      r.onclick = async () => {
+        try {
+          await invoke("redo_task", { id: t.id });
+          refreshTasks();
+        } catch (e) {
+          toast(String(e), true);
+        }
+      };
+      actCell.appendChild(r);
     } else if (done && t.output_path) {
       const o = el("button", "icon-btn", "打开");
       o.title = "打开所在文件夹";
@@ -852,8 +1126,6 @@
     const total = t.total_bytes || t.downloaded_bytes;
     if (sz && total) sz.textContent = fmtBytes(total);
   }
-
-  const ACTIVE_STATES = new Set(["queued", "downloading", "merging"]);
 
   // 侧边栏计数 + 状态栏。只依赖 taskMap，不必为了更新它们再跑一次 IPC。
   function updateSummary() {
@@ -1206,6 +1478,7 @@
       }
 
       case "resumeSelected":
+      case "redoSelected":
       case "pauseSelected":
       case "deleteSelected": {
         const ids = [...selectedIds];
@@ -1213,23 +1486,58 @@
           toast("请先在任务列表里勾选任务", true);
           break;
         }
+        // 弹窗要按状态分流（有几个有成品文件），所以要拿任务快照。
+        // 拿不到（任务刚好被清掉）就按"没有成品文件"处理，走保守分支。
+        const picked = ids.map((id) => taskMap.get(id)).filter(Boolean);
         try {
+          // 批量操作的后端内核都是「逐条判断、不该动的跳过」，提示必须带上
+          // 跳过数：选了 5 个只动了 2 个而不说原因，看起来就像功能坏了。
+          const report = (verb, n, why) => {
+            const skipped = ids.length - n;
+            toast(skipped > 0 ? `${verb} ${n} 个任务（跳过 ${skipped} 个：${why}）` : `${verb} ${n} 个任务`);
+          };
           if (cmd === "resumeSelected") {
             const n = await invoke("resume_tasks", { args: { ids } });
-            toast(`已恢复 ${n} 个任务`);
+            report("已恢复", n, "正在下载、已结束或正在收尾");
+          } else if (cmd === "redoSelected") {
+            const n = await invoke("redo_tasks", { args: { ids } });
+            report("已重新下载", n, "正在下载或已完成");
           } else if (cmd === "pauseSelected") {
             const n = await invoke("pause_tasks", { args: { ids } });
-            toast(`已暂停 ${n} 个任务`);
+            report("已暂停", n, "已结束或正在收尾");
           } else {
-            // 删除和「清空」一样是不可撤销的：正在下的会被中止，临时文件会被清掉。
+            // 删除是不可撤销的：正在下的会被中止，临时文件会被清掉。
             // 不确认的话，误点一次 Del 就白下几十分钟。
-            const ok = confirm(
-              `确定删除选中的 ${ids.length} 个任务吗？\n\n正在下载的任务会被中止，未完成的临时文件会被删除。`
-            );
-            if (!ok) break;
-            const n = await invoke("remove_tasks", { args: { ids } });
-            toast(`已删除 ${n} 个任务`);
-            ids.forEach((id) => selectedIds.delete(id));
+            //
+            // 三条路给用户自己选，而不是替他决定删不删文件：
+            //   · 只删任务记录 —— 磁盘上的成品保留（原来的唯一行为）
+            //   · 连文件一起删 —— 成品 + 任务都没了，用户要的"真删除"
+            //   · 还有什么都不做
+            // 用三按钮 confirm 而不是先删任务再追问：顺序一反过来，
+            // 删文件失败时任务已经没了，用户连重试的抓手都没有。
+            const doneCount = picked.filter((t) => t.state === "done" && t.output_path).length;
+            const choice = await askDeleteMode(ids.length, doneCount);
+            if (choice === "cancel") break;
+
+            const withFiles = choice === "withFiles";
+            const r = await invoke("remove_tasks", {
+              args: withFiles ? { ids, delete_files: true } : { ids },
+            });
+
+            if (withFiles && r.errors && r.errors.length) {
+              // 后端「文件没删成就不动任务记录」：失败的仍在列表里，
+              // 所以这里不清选中，用户可直接再点一次。
+              toast(
+                `${r.errors.length} 个文件未能删除，任务已保留，可稍后重试：\n${r.errors.join("\n")}`,
+                true
+              );
+            } else if (withFiles) {
+              toast(`已删除 ${r.removed} 个任务及其文件（共 ${r.files_deleted} 个文件）`);
+              ids.forEach((id) => selectedIds.delete(id));
+            } else {
+              toast(`已删除 ${r.removed} 个任务（文件保留在硬盘上）`);
+              ids.forEach((id) => selectedIds.delete(id));
+            }
           }
           refreshTasks();
         } catch (e) {
@@ -1290,7 +1598,7 @@
            <p><b>浏览器集成</b>：菜单「帮助 → 启用浏览器扩展」会把扩展目录和
               edge://extensions 一起给你，加载一次后网页点下载就会自动转给 VeloxGrab。</p>
            <p><b>暂停与恢复</b>：暂停保留断点，点「继续」从原位置接着下；
-              「取消」才会真正放弃。</p>`
+              「取消」会放弃断点，之后用行内「重下」或菜单「重新下载选中」从头再下。</p>`
         );
         break;
 
@@ -1460,12 +1768,75 @@
     listen("update-available", (evt) => {
       showUpdateDialog(evt.payload);
     });
+
+    // 托盘菜单的常用动作：Rust 侧只负责把窗口拉到前台 + 发命令名，
+    // 具体执行与提示全部复用 runMenuCommand —— 托盘、菜单栏、快捷键
+    // 三条入口必须走同一个执行器，否则迟早出现三份行为不一致。
+    listen("tray-command", (evt) => {
+      const cmd = evt && evt.payload;
+      if (typeof cmd === "string" && cmd) runMenuCommand(cmd);
+    });
   }
 
   function showInfo(title, html) {
     $("infoTitle").textContent = title;
     $("infoBody").innerHTML = html;
     $("infoOverlay").classList.remove("hidden");
+  }
+
+  /**
+   * 删除方式确认：三选一，返回 "withFiles" | "tasksOnly" | "cancel"。
+   *
+   * 为什么不用原生 confirm：它只有两态，而「删任务」和「删文件」的后果
+   * 差一个数量级（前者可重下，后者不可恢复）。用二选一逼用户猜，就只能
+   * 二选一：要么永远不删文件（就是原来的问题），要么把删文件当默认
+   * （误删风险）。这里把三个选项都摆出来，默认焦点给最保守的那个。
+   *
+   * `doneCount` 决定弹窗文案：选取里没有成品文件时，「连文件一起删」
+   * 这个按钮要置灰，否则点了什么都不会发生，看起来像坏了。
+   */
+  function askDeleteMode(total, doneCount) {
+    const haveFiles = doneCount > 0;
+    $("delTitle").textContent = `删除 ${total} 个任务`;
+    $("delBody").textContent =
+      `选中的 ${total} 个任务会被移除。` +
+      (haveFiles
+        ? `\n其中 ${doneCount} 个任务有已下载完成的文件。`
+        : `\n其中没有已下载完成的文件（未完成的临时文件总会被清理）。`);
+
+    const warn = $("delWarn");
+    if (haveFiles) {
+      warn.textContent = "「连文件一起删」会把成品文件从硬盘永久删除，无法恢复。";
+      warn.classList.remove("hidden");
+    } else {
+      warn.classList.add("hidden");
+    }
+    $("delWithFiles").disabled = !haveFiles;
+
+    $("delOverlay").classList.remove("hidden");
+
+    return new Promise((resolve) => {
+      const cleanup = () => {
+        $("delOverlay").classList.add("hidden");
+        $("delCancel").onclick = null;
+        $("delTasksOnly").onclick = null;
+        $("delWithFiles").onclick = null;
+        $("delOverlay").onclick = null;
+      };
+      const done = (v) => {
+        cleanup();
+        resolve(v);
+      };
+      $("delCancel").onclick = () => done("cancel");
+      $("delTasksOnly").onclick = () => done("tasksOnly");
+      $("delWithFiles").onclick = () => done("withFiles");
+      // 点遮罩 = 取消（与其它弹窗一致）
+      $("delOverlay").onclick = (e) => {
+        if (e.target === $("delOverlay")) done("cancel");
+      };
+      // 默认焦点给「只删任务」：回车不该落到不可恢复的那个按钮上
+      setTimeout(() => $("delTasksOnly").focus(), 30);
+    });
   }
 
   /**
@@ -1501,10 +1872,22 @@
     if (e.target === $("infoOverlay")) $("infoOverlay").classList.add("hidden");
   });
 
+  // 当前视图下的任务 id（不是 taskMap 全量）。全选、批量删除、跨视图统计都以
+  // 这个为准——在「已完成」里 Ctrl+A 结果把「正在下载」的也勾上，再一按 Del
+  // 就是误删看不见的任务。taskMap 是唯一真相，可见集每次从它按 matchView 现算，
+  // 不用另维护一份会漏更新的镜像。
+  function visibleIds() {
+    const ids = [];
+    taskMap.forEach((t, id) => {
+      if (matchView(t)) ids.push(id);
+    });
+    return ids;
+  }
+
   // 全选
   $("selectAll").addEventListener("change", (e) => {
     const on = e.target.checked;
-    if (on) taskMap.forEach((_, id) => selectedIds.add(id));
+    if (on) visibleIds().forEach((id) => selectedIds.add(id));
     else selectedIds.clear();
     refreshTasks();
   });
@@ -1534,7 +1917,8 @@
     if (mod && e.key.toLowerCase() === "a" && !typing) {
       e.preventDefault();
       $("selectAll").checked = true;
-      taskMap.forEach((_, id) => selectedIds.add(id));
+      // 与「全选」勾选框同一条路径：只选当前视图可见的任务
+      visibleIds().forEach((id) => selectedIds.add(id));
       refreshTasks();
       return;
     }
@@ -1606,6 +1990,15 @@
     $(id).addEventListener("keydown", (e) => {
       if (e.key === "Enter") doNewDownload();
     });
+  });
+
+  // 用户在手动新建区动手（展开或输入地址）= 明确选择直链路径，
+  // 把之前的解析结果清掉，保证「开始下载」永远只有一个能点。
+  $("newDownload").addEventListener("toggle", (e) => {
+    if (e.target.open) preferManualEntry();
+  });
+  $("ndUrl").addEventListener("input", () => {
+    if ($("ndUrl").value.trim()) preferManualEntry();
   });
 
   $("setConcurrent").addEventListener("input", (e) => {

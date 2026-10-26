@@ -35,6 +35,7 @@
       <button class="menu-btn" data-i18n="menuDownload">下载(D)</button>
       <div class="menu-pop">
         <button class="menu-item" data-cmd="resumeSelected"><span data-i18n="miResumeSel">恢复选中</span></button>
+        <button class="menu-item" data-cmd="redoSelected"><span data-i18n="miRedoSel">重新下载选中</span></button>
         <button class="menu-item" data-cmd="pauseSelected"><span data-i18n="miPauseSel">暂停选中</span></button>
         <button class="menu-item" data-cmd="deleteSelected"><span data-i18n="miDeleteSel">删除选中</span><kbd>Del</kbd></button>
         <div class="menu-sep"></div>
@@ -255,7 +256,7 @@
             </label>
             <label class="fld">
               <span><span data-i18n="hfToken">HuggingFace Access Token</span> <em class="dim" data-i18n="hfTokenHint">(可选，hf_xxx)</em></span>
-              <input id="setHfToken" type="text" placeholder="hf_..." spellcheck="false" />
+              <input id="setHfToken" type="password" placeholder="hf_..." spellcheck="false" autocomplete="off" />
             </label>
           </div>
 
@@ -347,7 +348,7 @@
             </label>
             <label class="fld">
               <span><span data-i18n="proxyPass">密码</span> <em class="dim" data-i18n="optionalHint">(可选)</em></span>
-              <input id="setProxyPass" type="text" />
+              <input id="setProxyPass" type="password" autocomplete="off" />
             </label>
           </div>
           <small class="dim" data-i18n="proxyHint">SOCKS5 走 socks5h（远端解析 DNS），可对接 v2rayN 的 10808 端口</small>
@@ -452,12 +453,15 @@
         <div class="actions">
           <button id="ndStart" class="primary"><span data-i18n="startDownload">开始下载</span></button>
           <span class="dim" data-i18n="ndHint">不解析直接下载，适合已知地址的直链</span>
+          <!-- 解析出结果后显示：告诉用户为什么这里的按钮不能点了，
+               而不是让按钮无声失效 -->
+          <span id="ndDisabledHint" class="dim hidden">↑ 已解析出下面的结果，请用下面的「开始下载」<br />（收起手动新建或清空地址可切回直链模式）</span>
         </div>
       </details>
 
       <div id="mediaCard" class="media-card hidden">
         <div class="media-head">
-          <img id="mediaThumb" class="thumb" alt="" />
+          <img id="mediaThumb" class="thumb" alt="" referrerpolicy="no-referrer" />
           <div class="media-meta">
             <h2 id="mediaTitle"></h2>
             <div class="sub">
@@ -595,6 +599,47 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
+
+  <!-- 删除方式确认（顶栏「删除」/ Del 键）。
+       原生 confirm() 只有「确定/取消」两态，而删文件这件事必须三选一：
+       只删记录、连文件一起删、什么都不做。用一个独立弹窗而不是塞进
+       infoOverlay，是因为那个弹窗的结构只支持「一个主动按钮 + 关闭」。 -->
+  <div id="delOverlay" class="overlay hidden">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h3 id="delTitle">删除任务</h3>
+      </div>
+      <div class="dialog-body">
+        <div id="delBody"></div>
+        <div class="banner warn" id="delWarn"></div>
+      </div>
+      <div class="actions dialog-actions">
+        <button id="delCancel" class="ghost">取消</button>
+        <button id="delTasksOnly" class="ghost">只删任务</button>
+        <button id="delWithFiles" class="primary danger-btn">连文件一起删</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 任务行右键菜单。位置由 app.js 按鼠标坐标摆（fixed + 边界收拢），
+       内容按任务状态动态显示/置灰：已完成的才有「打开/定位/复制路径」，
+       未完成的才有「暂停/继续/重下」。 -->
+  <div id="ctxMenu" class="ctx-menu hidden" role="menu">
+    <button class="ctx-item" data-ctx="open"><span data-i18n="cxOpen">打开文件</span></button>
+    <button class="ctx-item" data-ctx="reveal"><span data-i18n="cxReveal">打开所在文件夹</span></button>
+    <button class="ctx-item" data-ctx="copyPath"><span data-i18n="cxCopyPath">复制文件路径</span></button>
+    <div class="ctx-sep"></div>
+    <button class="ctx-item" data-ctx="copyUrl"><span data-i18n="cxCopyUrl">复制下载链接</span></button>
+    <div class="ctx-sep"></div>
+    <button class="ctx-item" data-ctx="pause"><span data-i18n="cxPause">暂停</span></button>
+    <button class="ctx-item" data-ctx="resume"><span data-i18n="cxResume">继续</span></button>
+    <button class="ctx-item" data-ctx="redo"><span data-i18n="cxRedo">重新下载</span></button>
+    <div class="ctx-sep"></div>
+    <button class="ctx-item danger" data-ctx="remove"><span data-i18n="cxRemove">移除任务</span></button>
+    <button class="ctx-item danger" data-ctx="removeWithFile">
+      <span data-i18n="cxRemoveFile">删除任务和文件</span>
+    </button>
+  </div>
 
   <script src="app.js"></script>
 </body>
