@@ -10,11 +10,16 @@ use tokio::sync::Mutex;
 use crate::settings::Settings;
 use crate::ytdlp::{push_common_args, resolve_ytdlp};
 
-/// 按行读取，非 UTF-8 字节用替换字符兜底。
+/// 按行读取，并按系统代码页解码（见 decode.rs）。
 ///
 /// 不能用 `BufReader::lines()`：它遇到非法 UTF-8 会返回 `Err(InvalidData)`，
 /// 而 Windows 上 yt-dlp 输出的路径/标题未必是 UTF-8。读取一旦中断，子进程的
 /// 管道没人消费会被写满，`child.wait()` 就会永远卡住。
+///
+/// 也不能只用 `from_utf8_lossy`：实测 yt-dlp.exe 在简中系统吐 cp936 字节，
+/// lossy 会把标题的每个汉字变成 `?`——`--print after_move:filepath` 的输出
+/// 因此存成坏路径，之后打开/定位/删除全部 `os error 2`。解码细节与实测证据
+/// 见 decode.rs 头注释。
 async fn next_line_lossy<R>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<String>>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -27,7 +32,7 @@ where
     while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
         buf.pop();
     }
-    Ok(Some(String::from_utf8_lossy(buf).into_owned()))
+    Ok(Some(crate::decode::decode_output(buf)))
 }
 
 /// 任务状态机

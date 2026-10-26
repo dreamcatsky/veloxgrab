@@ -156,6 +156,14 @@ fn resolve_ffmpeg_uncached() -> Option<PathBuf> {
 pub fn push_common_args(cmd: &mut Command, settings: &Settings, with_cookies: bool, url: &str) {
     cmd.arg("--no-warnings");
     cmd.arg("--no-playlist");
+    // 尽力让 yt-dlp 用 UTF-8 输出。**它不是可靠防线**，实测（v2026.08.19 的
+    // PyInstaller 独立 exe，简中系统）设了这两个变量仍然吐 cp936 字节：
+    //   UTF-8 解 → "N��֡������35% ..."
+    //   GBK   解 → "N卡帧率提升35% 全新dlss5模型再次优化"
+    // 真正的防线是 decode.rs 的「先严格 UTF-8，再按系统代码页」两步解码。
+    // 保留这两行只是给某些能识别它的发行版留个机会，无害。
+    cmd.env("PYTHONUTF8", "1");
+    cmd.env("PYTHONIOENCODING", "utf-8");
 
     if with_cookies {
         // Cookie：自定义文件优先，其次浏览器导入
@@ -199,7 +207,10 @@ pub fn has_cookie_source(settings: &Settings) -> bool {
 
 /// 把 yt-dlp 的 stderr 压成几行可读的错误摘要
 fn summarize_err(stderr: &[u8]) -> String {
-    let err = String::from_utf8_lossy(stderr);
+    // 用 decode_output 而不是 from_utf8_lossy：yt-dlp 的错误信息里常带中文
+    // 文件名/标题（例如"文件已存在"），lossy 会把这部分变成问号，用户看到的
+    // 报错就是一堆 `?`，无从判断到底卡在哪个文件上。见 decode.rs。
+    let err = crate::decode::decode_output(stderr);
     err.lines()
         .filter(|l| !l.trim().is_empty())
         .rev()
