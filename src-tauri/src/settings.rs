@@ -54,6 +54,14 @@ pub struct Settings {
     pub proxy_pass: String,
     /// 界面语言 zh | en（重启生效）
     pub language: String,
+    /// 用户经原生确认框明确认可过的「默认下载目录之外」的保存位置（高-1 信任集）。
+    ///
+    /// 深链/扩展传入、且不在默认目录子树内的路径，第一次会弹 OS 级确认框；
+    /// 同意后记在这里——同一目录不再重复打扰，也让「暂停/重启后继续往自己
+    /// 指定的盘下载」能活过闸门。save_settings 改动 download_dir 时，旧值会
+    /// 自动落进来：历史任务的目录不能因为用户换了默认目录就突然失去信任。
+    #[serde(default)]
+    pub trusted_dirs: Vec<String>,
 }
 
 impl Default for Settings {
@@ -88,6 +96,36 @@ impl Default for Settings {
             proxy_pass: String::new(),
             language: "zh".into(),
             theme: "system".into(),
+            trusted_dirs: Vec::new(),
+        }
+    }
+}
+
+impl Settings {
+    /// 记住一个「用户刚在原生确认框里同意过」的目录（幂等，按字符串去重）。
+    pub fn remember_trusted(&mut self, dir: &str) {
+        let d = dir.trim();
+        if d.is_empty() {
+            return;
+        }
+        if !self.trusted_dirs.iter().any(|t| t == d) {
+            // 上限防止被反复「同意」的目录无限撑大设置文件；溢出时丢最旧的
+            if self.trusted_dirs.len() >= 32 {
+                self.trusted_dirs.remove(0);
+            }
+            self.trusted_dirs.push(d.to_string());
+        }
+    }
+
+    /// save_settings 专用：默认下载目录发生变更时，把**旧值**记为已信任。
+    ///
+    /// 没有这一步的话：用户以前经确认框同意过目录 X 并把默认改成 X，之后把
+    /// 默认挪去别处，X 里还有历史任务——重启回灌后那些任务的「重下/清理」
+    /// 会被闸门拦下，用户视角就是「我选过的盘突然不能用了」。
+    pub fn absorb_replaced_root(&mut self, old_root: &str) {
+        let o = old_root.trim();
+        if !o.is_empty() && o != self.download_dir {
+            self.remember_trusted(o);
         }
     }
 }
@@ -110,8 +148,16 @@ pub fn read_settings_from_disk() -> Settings {
         Ok(t) => t,
         Err(_) => return Settings::default(),
     };
-    match serde_json::from_str(&text) {
+    // 显式标 Settings：下面第一步就是字段读写（unseal 赋 hf_token），
+    // 不钉类型的话编译器无从反推 s 的形状。
+    match serde_json::from_str::<Settings>(&text) {
         Ok(mut s) => {
+            // 先把盘上的机密解回明文——内存里的 Settings 一律以明文形态存在，
+            // 下游（proxy_url 拼 URL、hf_token_trimmed 进 Authorization 头、
+            // 前端表单回填）都不必知道加密这件事。旧明文字段不带前缀，
+            // unseal 原样返回，新老世代一次读盘兼容。
+            s.hf_token = crate::dpapi::unseal(&s.hf_token);
+            s.proxy_pass = crate::dpapi::unseal(&s.proxy_pass);
             // 产品改名（VGrab → VeloxGrab）的遗留路径迁移。老用户 settings.json
             // 里存的默认下载目录还是 `...\Downloads\VGrab`——用户显式设置过的值
             // 优先于出厂默认，不迁移的话他们会一直往旧名目录里写。
@@ -122,8 +168,10 @@ pub fn read_settings_from_disk() -> Settings {
         }
         Err(e) => {
             // 不要把坏文件直接留在原地让下次继续失败，也不要静默覆盖掉：
-            // 改名备份，用户至少还能从里面找回自己填过的路径。
-            let bad = path.with_extension("json.bad");
+            // 改名备份，用户至少还能从里面找回自己填过的路径。备份名带时间戳
+            // （与 history 同规则）：连续两次损坏时固定名会把第一次的遗骸顶掉。
+            let stamp = crate::commands::now_ms();
+            let bad = path.with_extension(format!("json.bad-{stamp}"));
             let _ = std::fs::rename(&path, &bad);
             eprintln!(
                 "settings.json 解析失败（{e}），已备份到 {}，本次使用默认设置",
@@ -158,15 +206,7 @@ pub(crate) fn migrate_legacy_download_dir(s: &mut Settings) -> bool {
 /// 迁移结果写回磁盘（原子写，与 save_settings 同一套路）。
 /// 写失败不致命：内存里已经是新值，本次运行正确；下次启动再迁一次即可（幂等）。
 fn persist_migrated(s: &Settings) {
-    let path = settings_path();
-    let Ok(text) = serde_json::to_string_pretty(s) else { return };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    let _ = persist_settings(s);
 }
 
 impl Settings {
@@ -267,9 +307,72 @@ pub(crate) fn default_download_dir() -> String {
         .to_string()
 }
 
+/// 落盘专用：把机密字段封成 DPAPI 密文，返回**新对象**，不改调用方的内存值。
+///
+/// 内存里的 Settings 永远是明文（proxy_url / hf_token_trimmed 拼请求头要用，
+/// 前端表单回填也要用），加密只发生在写磁盘的最后一刻。
+fn sealed_for_disk(s: &Settings) -> Settings {
+    let mut d = s.clone();
+    d.hf_token = crate::dpapi::seal(&d.hf_token);
+    d.proxy_pass = crate::dpapi::seal(&d.proxy_pass);
+    d
+}
+
+/// 原子写入 settings.json 的唯一入口。
+///
+/// 三个写者（save_settings / set_theme / 迁移回写 persist_migrated）原先各自摊开
+/// 「write 同一个 settings.json.tmp → rename」。同名临时文件 + 无串行化 = 并发
+/// 时 A 的半截内容会被 B 的 rename 抢去顶替，产出坏 JSON；下次启动解析失败，
+/// 下载目录/Cookie 路径/代理配置整份报废。这里加进程内互斥，并把临时文件名
+/// 带上序号（万一将来又有第四个写者、或跨进程场景，也不会互相覆盖半成品）。
+///
+/// 用 std Mutex 而不是 tokio：三个写者都是同步命令线程，锁里只有本地磁盘 IO。
+fn persist_settings(s: &Settings) -> Result<(), String> {
+    static SETTINGS_IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let path = settings_path();
+    let text = serde_json::to_string_pretty(&sealed_for_disk(s)).map_err(|e| e.to_string())?;
+
+    // 中毒也要继续写：上一个持有者 panic 不代表这次写盘会坏，让配置保存沉默
+    // 才是更大的损失。锁的粒度是「一次完整写盘」，panic 只会留下一个孤儿 .tmp。
+    let _guard = SETTINGS_IO.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    }
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp-{seq}"));
+    let r = std::fs::write(&tmp, &text).map_err(|e| format!("写入设置失败: {e}"));
+    if r.is_ok() {
+        // fsync 后再 rename：崩溃时不留「目录项已更新、内容还在页缓存」的空文件
+        if let Ok(f) = std::fs::File::open(&tmp) {
+            let _ = f.sync_data();
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| format!("保存设置失败: {e}"))?;
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
 #[tauri::command]
 pub fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
     load_settings(&state)
+}
+
+/// 把「用户刚在原生确认框里同意过」的目录写入内存与磁盘（闸门放行后调用）。
+///
+/// 落盘失败只影响「下次启动要不要再问一遍」，不推翻本次放行，所以返回 ()。
+pub(crate) fn remember_trusted_dir(state: &AppState, dir: &str) {
+    let snapshot = {
+        let Ok(mut guard) = state.settings.lock() else { return };
+        guard.remember_trusted(dir);
+        guard.clone()
+    };
+    if let Err(e) = persist_settings(&snapshot) {
+        eprintln!("[settings] 信任目录落盘失败: {e}");
+    }
 }
 
 #[tauri::command]
@@ -290,16 +393,25 @@ pub fn save_settings(
     }
     settings.theme = normalize_theme(&settings.theme).to_string();
 
-    let path = settings_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
-    }
-    let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    // 原子写：直接 write 在断电/崩溃时会留下截断的 JSON，下次启动解析失败，
-    // 用户改过的下载目录、Cookie 路径、并发数会全部丢失。
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("写入设置失败: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("保存设置失败: {e}"))?;
+    // 信任集只允许两个来源：原生确认框的同意（remember_trusted_dir）、以及
+    // 「用户把默认目录从 A 改到 B」时旧值 A 的自动继承。**前端表单里带来的
+    // trusted_dirs 一律丢弃**——闸门的设计前提就是「外部输入不得自授信任」，
+    // 若这里照收，受损 webview 只要往表单里塞一句 `"trusted_dirs":["C:\\win"]`
+    // 就把整个高-1 闸门旁路掉了。以**后端现值**为基准合并：确认框攒下的信任
+    // 不能被一次「保存设置」抹掉，否则用户改个主题都要重新被问一遍目录。
+    let (old_root, old_trusted) = match state.settings.lock() {
+        Ok(guard) => (guard.download_dir.clone(), guard.trusted_dirs.clone()),
+        // 中毒时按「没有旧值」处理：宁可重新问一遍，不凭空造信任
+        Err(_) => (String::new(), Vec::new()),
+    };
+    settings.trusted_dirs = old_trusted;
+    settings.absorb_replaced_root(&old_root);
+
+    // 原子写统一走 persist_settings（进程内串行 + 独立临时文件名）：
+    // 与 set_theme / 迁移回写共用一把闸，杜绝同名 .tmp 互踩。
+    // 注意：absorb 只进内存，persist 失败时盘上仍是旧值——重启后以盘为准，
+    // 最坏结果是多弹一次确认框，不影响正确性。
+    persist_settings(&settings)?;
 
     if let Ok(mut guard) = state.settings.lock() {
         *guard = settings.clone();
@@ -337,16 +449,9 @@ pub fn set_theme(state: tauri::State<'_, AppState>, theme: String) -> Result<Str
     let mut current = load_settings(&state);
     current.theme = normalized.clone();
 
-    let path = settings_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
-    }
-    let text = serde_json::to_string_pretty(&current).map_err(|e| e.to_string())?;
-    // 与 save_settings 同样的原子写：主题是高频改动项（用户会来回切着看效果），
-    // 截断的 settings.json 会让整份配置报废。
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("写入设置失败: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("保存设置失败: {e}"))?;
+    // 与 save_settings 同一把闸、同一套原子写：主题是高频改动项（用户会来回切着
+    // 看效果），截断的 settings.json 会让整份配置报废。
+    persist_settings(&current)?;
 
     if let Ok(mut guard) = state.settings.lock() {
         guard.theme = normalized.clone();
