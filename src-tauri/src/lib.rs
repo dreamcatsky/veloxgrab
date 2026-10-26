@@ -217,11 +217,16 @@ pub fn run() {
             commands::resume_task,
             commands::pause_tasks,
             commands::resume_tasks,
+            commands::redo_task,
+            commands::redo_tasks,
             commands::remove_tasks,
             commands::start_all,
             commands::pause_all,
             commands::clear_all_tasks,
             commands::clipboard_url,
+            commands::copy_text,
+            commands::open_task_file,
+            commands::reveal_task_file,
             commands::open_download_dir,
             commands::app_version,
             commands::open_progress_window,
@@ -257,6 +262,11 @@ pub fn run() {
                         .await
                     });
                 }
+                // cancel_all 的状态变化只投递给了历史写线程（攒批落盘）：
+                // 退出前强制刷一次，否则「暂停任务重启后还在」依赖的那次写入
+                // 可能停在 200ms 合并窗口里。给 1 秒——宁可丢攒批，
+                // 也不能让磁盘卡住把「退出」本身卡死。
+                commands::shutdown_history_writer();
                 app_handle.exit(0);
             }
         });

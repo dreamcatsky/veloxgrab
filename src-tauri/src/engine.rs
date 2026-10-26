@@ -885,10 +885,9 @@ async fn run_download_inner(
                 Some(t) => {
                     t.state = state;
                     t.error = Some(msg.clone());
-                    // 暂停不写历史：它还没结束，写进去在记录页会显示成一条停滞的条目。
-                    if state != TaskState::Paused {
-                        crate::history::upsert_entry(t);
-                    }
+                    // 暂停也要落历史：历史是任务表唯一的持久化层，
+                    // 不写的话用户暂停后退出软件，任务连同「继续」入口一起消失。
+                    crate::history::upsert_entry(t);
                     stop_snapshot(t, state)
                 }
                 None => (0.0, 0, None),
@@ -1031,9 +1030,7 @@ pub async fn run_direct_download(
                 Some(t) => {
                     t.state = state;
                     t.error = Some(msg.clone());
-                    if state != TaskState::Paused {
-                        crate::history::upsert_entry(t);
-                    }
+                    crate::history::upsert_entry(t);
                     stop_snapshot(t, state)
                 }
                 None => (0.0, 0, None),
@@ -1194,11 +1191,7 @@ pub async fn run_direct_download(
                     Some(t) => {
                         t.state = state;
                         t.error = Some(msg.clone());
-                        // 暂停不是终点，不写历史：它在记录页会变成一条永远停在那儿的条目，
-                        // 而用户恢复后是同一条任务接着跑，历史里也不该凭空多一条。
-                        if state != TaskState::Paused {
-                            crate::history::upsert_entry(t);
-                        }
+                        crate::history::upsert_entry(t);
                         stop_snapshot(t, state)
                     }
                     None => (0.0, 0, None),
