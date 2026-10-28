@@ -53,10 +53,18 @@ pub fn decode_output(bytes: &[u8]) -> String {
 /// - 系统调用返回 0（该代码页下无法表示）。让调用方退回 lossy。
 #[cfg(windows)]
 fn decode_ansi(bytes: &[u8]) -> Option<String> {
-    use windows_sys::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
     // CP_ACP 是常量 0，这里写字面量是为了让 `decode_ansi` 的依赖只看这一行
     // 就能读懂——`CP_ACP` 本身还需要再 import 一次，收益不值。
     const CP_ACP: u32 = 0;
+    decode_code_page(bytes, CP_ACP)
+}
+
+/// 按指定代码页解码。抽出来只为让测试能锁死「给定代码页」的行为：
+/// `CP_ACP` 随运行机器 locale 变化（简中 936、英文 1252），拿它做断言
+/// 等于在测 CI runner 的所在地，不是测代码。
+#[cfg(windows)]
+fn decode_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
 
     if bytes.is_empty() {
         return Some(String::new());
@@ -64,7 +72,9 @@ fn decode_ansi(bytes: &[u8]) -> Option<String> {
     let len = i32::try_from(bytes.len()).ok()?;
     // 第一遍：问系统需要多少个 UTF-16 码元。这里**不带** MB_ERR_INVALID_CHARS，
     // 因为带它时非法字节会让整个转换失败（返回 0），我们就拿不到长度了。
-    let need = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    let need = unsafe {
+        MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0)
+    };
     if need <= 0 {
         return None;
     }
@@ -73,7 +83,7 @@ fn decode_ansi(bytes: &[u8]) -> Option<String> {
     // 下也解释不通"明确失败，而不是静默换成 `?`。
     let got = unsafe {
         MultiByteToWideChar(
-            CP_ACP,
+            code_page,
             MB_ERR_INVALID_CHARS,
             bytes.as_ptr(),
             len,
@@ -109,6 +119,11 @@ mod tests {
     ///
     /// 这串字节是拿 `yt-dlp --print title` 的真实输出 dump 出来的，不是手搓的
     /// ——手搓的 GBK 字节测不出"系统代码页"这条路径的行为差异。
+    ///
+    /// 这里显式指定 936，不经过 `CP_ACP`：ACP 取决于运行机器的 locale，
+    /// 英文 Windows（CI 的 windows-latest 就是）是 1252，同一串字节解出来
+    /// 是拉丁字母，断言汉字必然失败。产品行为本身没变——中文系统上
+    /// `CP_ACP` 就是 936，两者等价。
     #[test]
     #[cfg(windows)]
     fn gbk_title_decodes_to_real_characters() {
@@ -126,13 +141,23 @@ mod tests {
             0x64, 0x6C, 0x73, 0x73, 0x35, // dlss5
             0xC4, 0xA3, 0xD0, 0xCD, // 模型
         ];
-        let out = decode_output(&gbk);
+        let out = decode_code_page(&gbk, 936).expect("cp936 必须能解这段字节");
         // 只要落进 ANSI 分支就得是真汉字，不能有任何替换符
         assert!(!out.contains('\u{FFFD}'), "不应出现替换符: {out}");
         assert!(!out.contains('?'), "不应出现问号: {out}");
         assert!(out.contains("35%"), "ASCII 部分必须保留: {out}");
         assert!(out.contains("dlss5"), "ASCII 部分必须保留: {out}");
         assert!(out.contains('帧'), "中文必须被正确还原: {out}");
+    }
+
+    /// `CP_ACP` 分支只看「不炸」：它解出来是什么随机器 locale 变，
+    /// 但任何 locale 下都不许 panic、不许返回空串（管道读取依赖这一点）。
+    #[test]
+    #[cfg(windows)]
+    fn ansi_branch_never_panics_and_never_empty() {
+        let gbk: Vec<u8> = vec![0x4E, 0xBF, 0xA8, 0xD6, 0xA1];
+        let out = decode_output(&gbk);
+        assert!(!out.is_empty(), "ANSI 分支不得返回空串");
     }
 
     /// 两个分支都不通时，仍要返回**东西**（允许有替换符），绝不能返回空串
