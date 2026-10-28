@@ -34,11 +34,23 @@ use crate::settings::load_settings;
 pub const REPO: &str = "dreamcatsky/veloxgrab";
 pub(crate) const API_LATEST: &str = "https://api.github.com/repos/dreamcatsky/veloxgrab/releases/latest";
 
-/// 只接受这几个主机的下载地址。前端传什么都拦不住这条校验。
+/// 唯一允许的安装包下载前缀：**本仓库**的 release 资产路径。
+///
+/// 只校验 `https://github.com/` 是不够的：任何 GitHub 仓库都能挂一个
+/// `setup.exe`，`update_now` 是公开命令面，伪造一次调用就能让我们下载并执行
+/// 别人的可执行文件。CDN 域（objects.githubusercontent.com 等）也不能放行——
+/// 它们承载所有仓库的资产，URL 里没有任何仓库信息。GitHub 的
+/// `browser_download_url` 本身是 github.com 路径，重定向到 CDN 由 reqwest
+/// 在内部跟随，初始 URL 校验已经足够。
+pub(crate) const RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/dreamcatsky/veloxgrab/releases/download/";
+
+/// 只接受本仓库 release 资产地址。前端传什么都拦不住这条校验。
 fn is_trusted_download(url: &str) -> bool {
-    ["https://github.com/", "https://objects.githubusercontent.com/", "https://release-assets.githubusercontent.com/"]
-        .iter()
-        .any(|p| url.starts_with(p))
+    url.starts_with(RELEASE_DOWNLOAD_PREFIX)
+        && url.len() > RELEASE_DOWNLOAD_PREFIX.len()
+        // 前缀之后不能又是 scheme/凭据之类的东西（防御性，正常 URL 不会命中）
+        && !url[RELEASE_DOWNLOAD_PREFIX.len()..].contains("://")
 }
 
 #[derive(Serialize)]
@@ -65,10 +77,7 @@ fn parse_ver(s: &str) -> Option<[u64; 3]> {
         None => 0,
     };
     // 预发布/构建后缀（"3-beta1"、"3+build7"）截掉再解析
-    let patch_raw = match it.next() {
-        Some(x) => x,
-        None => "0",
-    };
+    let patch_raw = it.next().unwrap_or("0");
     let patch = patch_raw.split(['-', '+']).next()?.parse().ok()?;
     Some([major, minor, patch])
 }
@@ -102,7 +111,10 @@ pub fn parse_release(v: &serde_json::Value, current: &str) -> UpdateInfo {
             let name = a.get("name").and_then(|x| x.as_str()).unwrap_or("");
             let url = a.get("browser_download_url").and_then(|x| x.as_str()).unwrap_or("");
             let size = a.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
-            if !name.to_ascii_lowercase().ends_with("setup.exe") || url.is_empty() {
+            if !name.to_ascii_lowercase().ends_with("setup.exe")
+                || url.is_empty()
+                || !is_trusted_download(url)
+            {
                 continue;
             }
             let better = chosen.as_ref().map_or(true, |(_, _, c)| {
@@ -259,7 +271,7 @@ pub async fn update_now(
     file.flush().map_err(|e| e.to_string())?;
     drop(file);
 
-    if total > 0 && downloaded < total {
+    if total > 0 && downloaded != total {
         return Err(format!("下载不完整（{downloaded}/{total} 字节）"));
     }
 
@@ -340,7 +352,9 @@ mod tests {
 
     #[test]
     fn parses_real_release_shape() {
-        // 取自 api.github.com/.../releases/latest 的真实结构（裁剪版）
+        // 取自 api.github.com/.../releases/latest 的真实结构（裁剪版）。
+        // browser_download_url 是 github.com 的本仓库 release 路径，
+        // 重定向到 CDN 由下载器内部跟随。
         let v: serde_json::Value = serde_json::json!({
             "tag_name": "v1.1.1",
             "name": "VeloxGrab 1.1.1",
@@ -349,7 +363,7 @@ mod tests {
             "assets": [
                 { "name": "source.zip", "browser_download_url": "https://github.com/x/source.zip", "size": 10 },
                 { "name": "VeloxGrab_1.1.1_x64-setup.exe",
-                  "browser_download_url": "https://release-assets.githubusercontent.com/x/setup.exe",
+                  "browser_download_url": "https://github.com/dreamcatsky/veloxgrab/releases/download/v1.1.1/VeloxGrab_1.1.1_x64-setup.exe",
                   "size": 20850601 }
             ]
         });
@@ -375,6 +389,43 @@ mod tests {
         assert!(!is_trusted_download("http://github.com/a/b")); // 必须 https
         assert!(!is_trusted_download("https://evil.example.com/setup.exe"));
         assert!(!is_trusted_download("file:///C:/windows/system32/cmd.exe"));
-        assert!(is_trusted_download("https://github.com/o/r/releases/download/v1/a.exe"));
+        // 别人仓库的 release 资产同样不行：任何 GitHub 账号都能挂 setup.exe
+        assert!(!is_trusted_download("https://github.com/o/r/releases/download/v1/a.exe"));
+        // CDN 域承载所有仓库，无法绑定本仓库 → 不放行
+        assert!(!is_trusted_download(
+            "https://release-assets.githubusercontent.com/x/setup.exe"
+        ));
+        assert!(!is_trusted_download(
+            "https://objects.githubusercontent.com/x/setup.exe"
+        ));
+        // 本仓库路径放行
+        assert!(is_trusted_download(
+            "https://github.com/dreamcatsky/veloxgrab/releases/download/v1.2.8/a.exe"
+        ));
+        // 前缀相似但换仓库名 / 把仓库名塞进路径的写法不放行
+        assert!(!is_trusted_download(
+            "https://github.com/dreamcatsky/veloxgrab-fork/releases/download/v1/a.exe"
+        ));
+        assert!(!is_trusted_download(
+            "https://evil.example/https://github.com/dreamcatsky/veloxgrab/releases/download/v1/a.exe"
+        ));
+    }
+
+    /// 资产 URL 不受信时不能被当成「可更新」，避免前端拿着坏地址去下载。
+    #[test]
+    fn untrusted_asset_url_means_no_update() {
+        let v: serde_json::Value = serde_json::json!({
+            "tag_name": "v9.9.9",
+            "body": "",
+            "html_url": "",
+            "assets": [
+                { "name": "VeloxGrab_9.9.9_x64-setup.exe",
+                  "browser_download_url": "https://release-assets.githubusercontent.com/x/setup.exe",
+                  "size": 1 }
+            ]
+        });
+        let info = parse_release(&v, "1.0.0");
+        assert!(!info.available);
+        assert!(info.download_url.is_empty());
     }
 }

@@ -386,7 +386,7 @@ pub async fn probe_auto(
     }
 
     // 非媒体站点：先试直链
-    let net = crate::settings::NetCfg::from_settings(&settings);
+    let net = crate::settings::NetCfg::for_url(&settings, &url);
     match direct::probe_direct(&url, None, &net).await {
         Ok(p) => Ok(serde_json::json!({ "kind": "direct", "direct": p })),
         Err(e) => {
@@ -1087,26 +1087,32 @@ pub(crate) async fn create_direct_task(
 /// 用户以为清掉的条目下次启动又回来了，等于这个按钮在骗人。
 #[tauri::command]
 pub async fn clear_finished(state: tauri::State<'_, AppState>) -> Result<usize, String> {
-    let removed: Vec<String> = {
+    // 先把被清掉的条目整个快照下来：retain 之后字段就没了，而清理临时文件
+    // 需要 kind/title/id/save_dir。旧实现只删记录不清残片，取消/失败留下的
+    // `.veloxgrab-downloading.<id>` 会一直躺在下载目录里。
+    let removed: Vec<Task> = {
         let mut guard = state.tasks.lock().await;
-        let before = guard.len();
-        let mut ids = Vec::new();
-        guard.retain(|id, t| {
+        let mut gone = Vec::new();
+        guard.retain(|_, t| {
             if t.state.is_terminal() {
-                ids.push(id.clone());
+                gone.push(t.clone());
                 false
             } else {
                 true
             }
         });
-        if before == guard.len() {
-            return Ok(0);
-        }
-        ids
+        gone
     };
+    if removed.is_empty() {
+        return Ok(0);
+    }
 
-    for id in &removed {
-        let _ = crate::history::remove_entry(id);
+    let settings = load_settings(&state);
+    for t in &removed {
+        let dir = engine::resolve_task_dir(&settings, t)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&settings.download_dir));
+        engine::cleanup_task_artifacts(&dir, t);
+        let _ = crate::history::remove_entry(&t.id);
     }
     Ok(removed.len())
 }
@@ -1755,6 +1761,15 @@ pub async fn clear_all_tasks(
 ) -> Result<usize, String> {
     use tauri::Emitter;
 
+    // 摘掉令牌之前的「在跑任务」名单：cancel_all 只负责发暂停信号并清空令牌表，
+    // worker 可能还在写文件。对这批任务跳过临时文件清理——Windows 上删一个
+    // 被工作线程打开的文件必然失败，删了也会在 worker 收尾时重新出现；
+    // 交给启动时的 7 天陈旧清理收口，比在这里赌时序可靠。
+    let running: std::collections::HashSet<String> = {
+        let tokens = state.tokens.lock().await;
+        tokens.keys().cloned().collect()
+    };
+
     // 先停掉所有在跑的，否则它们会继续往刚删掉的任务目录里写
     cancel_all(&state).await;
 
@@ -1771,6 +1786,9 @@ pub async fn clear_all_tasks(
     {
         let settings = load_settings(&state);
         for t in &tasks {
+            if running.contains(&t.id) {
+                continue;
+            }
             let dir = engine::resolve_task_dir(&settings, t)
                 .unwrap_or_else(|_| std::path::PathBuf::from(&settings.download_dir));
             engine::cleanup_task_artifacts(&dir, t);

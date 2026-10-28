@@ -416,9 +416,11 @@ yt-dlp 把 Chromium 系浏览器统一按 Chrome 的库路径处理。
   内网」的 true SSRF 不做 DNS 预检——有 TOCTOU 且误伤内网用户。重定向逐跳
   过同一道闸（含拦 https→http 降级、云元数据字面量）。
 - **更新链维持「信任 GitHub 仓库」姿态，未做验签**（产品决定，2026-10-23）：
-  下载源锁死 github 官方三域 + TLS 校验开启 + 大小校验，信任边界与「人去网页
-  上点下载」一致；代价是**仓库账号被盗 = 可推送任意安装包**。要升级这个姿态
-  就引入 minisign（tauri-plugin-updater）或 release 附带 SHA-256 并校验。
+  下载源锁死**本仓库**的 release 资产路径
+  （`https://github.com/dreamcatsky/veloxgrab/releases/download/`）+ TLS 校验开启
+  + 大小校验，信任边界与「人去网页上点下载」一致；任何别的 GitHub 仓库、
+  CDN 域、相似前缀都不放行。代价是**仓库账号被盗 = 可推送任意安装包**。要升级
+  这个姿态就引入 minisign（tauri-plugin-updater）或 release 附带 SHA-256 并校验。
   安装链的 bat 路径做了引号剥离（合法文件名含 `"` 不致注入命令）。
 - **机密存储**：hf_token / proxy_pass 落盘前过 DPAPI（CryptProtectData，
   用户+机器绑定），settings.json 里只有 `dpapi1:<hex>`；加密失败退回明文

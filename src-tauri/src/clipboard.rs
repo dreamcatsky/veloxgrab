@@ -14,7 +14,7 @@ pub fn read_clipboard_text() -> String {
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     };
-    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 
     // CF_UNICODETEXT = 13。windows-sys 把它放在 Win32_System_Ole 下，
     // 为这一个常量引入整个 OLE 模块不划算，直接写字面量并在此注明。
@@ -49,10 +49,15 @@ pub fn read_clipboard_text() -> String {
                 if ptr.is_null() {
                     String::new()
                 } else {
-                    // 剪贴板里的文本是以 NUL 结尾的 UTF-16，长度只能靠扫描得到
+                    // 剪贴板里的文本是以 NUL 结尾的 UTF-16，长度只能靠扫描得到。
+                    // 但扫描**不能越过全局块的实际大小**：别的进程可以放一块
+                    // 没有 NUL 的小内存，按固定 1M 字符硬扫就是越界读，轻则
+                    // 读到相邻内存的随机数据，重则踩到未映射页直接崩溃。
+                    // GlobalSize 给出块字节数，取一半作字符上限，再夹 1M 上限。
+                    let bytes = GlobalSize(handle as _) as usize;
+                    let max_len = (bytes / 2).min(1_048_576);
                     let mut len = 0usize;
-                    // 上限防住异常数据把进程拖死（正常剪贴板文本远不到 1M 字符）
-                    while len < 1_048_576 && *ptr.add(len) != 0 {
+                    while len < max_len && *ptr.add(len) != 0 {
                         len += 1;
                     }
                     let slice = std::slice::from_raw_parts(ptr, len);

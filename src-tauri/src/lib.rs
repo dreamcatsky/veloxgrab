@@ -137,14 +137,36 @@ pub fn run() {
             // 启动时扫一遍下载目录，清掉陈旧的半成品与空临时目录。
             // 只清理 7 天前的：取消后立刻重开的场景还要能续传。
             // 放到独立线程里跑：目录可能很大，不能让扫描拖慢窗口显示。
-            if let Ok(guard) = state.settings.lock() {
-                let dir = std::path::PathBuf::from(&guard.download_dir);
-                drop(guard);
+            //
+            // 范围必须覆盖「默认根 + 所有用户批准过的目录」：任务可以单独设
+            // save_dir，只扫默认根的话，D 盘任务留下的残片永远没人收。
+            let scan_dirs: Vec<std::path::PathBuf> = if let Ok(guard) = state.settings.lock() {
+                let mut dirs: Vec<String> = Vec::new();
+                let root = guard.download_dir.trim();
+                dirs.push(if root.is_empty() {
+                    crate::settings::default_download_dir()
+                } else {
+                    root.to_string()
+                });
+                dirs.extend(guard.trusted_dirs.iter().cloned());
+                dirs.retain(|d| !d.trim().is_empty());
+                dirs.sort();
+                dirs.dedup();
+                dirs.into_iter()
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| p.is_absolute())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if !scan_dirs.is_empty() {
                 std::thread::spawn(move || {
-                    engine::cleanup_stale_artifacts(
-                        &dir,
-                        std::time::Duration::from_secs(7 * 24 * 3600),
-                    );
+                    for dir in scan_dirs {
+                        engine::cleanup_stale_artifacts(
+                            &dir,
+                            std::time::Duration::from_secs(7 * 24 * 3600),
+                        );
+                    }
                 });
             }
 

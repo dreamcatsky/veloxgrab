@@ -99,6 +99,21 @@
     toastTimer = setTimeout(() => t.classList.add("hidden"), 3200);
   }
 
+  /**
+   * 把字符串转义成可安全拼进 innerHTML 的文本。
+   *
+   * 后端返回的目录名来自安装/解压位置，用户完全可能把它放在 `D:\a&b\<c>`
+   * 这种路径下；直接拼进模板会让路径里的标签被当成 HTML 解析。
+   */
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
   function showError(msg) {
     const b = $("parseError");
     if (!msg) {
@@ -2436,7 +2451,7 @@
     }
     const pageName = target === "edge" ? "edge://extensions" : "chrome://extensions";
     const dirLine = dir
-      ? `<p style="margin:8px 0 0">扩展目录（可直接复制）：<code style="user-select:all;word-break:break-all">${dir}</code></p>`
+      ? `<p style="margin:8px 0 0">扩展目录（可直接复制）：<code style="user-select:all;word-break:break-all">${escHtml(dir)}</code></p>`
       : "";
     const devMode = target === "edge" ? "左下角" : "右上角";
 

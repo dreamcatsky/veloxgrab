@@ -130,6 +130,62 @@ impl Settings {
     }
 }
 
+/// 把用户填的代理主机规范成 `reqwest::Proxy` 能吃的 `host` / `[v6]`。
+///
+/// 兼容三种常见粘贴形态：`host`、`host:port`（端口以输入框为准）、
+/// `http://user:pass@host:port/`。返回 None 表示确实是非法输入。
+fn normalize_proxy_host(raw: &str) -> Option<String> {
+    let mut h = raw.trim();
+    let lower = h.to_ascii_lowercase();
+    for p in ["http://", "https://", "socks5h://", "socks5://"] {
+        if lower.starts_with(p) {
+            h = &h[p.len()..];
+            break;
+        }
+    }
+    h = h.split(['/', '?', '#']).next().unwrap_or("");
+    if let Some((_, rest)) = h.rsplit_once('@') {
+        h = rest;
+    }
+
+    let mut host = if h.starts_with('[') {
+        // `[v6]` / `[v6]:port`：只取到右方括号
+        let end = h.find(']')?;
+        h[..=end].to_string()
+    } else {
+        let colons = h.matches(':').count();
+        if colons > 1 {
+            // 裸 IPv6（`::1`、`fe80::1`）：冒号是地址的一部分，不是端口分隔符
+            h.to_string()
+        } else if colons == 1 {
+            // 单冒号只有一种合法解释：端口。端口值以 proxy_port 输入框为准。
+            let (name, port) = h.rsplit_once(':')?;
+            if name.is_empty() || port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            name.to_string()
+        } else {
+            h.to_string()
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    // 裸 IPv6（`::1`）→ `[::1]`；带方括号的保持原样
+    if host.contains(':') && !host.starts_with('[') {
+        host = format!("[{host}]");
+    }
+    // 白名单字符：主机名 / IPv4 / [IPv6]。有别的字符直接判非法，
+    // 不给「拼进 URL 再让解析器兜底」留空间。
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
+    {
+        return None;
+    }
+    Some(host)
+}
+
 fn settings_path() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join("VeloxGrab").join("settings.json")
@@ -211,12 +267,16 @@ fn persist_migrated(s: &Settings) {
 
 impl Settings {
     /// 组装 reqwest / yt-dlp 可用的代理 URL，未启用或填得不全时返回 None。
+    ///
+    /// 用户填的 user/pass 必须 percent-encode：密码里出现 `@`、`:`、`/`
+    /// （企业代理很常见）时，直接拼 `user:pass@host` 会让 URL 解析器把
+    /// 后半段当成主机——轻则认证失败，重则把请求发去错误的主机。
     pub fn proxy_url(&self) -> Option<String> {
         if !self.proxy_enabled {
             return None;
         }
-        let host = self.proxy_host.trim();
-        if host.is_empty() || self.proxy_port == 0 {
+        let host = normalize_proxy_host(&self.proxy_host)?;
+        if self.proxy_port == 0 {
             return None;
         }
         // socks5h：让代理端解析域名，配合「加速被墙站点」的初衷（本地 DNS 往往拿不到正确结果）
@@ -225,7 +285,11 @@ impl Settings {
         let auth = if user.is_empty() {
             String::new()
         } else {
-            format!("{}:{}@", user, self.proxy_pass.trim())
+            format!(
+                "{}:{}@",
+                urlencoding::encode(user),
+                urlencoding::encode(self.proxy_pass.trim())
+            )
         };
         Some(format!("{scheme}://{auth}{host}:{}", self.proxy_port))
     }
@@ -344,9 +408,10 @@ pub fn apply_autostart(enable: bool) -> Result<(), String> {
 /// 固化成 "."，否则恢复默认会把用户导到程序目录里去。
 #[tauri::command]
 pub fn default_settings() -> Settings {
-    let mut s = Settings::default();
-    s.download_dir = default_download_dir();
-    s
+    Settings {
+        download_dir: default_download_dir(),
+        ..Settings::default()
+    }
 }
 
 /// 默认下载目录：系统「下载」文件夹下的 VeloxGrab，拿不到时退回当前目录。
@@ -396,9 +461,11 @@ fn persist_settings(s: &Settings) -> Result<(), String> {
     let tmp = path.with_extension(format!("json.tmp-{seq}"));
     let r = std::fs::write(&tmp, &text).map_err(|e| format!("写入设置失败: {e}"));
     if r.is_ok() {
-        // fsync 后再 rename：崩溃时不留「目录项已更新、内容还在页缓存」的空文件
-        if let Ok(f) = std::fs::File::open(&tmp) {
-            let _ = f.sync_data();
+        // fsync 后再 rename：崩溃时不留「目录项已更新、内容还在页缓存」的空文件。
+        // 必须用**可写**句柄：Windows 的 FlushFileBuffers 对只读句柄直接失败，
+        // 旧写法 `File::open`（只读）+ sync_data 等于什么都没做。
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
+            let _ = f.sync_all();
         }
         std::fs::rename(&tmp, &path).map_err(|e| format!("保存设置失败: {e}"))?;
     } else {
@@ -515,9 +582,10 @@ mod tests {
     use super::*;
 
     fn with_dir(d: &str) -> Settings {
-        let mut s = Settings::default();
-        s.download_dir = d.to_string();
-        s
+        Settings {
+            download_dir: d.to_string(),
+            ..Settings::default()
+        }
     }
 
     #[test]
@@ -546,5 +614,54 @@ mod tests {
         // 空目录（= 用出厂默认）不碰
         let mut u = with_dir("  ");
         assert!(!migrate_legacy_download_dir(&mut u));
+    }
+
+    fn proxy(host: &str, user: &str, pass: &str) -> Option<String> {
+        Settings {
+            proxy_enabled: true,
+            proxy_host: host.into(),
+            proxy_port: 1080,
+            proxy_user: user.into(),
+            proxy_pass: pass.into(),
+            ..Settings::default()
+        }
+        .proxy_url()
+    }
+
+    #[test]
+    fn proxy_credentials_are_percent_encoded() {
+        // 密码里的 @ : / 不编码就会让解析器把后半段当主机
+        assert_eq!(
+            proxy("127.0.0.1", "me@corp", "p@ss:w/rd").unwrap(),
+            "http://me%40corp:p%40ss%3Aw%2Frd@127.0.0.1:1080"
+        );
+    }
+
+    #[test]
+    fn proxy_host_accepts_pasted_url_and_ipv6() {
+        assert_eq!(
+            proxy("http://u:p@10.0.0.2:8080/x", "", "").unwrap(),
+            "http://10.0.0.2:1080"
+        );
+        assert_eq!(proxy("[::1]", "", "").unwrap(), "http://[::1]:1080");
+        assert_eq!(proxy("::1", "", "").unwrap(), "http://[::1]:1080");
+        // 空格 / 端口非数字 → 不拼出脏 URL
+        assert!(proxy("bad host", "", "").is_none());
+        assert!(proxy("host:abc", "", "").is_none());
+    }
+
+    #[test]
+    fn host_auth_is_scoped_to_host() {
+        let a = HostAuth {
+            host: "huggingface.co".into(),
+            value: "Bearer t".into(),
+        };
+        assert_eq!(a.for_url("https://huggingface.co/x"), Some("Bearer t"));
+        assert_eq!(
+            a.for_url("https://cdn-lfs.huggingface.co/x"),
+            Some("Bearer t")
+        );
+        assert_eq!(a.for_url("https://evil.example/?h=huggingface.co"), None);
+        assert_eq!(a.for_url("https://huggingface.co.evil.example/x"), None);
     }
 }

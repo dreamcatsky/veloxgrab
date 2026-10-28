@@ -277,8 +277,10 @@ fn write_history(list: &[HistoryEntry]) -> Result<(), String> {
     std::fs::write(&tmp, &text).map_err(|e| format!("写入历史失败: {e}"))?;
     // fsync 到盘再 rename：崩溃时不留下「目录项已更新、内容还在页缓存」的空文件。
     // rename + flush 的组合才是「要么旧内容要么新内容」的原子性来源。
-    if let Ok(f) = std::fs::File::open(&tmp) {
-        let _ = f.sync_data();
+    // 句柄必须可写：Windows 上 FlushFileBuffers 对只读句柄会失败，
+    // 原来用 File::open + sync_data 在 Windows 上其实是静默空操作。
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
+        let _ = f.sync_all();
     }
     std::fs::rename(&tmp, &path).map_err(|e| format!("保存历史失败: {e}"))?;
     Ok(())

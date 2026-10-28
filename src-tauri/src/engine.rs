@@ -413,17 +413,40 @@ pub fn cleanup_stale_artifacts(dir: &std::path::Path, max_age: std::time::Durati
     let _ = std::fs::remove_dir(&tmp_root);
 }
 
-/// 兜底查找：下载目录里最近 10 分钟内生成、以标题开头的成品文件。
+/// 兜底查找：下载目录里在任务开始后生成、以标题开头的成品文件。
 ///
 /// 只在 `--print after_move:filepath` 没有输出时使用。标题退化成 "download"
 /// 时匹配面太宽，宁可返回 None 也不要随便挑一个用户的文件。
-fn find_recent_output(dir: &std::path::Path, title: &str) -> Option<String> {
+///
+/// 两处收紧（旧实现会挑错文件）：
+/// - 标题必须以 `.` 收尾才算命中：`movie` 不能匹配 `movie2.mp4`；
+/// - 文件时间不得早于任务创建时间（留 60 秒时钟/文件系统粒度余量）：同一目录里
+///   十分钟前下过的同名旧文件不能被当成本次成品。
+fn find_recent_output(
+    dir: &std::path::Path,
+    title: &str,
+    created_at_ms: i64,
+) -> Option<String> {
     let stem = crate::util::sanitize_filename(title);
     if stem.is_empty() || stem == "download" {
         return None;
     }
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(600))?;
+    let now = std::time::SystemTime::now();
+    let mut cutoff = now
+        .checked_sub(std::time::Duration::from_secs(600))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    if created_at_ms > 0 {
+        let started = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_millis(created_at_ms as u64))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let started = started
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if started > cutoff {
+            cutoff = started;
+        }
+    }
+    let prefix = format!("{stem}.");
 
     let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -432,10 +455,9 @@ fn find_recent_output(dir: &std::path::Path, title: &str) -> Option<String> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(&stem)
+        if !name.starts_with(&prefix)
             || name.ends_with(".part")
-            || name.ends_with(".veloxgrab-part")
-            || name.ends_with(".veloxgrab-downloading")
+            || crate::direct::is_temp_artifact(&name)
         {
             continue;
         }
@@ -462,6 +484,9 @@ fn output_template(dir: &str, task: &Task) -> String {
     } else {
         crate::util::sanitize_filename(&task.title)
     };
+    // yt-dlp 的输出模板里 `%` 是格式符：标题带 `%` 会让模板解析失败或吃掉后面
+    // 的 `%(ext)s`。转义成 `%%` 才是字面百分号（官方文档：`%%` → `%`）。
+    let name = name.replace('%', "%%");
     std::path::Path::new(dir)
         .join(format!("{name}.%(ext)s"))
         .to_string_lossy()
@@ -828,14 +853,23 @@ async fn run_download_inner(
                     };
                     {
                         let mut guard = tasks2.lock().await;
-                        if let Some(t) = guard.get_mut(&id2) {
-                            t.progress = p.progress;
-                            t.downloaded_bytes = p.downloaded;
-                            t.total_bytes = p.total;
-                            t.speed = ev.speed.clone();
-                            t.eta = ev.eta.clone();
-                            t.state = TaskState::Downloading;
+                        let Some(t) = guard.get_mut(&id2) else {
+                            continue;
+                        };
+                        // 取消/暂停已经落盘之后，管道里滞留的旧进度行不能再把
+                        // 状态改回 Downloading——否则界面会「取消完又开始跑」。
+                        if !matches!(
+                            t.state,
+                            TaskState::Queued | TaskState::Downloading | TaskState::Merging
+                        ) {
+                            continue;
                         }
+                        t.progress = p.progress;
+                        t.downloaded_bytes = p.downloaded;
+                        t.total_bytes = p.total;
+                        t.speed = ev.speed.clone();
+                        t.eta = ev.eta.clone();
+                        t.state = TaskState::Downloading;
                     }
                     let _ = app2.emit("task-progress", &ev);
                 }
@@ -853,9 +887,16 @@ async fn run_download_inner(
                 };
                 {
                     let mut guard = tasks2.lock().await;
-                    if let Some(t) = guard.get_mut(&id2) {
-                        t.state = TaskState::Merging;
+                    let Some(t) = guard.get_mut(&id2) else {
+                        continue;
+                    };
+                    if !matches!(
+                        t.state,
+                        TaskState::Queued | TaskState::Downloading | TaskState::Merging
+                    ) {
+                        continue;
                     }
+                    t.state = TaskState::Merging;
                 }
                 let _ = app2.emit("task-progress", &ev);
             } else if line.starts_with("ERROR:") {
@@ -940,7 +981,9 @@ async fn run_download_inner(
     // 这时从下载目录里找刚生成的文件兜底，别让用户拿到一个没有路径的「成功」任务。
     let resolved_path = match final_path {
         Some(p) => Some(p),
-        None if status.success() && !untrusted_success => find_recent_output(&dir, &task.title),
+        None if status.success() && !untrusted_success => {
+            find_recent_output(&dir, &task.title, task.created_at)
+        }
         None => None,
     };
     let missing_output = status.success() && !untrusted_success && resolved_path.is_none();
@@ -952,34 +995,57 @@ async fn run_download_inner(
             .as_ref()
             .and_then(|p| std::fs::metadata(p).ok())
             .map(|m| m.len());
-        let mut guard = tasks.lock().await;
-        if let Some(t) = guard.get_mut(&task.id) {
-            t.state = TaskState::Done;
-            t.progress = 100.0;
-            t.output_path = resolved_path.clone();
-            t.error = None;
-            if let Some(sz) = final_size {
-                t.downloaded_bytes = sz;
-                t.total_bytes = Some(sz);
+
+        // 终态写进 tasks 表之前**在锁内**复查取消标志。cancel_one 的顺序是
+        // 「拿 tasks 锁 → cancel token → 写 Canceled」；我们若在锁内看到令牌
+        // 未取消，就说明取消方还没拿到锁，它之后会看到 Done 并跳过覆盖；
+        // 反过来若取消已发生，这里必须落停止态，而不是把用户的取消改成 Done。
+        let (state, ev_err, snap) = {
+            let mut guard = tasks.lock().await;
+            match guard.get_mut(&task.id) {
+                Some(t) if token.is_canceled() => {
+                    let (state, msg) = stopped_state(&token);
+                    t.state = state;
+                    t.error = Some(msg.clone());
+                    crate::history::upsert_entry(t);
+                    let snap = stop_snapshot(t, state);
+                    (state, Some(msg), snap)
+                }
+                Some(t) => {
+                    t.state = TaskState::Done;
+                    t.progress = 100.0;
+                    t.output_path = resolved_path.clone();
+                    t.error = None;
+                    if let Some(sz) = final_size {
+                        t.downloaded_bytes = sz;
+                        t.total_bytes = Some(sz);
+                    }
+                    crate::history::upsert_entry(t);
+                    (TaskState::Done, None, (100.0, t.downloaded_bytes, t.total_bytes))
+                }
+                None => (
+                    TaskState::Done,
+                    None,
+                    (100.0, final_size.unwrap_or(0), final_size),
+                ),
             }
-            crate::history::upsert_entry(t);
-        }
-        drop(guard);
+        };
+        let (prog, bytes, total) = snap;
         let _ = app.emit(
             "task-progress",
             &ProgressEvent {
                 id: task.id.clone(),
-                state: TaskState::Done,
-                progress: 100.0,
-                downloaded_bytes: final_size.unwrap_or(0),
-                total_bytes: final_size,
+                state,
+                progress: prog,
+                downloaded_bytes: bytes,
+                total_bytes: total,
                 speed: None,
                 eta: None,
-                error: None,
-                output_path: resolved_path.clone(),
+                error: ev_err,
+                output_path: resolved_path.clone().filter(|_| state == TaskState::Done),
             },
         );
-        Ok(resolved_path)
+        Ok(resolved_path.filter(|_| state == TaskState::Done))
     } else {
         let mut parts: Vec<String> = Vec::new();
         if missing_output {
@@ -1001,28 +1067,46 @@ async fn run_download_inner(
         if msg.chars().count() > 1200 {
             msg = msg.chars().take(1200).collect();
         }
-        let mut guard = tasks.lock().await;
-        if let Some(t) = guard.get_mut(&task.id) {
-            t.state = TaskState::Failed;
-            t.error = Some(msg.clone());
-            crate::history::upsert_entry(t);
-        }
-        drop(guard);
+        // 与成功分支同一把锁内的复查：取消/暂停恰好压着失败一起到达时，
+        // 不能让 worker 把用户刚点的「取消」覆盖成 Failed。
+        let (state, ev_msg) = {
+            let mut guard = tasks.lock().await;
+            if token.is_canceled() {
+                let (state, smsg) = stopped_state(&token);
+                if let Some(t) = guard.get_mut(&task.id) {
+                    t.state = state;
+                    t.error = Some(smsg.clone());
+                    crate::history::upsert_entry(t);
+                }
+                (state, smsg)
+            } else {
+                if let Some(t) = guard.get_mut(&task.id) {
+                    t.state = TaskState::Failed;
+                    t.error = Some(msg.clone());
+                    crate::history::upsert_entry(t);
+                }
+                (TaskState::Failed, msg.clone())
+            }
+        };
         let _ = app.emit(
             "task-progress",
             &ProgressEvent {
                 id: task.id.clone(),
-                state: TaskState::Failed,
+                state,
                 progress: 0.0,
                 downloaded_bytes: 0,
                 total_bytes: None,
                 speed: None,
                 eta: None,
-                error: Some(msg.clone()),
+                error: Some(ev_msg),
                 output_path: None,
             },
         );
-        Err(msg)
+        if state == TaskState::Failed {
+            Err(msg)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -1108,14 +1192,23 @@ pub async fn run_direct_download(
         while let Some(ev) = rx.recv().await {
             {
                 let mut guard = tasks_c.lock().await;
-                if let Some(t) = guard.get_mut(&id_c) {
-                    t.progress = ev.progress;
-                    t.downloaded_bytes = ev.downloaded_bytes;
-                    t.total_bytes = ev.total_bytes;
-                    t.speed = ev.speed.clone();
-                    t.eta = ev.eta.clone();
-                    t.state = ev.state;
+                let Some(t) = guard.get_mut(&id_c) else {
+                    continue;
+                };
+                // 只让「还在跑」的状态接受进度覆盖。取消/暂停/完成之后通道里
+                // 可能还压着几帧旧进度，无守卫会把用户的取消改回 Downloading。
+                if !matches!(
+                    t.state,
+                    TaskState::Queued | TaskState::Downloading | TaskState::Merging
+                ) {
+                    continue;
                 }
+                t.progress = ev.progress;
+                t.downloaded_bytes = ev.downloaded_bytes;
+                t.total_bytes = ev.total_bytes;
+                t.speed = ev.speed.clone();
+                t.eta = ev.eta.clone();
+                t.state = ev.state;
             }
             let _ = app_c.emit("task-progress", &ev);
         }
@@ -1159,68 +1252,89 @@ pub async fn run_direct_download(
             // downloaded_bytes/total_bytes 写死成 0/None，表格「大小」列于是
             // 永远显示「—」。按磁盘长度回填，慢速和快速下载都能拿到正确大小。
             let final_size = std::fs::metadata(&path).map(|m| m.len()).ok();
-            let (done_bytes, done_total) = {
-                let guard = tasks.lock().await;
-                match guard.get(&task.id) {
-                    Some(t) => (
-                        final_size.unwrap_or(t.downloaded_bytes),
-                        final_size.or(t.total_bytes),
+
+            // 锁内复查取消标志，理由与 run_download 完全相同：cancel_one 也用
+            // tasks 锁做「查令牌 + 落终态」，两边互斥，不会出现「显示完成但用户
+            // 明明点过取消」的幽灵结果。
+            let (state, ev_err, snap) = {
+                let mut guard = tasks.lock().await;
+                match guard.get_mut(&task.id) {
+                    Some(t) if token.is_canceled() => {
+                        let (state, msg) = stopped_state(&token);
+                        t.state = state;
+                        t.error = Some(msg.clone());
+                        crate::history::upsert_entry(t);
+                        let snap = stop_snapshot(t, state);
+                        (state, Some(msg), snap)
+                    }
+                    Some(t) => {
+                        let done_bytes = final_size.unwrap_or(t.downloaded_bytes);
+                        let done_total = final_size.or(t.total_bytes);
+                        t.state = TaskState::Done;
+                        t.progress = 100.0;
+                        t.output_path = Some(path_str.clone());
+                        t.error = None;
+                        t.speed = None;
+                        t.downloaded_bytes = done_bytes;
+                        t.total_bytes = done_total;
+                        // 记录历史：完成时间、最终输出路径（历史页点「打开所在文件夹」要用）
+                        crate::history::upsert_entry(t);
+                        (TaskState::Done, None, (100.0, done_bytes, done_total))
+                    }
+                    None => (
+                        TaskState::Done,
+                        None,
+                        (100.0, final_size.unwrap_or(0), final_size),
                     ),
-                    None => (final_size.unwrap_or(0), final_size),
                 }
             };
-            {
-                let mut guard = tasks.lock().await;
-                if let Some(t) = guard.get_mut(&task.id) {
-                    t.state = TaskState::Done;
-                    t.progress = 100.0;
-                    t.output_path = Some(path_str.clone());
-                    t.error = None;
-                    t.speed = None;
-                    t.downloaded_bytes = done_bytes;
-                    t.total_bytes = done_total;
-                    // 记录历史：完成时间、最终输出路径（历史页点「打开所在文件夹」要用）
-                    crate::history::upsert_entry(t);
-                }
-            }
+            let (prog, done_bytes, done_total) = snap;
             let _ = app.emit(
                 "task-progress",
                 &ProgressEvent {
                     id: task.id.clone(),
-                    state: TaskState::Done,
-                    progress: 100.0,
+                    state,
+                    progress: prog,
                     downloaded_bytes: done_bytes,
                     total_bytes: done_total,
                     speed: None,
                     eta: None,
-                    error: None,
-                    output_path: Some(path_str.clone()),
+                    error: ev_err,
+                    output_path: (state == TaskState::Done).then_some(path_str.clone()),
                 },
             );
-            Ok(Some(path_str))
+            Ok(if state == TaskState::Done {
+                Some(path_str)
+            } else {
+                None
+            })
         }
         Err(e) => {
             // 直链的取消/暂停在 download_direct 内部就返回 Err("已取消")，
             // 所以这里除了看 token，还要认那条消息。暂停优先：token 被 pause()
             // 过的话，即便消息文本是「已取消」也要落成 Paused。
-            let stopped = token.is_canceled() || e.contains("已取消");
-            let (state, msg) = if stopped {
-                stopped_state(&token)
-            } else {
-                (TaskState::Failed, e)
-            };
-            let (prog, bytes, total) = {
+            //
+            // 判定必须在 tasks 锁内做：否则「读到未取消 → 取消方写 Canceled →
+            // 我们再写 Failed」这半拍会把用户刚点的取消覆盖掉。
+            let (state, msg, snap) = {
                 let mut guard = tasks.lock().await;
                 match guard.get_mut(&task.id) {
                     Some(t) => {
+                        let (state, msg) = if token.is_canceled() || e.contains("已取消") {
+                            stopped_state(&token)
+                        } else {
+                            (TaskState::Failed, e.clone())
+                        };
                         t.state = state;
                         t.error = Some(msg.clone());
                         crate::history::upsert_entry(t);
-                        stop_snapshot(t, state)
+                        let snap = stop_snapshot(t, state);
+                        (state, msg, snap)
                     }
-                    None => (0.0, 0, None),
+                    None => (TaskState::Failed, e.clone(), (0.0, 0, None)),
                 }
             };
+            let (prog, bytes, total) = snap;
             let _ = app.emit(
                 "task-progress",
                 &ProgressEvent {
@@ -1231,7 +1345,7 @@ pub async fn run_direct_download(
                     total_bytes: total,
                     speed: None,
                     eta: None,
-                    error: Some(msg.clone()),
+                    error: Some(msg),
                     output_path: None,
                 },
             );
@@ -1362,5 +1476,119 @@ mod tests {
         assert!(fresh_part.exists(), "活跃的 .part 文件必须保留");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn sample_task(save_dir: Option<&str>) -> Task {
+        Task {
+            id: "t1_0".into(),
+            url: "https://e.com/f.bin".into(),
+            title: "movie".into(),
+            thumbnail: None,
+            duration: None,
+            format_id: "best".into(),
+            quality_label: "Best".into(),
+            has_audio: true,
+            best_audio_format: None,
+            state: TaskState::Queued,
+            progress: 0.0,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            speed: None,
+            eta: None,
+            output_path: None,
+            error: None,
+            created_at: crate::commands::now_ms(),
+            kind: "direct".into(),
+            threads: 4,
+            save_dir: save_dir.map(str::to_string),
+        }
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "veloxgrab_{tag}_{}_{}",
+            std::process::id(),
+            crate::util::short_hash(&format!("{:?}", std::time::SystemTime::now()))
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// P1-1：history 回灌的 save_dir 必须在真正下载/清理前再过一次闸门。
+    #[test]
+    fn resolve_task_dir_rechecks_untrusted_history_dirs() {
+        let base = scratch("gate");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let settings = Settings {
+            download_dir: root.to_string_lossy().to_string(),
+            ..Settings::default()
+        };
+
+        // 根内子目录：放行（不存在时创建）
+        let inside = root.join("sub");
+        let t = sample_task(Some(inside.to_str().unwrap()));
+        assert_eq!(resolve_task_dir(&settings, &t).unwrap(), inside);
+        assert!(inside.is_dir());
+
+        // 根外且不在信任集：静默回落默认根，绝不按脏数据写出去
+        let t = sample_task(Some(outside.to_str().unwrap()));
+        assert_eq!(resolve_task_dir(&settings, &t).unwrap(), root);
+
+        // 相对路径 + 上跳同样回落
+        let t = sample_task(Some(r"..\..\Windows"));
+        assert_eq!(resolve_task_dir(&settings, &t).unwrap(), root);
+
+        // 已批准过的根外目录仍然可用（升级前用户同意过的历史任务）
+        let mut settings = settings;
+        settings.trusted_dirs.push(outside.to_string_lossy().to_string());
+        let t = sample_task(Some(outside.to_str().unwrap()));
+        assert_eq!(resolve_task_dir(&settings, &t).unwrap(), outside);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// P2：兜底找成品时不能把「同前缀的别的文件」或十分钟前的旧文件算进来。
+    #[test]
+    fn find_recent_output_is_strict_about_prefix_and_age() {
+        let dir = scratch("recent");
+        let real = dir.join("movie.mp4");
+        let lookalike = dir.join("movie2.mp4");
+        let temp = dir.join("movie.mp4.veloxgrab-downloading.t1_0");
+        for p in [&real, &lookalike, &temp] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        let created = crate::commands::now_ms();
+        assert_eq!(
+            find_recent_output(&dir, "movie", created),
+            Some(real.to_string_lossy().to_string()),
+            "只能命中 movie.*，不能命中 movie2.mp4 或临时文件"
+        );
+
+        // 把成品改成两小时前：早于任务创建时间，不能当成本次输出
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&real)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(find_recent_output(&dir, "movie", created), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2：标题里的 `%` 必须转义，否则 yt-dlp 会把 `%(ext)s` 一起吃掉。
+    #[test]
+    fn output_template_escapes_percent_in_title() {
+        let mut t = sample_task(None);
+        t.title = "100% 完成".into();
+        let tpl = output_template(r"C:\dl", &t);
+        assert!(tpl.contains("100%% 完成.%(ext)s"), "{tpl}");
     }
 }

@@ -162,16 +162,35 @@ chrome.downloads.onCreated.addListener(async (item) => {
     // erase 失败只是留个痕迹，不影响主流程
   }
 
-  // 用浏览器已经解析出的文件名：它比我们从 URL 猜的准得多
-  // （Content-Disposition 里的名字只有浏览器知道）。
-  const filename = pickFilename(item);
-  const ok = await send({ url: item.url, filename, dir: cfg.dir, threads: cfg.threads });
+  try {
+    // 用浏览器已经解析出的文件名：它比我们从 URL 猜的准得多
+    // （Content-Disposition 里的名字只有浏览器知道）。
+    const filename = pickFilename(item);
+    const ok = await send({ url: item.url, filename, dir: cfg.dir, threads: cfg.threads });
 
-  if (cfg.notify) {
-    notify(
-      ok ? "已转给 VeloxGrab" : "VeloxGrab 未响应",
-      ok ? filename || item.url : "请确认 VeloxGrab 正在运行（托盘图标可见）"
-    );
+    if (!ok) {
+      // VeloxGrab 没接住：浏览器那条已经被取消并抹掉了，这里不还回去的话
+      // 用户点一次下载会「什么都没发生」。重新交给浏览器下载。
+      // 扩展发起的下载带 byExtensionId，上面的监听器会跳过它，不会成环。
+      const opts = { url: item.url, conflictAction: "uniquify" };
+      if (filename) opts.filename = filename;
+      try {
+        await chrome.downloads.download(opts);
+      } catch {
+        // 仍然失败就只能靠 send() 里的剪贴板兜底了
+      }
+    }
+
+    if (cfg.notify) {
+      notify(
+        ok ? "已转给 VeloxGrab" : "VeloxGrab 未响应，已交回浏览器下载",
+        ok ? filename || item.url : "请确认 VeloxGrab 正在运行（托盘图标可见）"
+      );
+    }
+  } finally {
+    // 转发结束才解账：发送期间若因重定向再触发一次 onCreated，仍会被拦下。
+    // 不删的话这个集合会在后台页生命周期内无限增长。
+    canceling.delete(item.id);
   }
 });
 
