@@ -326,13 +326,13 @@ cargo run --release --example link_check -- cases.txt
 `direct_test` 会打印探测结果（是否支持 Range、总大小、建议线程数），下载完成后
 逐字节校验内容，并额外跑一轮“删掉一部分再续传”的一致性检查。
 
-`cargo test --lib` 覆盖 85 个单测：URL 分流、Range 判据、分块切分、续传累计值语义、
+`cargo test --lib` 覆盖 88 个单测：URL 分流、Range 判据、分块切分、续传累计值语义、
 文件名清洗、进度行解析、音频打分、陈旧清理、历史只收终态、深链解析全部形态
 （含 `add` 带斜杠、裸 URL 形态、参数别名、非 http 目标拒绝、threads clamp）、
 目录闸门（词法折叠、越界判定、可信集、可删文件校验）、代码页解码（真实 GBK 字节
 回归）、DPAPI 封装与旧明文兼容、本地桥 Origin 闸门、安装链引号剥离、
 HF token 的 host 作用域与 Authorization 头格式、代理凭据编码、按任务隔离的
-临时文件与清理、更新下载 URL 的仓库绑定。
+临时文件与清理、更新下载 URL 的仓库绑定、安装包 sha256 摘要校验。
 
 ### 协议投递的手工验证
 
@@ -417,13 +417,17 @@ yt-dlp 把 Chromium 系浏览器统一按 Chrome 的库路径处理。
   记入信任集。**刻意放行局域网/回环**（下载 NAS 是正当用途）；「域名解析到
   内网」的 true SSRF 不做 DNS 预检——有 TOCTOU 且误伤内网用户。重定向逐跳
   过同一道闸（含拦 https→http 降级、云元数据字面量）。
-- **更新链维持「信任 GitHub 仓库」姿态，未做验签**（产品决定，2026-10-23）：
-  下载源锁死**本仓库**的 release 资产路径
+- **更新链维持「信任 GitHub 仓库」姿态，未做发布者验签**（产品决定，2026-10-23，
+  2026-10-28 补内容校验）：下载源锁死**本仓库**的 release 资产路径
   （`https://github.com/dreamcatsky/veloxgrab/releases/download/`）+ TLS 校验开启
-  + 大小校验，信任边界与「人去网页上点下载」一致；任何别的 GitHub 仓库、
-  CDN 域、相似前缀都不放行。代价是**仓库账号被盗 = 可推送任意安装包**。要升级
-  这个姿态就引入 minisign（tauri-plugin-updater）或 release 附带 SHA-256 并校验。
-  安装链的 bat 路径做了引号剥离（合法文件名含 `"` 不致注入命令）。
+  + 大小校验 + **release 元数据里的 sha256 摘要逐字节校验**（下载后算 BCrypt
+  SHA-256，不一致立即删除安装包）；信任边界与「人去网页上点下载」一致，任何别的
+  GitHub 仓库、CDN 域、相似前缀都不放行。摘要防的是传输损坏（代理返回错误页、
+  CDN 半截文件、无 `Content-Length` 的中断），**不防仓库账号被盗**——摘要和下载
+  地址同源于一份 JSON，能改一个就能改另一个。要堵住这一层只能引入 Authenticode
+  （签名 + 绑定发布者指纹）或 minisign（`tauri-plugin-updater`），两者都需要
+  证书/私钥仪式，目前未做。安装链的 bat 路径做了引号剥离（合法文件名含 `"`
+  不致注入命令）。
 - **机密存储**：hf_token / proxy_pass 落盘前过 DPAPI（CryptProtectData，
   用户+机器绑定），settings.json 里只有 `dpapi1:<hex>`；加密失败退回明文
   （保存失败丢整个配置比不加密更糟），解密失败按未配置处理、绝不把密文漏进

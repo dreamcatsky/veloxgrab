@@ -13,6 +13,16 @@
 //! 的信任边界和人在网页上手动点下载是同一个。安装复用 NSIS 的 `/S`
 //! 静默模式，装完自动重启，用户视角就是「点一下升级，等它重开」。
 //!
+//! ## 安装包完整性
+//!
+//! 下载完成后会拿 GitHub release 元数据里的 `digest`（`sha256:…`）逐字节
+//! 校验安装包，不一致就删掉文件并报错。它挡的是**传输损坏**：代理返回了
+//! 一张错误页却给了 200、CDN 边缘节点给了半个文件、连接中途断了但
+//! `Content-Length` 恰好缺失。它挡不住「GitHub 账号被攻破后发一个新版本」
+//! ——摘要和下载地址来自同一个 JSON，能篡改一个就能篡改另一个。发布者身份
+//! 只能靠 Authenticode 签名，本仓库目前没有证书，所以这条边界如实写在这里，
+//! 不假装摘要提供了它没有的保证。
+//!
 //! ## 安装时序上唯一的坑
 //!
 //! NSIS 覆盖不了正在运行的 exe（文件锁）。所以不能「启动安装程序然后退出」
@@ -51,6 +61,36 @@ fn is_trusted_download(url: &str) -> bool {
         && url.len() > RELEASE_DOWNLOAD_PREFIX.len()
         // 前缀之后不能又是 scheme/凭据之类的东西（防御性，正常 URL 不会命中）
         && !url[RELEASE_DOWNLOAD_PREFIX.len()..].contains("://")
+}
+
+/// `sha256:<64 位十六进制>` → 32 字节。算法名不区分大小写；长度、字符集
+/// 或算法不对一律 `None`（宁可退回 Content-Length 校验，也不猜）。
+fn parse_digest(s: &str) -> Option<[u8; 32]> {
+    let (algo, hex) = s.split_once(':')?;
+    if !algo.eq_ignore_ascii_case("sha256") || hex.len() != 64 || !hex.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// 从 release JSON 里找出**这个 URL 对应资产**的 sha256 摘要。
+///
+/// 必须按 URL 匹配而不是「取第一个 digest」：同一个 release 里还有
+/// `.msi`、`source.zip` 等资产，拿错摘要会永远校验失败。
+/// 2025 年前的旧 release 没有 `digest` 字段（值为 null），返回 `None`。
+pub(crate) fn asset_digest_for(v: &serde_json::Value, url: &str) -> Option<[u8; 32]> {
+    let assets = v.get("assets")?.as_array()?;
+    assets.iter().find_map(|a| {
+        let candidate = a.get("browser_download_url").and_then(|x| x.as_str())?;
+        if candidate != url {
+            return None;
+        }
+        a.get("digest").and_then(|x| x.as_str()).and_then(parse_digest)
+    })
 }
 
 #[derive(Serialize)]
@@ -201,6 +241,118 @@ pub(crate) async fn fetch_latest(proxy: Option<&str>, current: &str) -> UpdateIn
     }
 }
 
+/// 取本仓库最新 release 里某个资产的内容摘要。
+///
+/// 任何一步失败都返回 `None` 让调用方放行下载：GitHub API 有 60 次/小时的
+/// 匿名限流，把「拿不到摘要」当成「更新失败」会让用户卡在旧版本上。
+/// 这条降级是有意的——摘要只防传输损坏，不是身份凭证。
+#[cfg(windows)]
+async fn fetch_asset_digest(proxy: Option<&str>, url: &str) -> Option<[u8; 32]> {
+    let client = build_client(proxy, Some(Duration::from_secs(15))).ok()?;
+    let resp = client
+        .get(API_LATEST)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    asset_digest_for(&v, url)
+}
+
+/// 流式计算文件的 SHA-256，走系统 BCrypt（`windows-sys` 已经在用，不新增依赖）。
+#[cfg(windows)]
+fn sha256_file(path: &std::path::Path) -> Result<[u8; 32], String> {
+    use windows_sys::Win32::Security::Cryptography as bc;
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("打开安装包失败: {e}"))?;
+    let mut alg: bc::BCRYPT_ALG_HANDLE = std::ptr::null_mut();
+    // SAFETY: 句柄在本函数内创建与释放；所有指针都指向本栈帧内的有效分配。
+    unsafe {
+        if bc::BCryptOpenAlgorithmProvider(&mut alg, bc::BCRYPT_SHA256_ALGORITHM, std::ptr::null(), 0) < 0 {
+            return Err("初始化 SHA-256 失败".into());
+        }
+        // 主体包一层闭包，保证任何失败路径都会走到下面的销毁句柄
+        let result = (|| {
+            let mut got: u32 = 0;
+            let mut obj_len: u32 = 0;
+            if bc::BCryptGetProperty(
+                alg,
+                bc::BCRYPT_OBJECT_LENGTH,
+                &mut obj_len as *mut u32 as *mut u8,
+                4,
+                &mut got,
+                0,
+            ) < 0
+            {
+                return Err("读取 SHA-256 参数失败".to_string());
+            }
+            let mut hash_len: u32 = 0;
+            if bc::BCryptGetProperty(
+                alg,
+                bc::BCRYPT_HASH_LENGTH,
+                &mut hash_len as *mut u32 as *mut u8,
+                4,
+                &mut got,
+                0,
+            ) < 0
+            {
+                return Err("读取 SHA-256 参数失败".to_string());
+            }
+            // 摘要长度写死 32 是调用方与 BCrypt 的契约，对不上说明拿错算法了
+            if hash_len != 32 {
+                return Err(format!("非预期的摘要长度 {hash_len}"));
+            }
+            let mut obj = vec![0u8; obj_len as usize];
+            let mut hash: bc::BCRYPT_HASH_HANDLE = std::ptr::null_mut();
+            if bc::BCryptCreateHash(alg, &mut hash, obj.as_mut_ptr(), obj_len, std::ptr::null(), 0, 0) < 0 {
+                return Err("创建 SHA-256 上下文失败".to_string());
+            }
+            let inner = (|| {
+                use std::io::Read;
+                // 64 KiB：安装包 20 MB 左右，这个块大小下 syscall 次数与
+                // 缓存友好度都够，不需要更细的调节
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    let n = file.read(&mut buf).map_err(|e| format!("读取安装包失败: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    if bc::BCryptHashData(hash, buf.as_ptr(), n as u32, 0) < 0 {
+                        return Err("计算 SHA-256 失败".to_string());
+                    }
+                }
+                let mut out = [0u8; 32];
+                if bc::BCryptFinishHash(hash, out.as_mut_ptr(), 32, 0) < 0 {
+                    return Err("计算 SHA-256 失败".to_string());
+                }
+                Ok(out)
+            })();
+            bc::BCryptDestroyHash(hash);
+            inner
+        })();
+        bc::BCryptCloseAlgorithmProvider(alg, 0);
+        result
+    }
+}
+
+/// 校验下载到的安装包；不一致时删掉文件——半成品留在临时目录里，
+/// 下次「更新」会先删再下，但如果用户手动去双击它就成了执行未知文件。
+#[cfg(windows)]
+fn verify_downloaded(path: &std::path::Path, expected: [u8; 32]) -> Result<(), String> {
+    let got = sha256_file(path)?;
+    if got == expected {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(path);
+    Err(format!(
+        "安装包校验失败：摘要 {} 与发布信息不符，已删除。请重试，或到 GitHub Releases 手动下载",
+        got.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    ))
+}
+
 /// 检查是否有新版本。代理设置照用——GitHub 直连不畅时，用户挂了代理就该走代理。
 #[tauri::command]
 pub async fn check_update(
@@ -241,6 +393,12 @@ pub async fn update_now(
     let dir = std::env::temp_dir().join("veloxgrab-update");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
     let tmp = dir.join("VeloxGrab-setup.exe");
+
+    // 摘要先取：取不到就放行（理由见 fetch_asset_digest），取到就得对得上。
+    // 放在下载前是为了少下一个注定要删的坏包，不是为了省那点带宽。
+    #[cfg(windows)]
+    let expected_digest = fetch_asset_digest(proxy.as_deref(), &url).await;
+
     // 清掉上次中断留下的半成品，避免续到坏文件上
     let _ = std::fs::remove_file(&tmp);
 
@@ -273,6 +431,13 @@ pub async fn update_now(
 
     if total > 0 && downloaded != total {
         return Err(format!("下载不完整（{downloaded}/{total} 字节）"));
+    }
+
+    // Content-Length 只能证明「长度对」，证明不了「内容对」：代理返回错误页、
+    // CDN 半截文件、连接中断都可能长度恰好一致或没有 Length。有摘要就逐字节校验。
+    #[cfg(windows)]
+    if let Some(expected) = expected_digest {
+        verify_downloaded(&tmp, expected)?;
     }
 
     #[cfg(windows)]
@@ -409,6 +574,88 @@ mod tests {
         assert!(!is_trusted_download(
             "https://evil.example/https://github.com/dreamcatsky/veloxgrab/releases/download/v1/a.exe"
         ));
+    }
+
+    // ---- 安装包摘要校验（P2 强化：update_now 下载后逐字节校验） ----
+
+    /// "abc" 的 SHA-256，取自 `Get-FileHash abc.bin -Algorithm SHA256`。
+    const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn digest_parsing_accepts_only_sha256_hex() {
+        let d = parse_digest(&format!("sha256:{SHA256_ABC}")).expect("合法摘要必须解析成功");
+        assert_eq!(d[0], 0xba);
+        assert_eq!(d[31], 0xad);
+        // 算法名大小写不该决定成败；十六进制同理（GitHub 目前给小写）
+        assert!(parse_digest(&format!("SHA256:{}", SHA256_ABC.to_uppercase())).is_some());
+        // 别的算法、长度不对、非十六进制、非 ASCII、空串一律拒绝
+        assert!(parse_digest(&format!("sha512:{SHA256_ABC}")).is_none());
+        assert!(parse_digest("sha256:abc").is_none());
+        assert!(parse_digest(&format!("sha256:{}", SHA256_ABC.replace('a', "z"))).is_none());
+        assert!(parse_digest("sha256:中文中文中文").is_none());
+        assert!(parse_digest("").is_none());
+        // 没有冒号 = 没有算法前缀
+        assert!(parse_digest(SHA256_ABC).is_none());
+    }
+
+    /// 必须按 URL 找摘要：同一个 release 里还有 `.msi`/`source.zip`，
+    /// 拿错资产的摘要会让更新永远校验失败。
+    #[test]
+    fn digest_is_matched_by_asset_url() {
+        let v: serde_json::Value = serde_json::json!({
+            "assets": [
+                { "name": "VeloxGrab_x64.msi",
+                  "browser_download_url": "https://github.com/dreamcatsky/veloxgrab/releases/download/v1/m.msi",
+                  "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+                { "name": "VeloxGrab_x64-setup.exe",
+                  "browser_download_url": "https://github.com/dreamcatsky/veloxgrab/releases/download/v1/setup.exe",
+                  "digest": format!("sha256:{SHA256_ABC}") }
+            ]
+        });
+        let setup = "https://github.com/dreamcatsky/veloxgrab/releases/download/v1/setup.exe";
+        let d = asset_digest_for(&v, setup).expect("setup.exe 的摘要必须取到");
+        assert_eq!(d[0], 0xba);
+        // 不存在的 URL、没有 digest 字段（2025 年前的旧 release）
+        assert!(asset_digest_for(&v, "https://github.com/dreamcatsky/veloxgrab/releases/download/v1/x.exe").is_none());
+        let old: serde_json::Value = serde_json::json!({
+            "assets": [{ "browser_download_url": setup, "digest": serde_json::Value::Null }]
+        });
+        assert!(asset_digest_for(&old, setup).is_none());
+        // 形状不对（没有 assets / assets 不是数组）不能 panic
+        assert!(asset_digest_for(&serde_json::json!({}), setup).is_none());
+        assert!(asset_digest_for(&serde_json::json!({ "assets": 1 }), setup).is_none());
+    }
+
+    /// 端到端校验：对的文件放行、错的文件被删掉。
+    #[test]
+    #[cfg(windows)]
+    fn verification_rejects_and_deletes_mismatched_file() {
+        let dir = std::env::temp_dir().join(format!("vg-digest-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let good = dir.join("good.exe");
+        std::fs::write(&good, b"abc").unwrap();
+        let expected = parse_digest(&format!("sha256:{SHA256_ABC}")).unwrap();
+        verify_downloaded(&good, expected).expect("摘要一致必须放行");
+        assert!(good.exists(), "校验通过的文件不能被删");
+
+        let bad = dir.join("bad.exe");
+        std::fs::write(&bad, b"abd").unwrap();
+        let err = verify_downloaded(&bad, expected).expect_err("摘要不一致必须失败");
+        assert!(err.contains("校验失败"), "错误信息要能让人看懂: {err}");
+        assert!(!bad.exists(), "校验失败的文件必须删掉，避免被手动双击");
+
+        // 空文件也不许 panic（读 0 次 HashData 就走 FinishHash）
+        let empty = dir.join("empty.exe");
+        std::fs::write(&empty, b"").unwrap();
+        let empty_hash = parse_digest(
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap();
+        verify_downloaded(&empty, empty_hash).expect("空文件摘要也要算对");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 资产 URL 不受信时不能被当成「可更新」，避免前端拿着坏地址去下载。
