@@ -4,7 +4,8 @@
 //! - 先发 HEAD（失败则退化为带 Range 的 GET）探测：是否支持 Range、总大小、文件名、MIME
 //! - 支持 Range 时把文件切成 N 段，每段一个连接并发拉取，各自 seek 写入同一个文件
 //! - 不支持 Range 时退化为单流顺序下载
-//! - 断点续传：每段已写偏移定期落盘到 `<文件名>.veloxgrab-part`，重启后按偏移继续
+//! - 断点续传：每段已写偏移定期落盘到 `<临时文件>.veloxgrab-part`，重启后按偏移继续
+//! - 临时文件带任务 id：同名任务并发时互不覆盖，清理也只删自己那一份
 //! - 取消通过共享 AtomicBool 实现，不依赖 reqwest 的取消机制
 
 use futures_util::StreamExt;
@@ -15,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::settings::NetCfg;
+use crate::util::host_of;
 
 /// 分块时每段的最小字节数：太小会让连接数虚高，收益被请求开销吃掉
 const MIN_CHUNK_SIZE: u64 = 1024 * 1024; // 1 MiB
@@ -96,6 +98,17 @@ fn client_with(proxy: Option<&str>) -> Result<reqwest::Client, String> {
     }
     b.build()
         .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))
+}
+
+/// 给请求附加按 host 作用域限定的认证头（目前只有 HuggingFace）。
+///
+/// `NetCfg.auth` 可能出现在任何直链任务里，但只有 URL 的 host 命中作用域时
+/// 才真正带上——这是「token 跟着设置走」与「token 跟着请求走」的分界线。
+fn apply_auth(rb: reqwest::RequestBuilder, url: &str, net: &NetCfg) -> reqwest::RequestBuilder {
+    match net.auth.as_ref().and_then(|a| a.for_url(url)) {
+        Some(v) => rb.header(reqwest::header::AUTHORIZATION, v),
+        None => rb,
+    }
 }
 
 /// 一个 URL 作为下载目标是否放行（初始 URL 与每一跳共用）。
@@ -302,20 +315,28 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 static LAST_PROBE: Mutex<Option<(String, Instant, DirectProbe)>> = Mutex::new(None);
 const PROBE_CACHE_TTL: Duration = Duration::from_secs(60);
 
-fn cached_probe(url: &str) -> Option<DirectProbe> {
+fn cached_probe(key: &str) -> Option<DirectProbe> {
     let g = LAST_PROBE.lock().ok()?;
-    let (cached_url, at, probe) = g.as_ref()?;
-    if cached_url == url && at.elapsed() < PROBE_CACHE_TTL {
+    let (cached_key, at, probe) = g.as_ref()?;
+    if cached_key == key && at.elapsed() < PROBE_CACHE_TTL {
         Some(probe.clone())
     } else {
         None
     }
 }
 
-fn store_probe(url: &str, probe: &DirectProbe) {
+fn store_probe(key: &str, probe: &DirectProbe) {
     if let Ok(mut g) = LAST_PROBE.lock() {
-        *g = Some((url.to_string(), Instant::now(), probe.clone()));
+        *g = Some((key.to_string(), Instant::now(), probe.clone()));
     }
+}
+
+/// 探测缓存键。
+///
+/// 同一个 URL「带 token」与「不带 token」的结果完全不同（gated 仓库是 401 vs 200），
+/// 只按 URL 缓存会把一次 401 复用给刚填好 token 的下载，或反过来。
+fn probe_cache_key(url: &str, net: &NetCfg) -> String {
+    format!("{url}\u{1}{}", net.auth.is_some())
 }
 
 /// 轮询取消标志，供 `select!` 使用（AtomicBool 本身没有 await 接口）
@@ -342,7 +363,7 @@ pub async fn probe_direct(
     // 这类"前缀合法、host 违规"的写法从这里漏过去；跳转后再拦也晚了——
     // 第一跳就是元数据地址时请求已经发出去了。
     url_target_guarded(url)?;
-    let fut = tokio::time::timeout(PROBE_TIMEOUT, probe_uncached(url, net.proxy.as_deref()));
+    let fut = tokio::time::timeout(PROBE_TIMEOUT, probe_uncached(url, net));
     let timed_out = || format!("探测超时（{} 秒），服务器响应过慢", PROBE_TIMEOUT.as_secs());
 
     let probe = match cancel {
@@ -353,13 +374,13 @@ pub async fn probe_direct(
         None => fut.await.map_err(|_| timed_out())??,
     };
 
-    store_probe(url, &probe);
+    store_probe(&probe_cache_key(url, net), &probe);
     Ok(probe)
 }
 
 /// 实际的探测逻辑（无超时、无缓存），由 `probe_direct` 包装后调用。
-async fn probe_uncached(url: &str, proxy: Option<&str>) -> Result<DirectProbe, String> {
-    let c = client_with(proxy)?;
+async fn probe_uncached(url: &str, net: &NetCfg) -> Result<DirectProbe, String> {
+    let c = client_with(net.proxy.as_deref())?;
 
     // HEAD 和 Range 探测并发发出，谁先回先用谁。
     //
@@ -375,7 +396,7 @@ async fn probe_uncached(url: &str, proxy: Option<&str>) -> Result<DirectProbe, S
     let head_fut = async {
         match tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            c.head(url).send(),
+            apply_auth(c.head(url), url, net).send(),
         )
         .await
         {
@@ -384,7 +405,7 @@ async fn probe_uncached(url: &str, proxy: Option<&str>) -> Result<DirectProbe, S
         }
     };
     let range_fut = async {
-        c.get(url)
+        apply_auth(c.get(url), url, net)
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send()
             .await
@@ -604,6 +625,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 async fn download_segment(
     c: reqwest::Client,
     url: String,
+    auth: Option<String>,
     start: u64,
     end: u64,
     total: u64,
@@ -620,9 +642,13 @@ async fn download_segment(
     }
     let from = start + already_done;
 
-    let resp = c
+    let mut rb = c
         .get(&url)
-        .header(reqwest::header::RANGE, format!("bytes={from}-{end}"))
+        .header(reqwest::header::RANGE, format!("bytes={from}-{end}"));
+    if let Some(v) = auth {
+        rb = rb.header(reqwest::header::AUTHORIZATION, v);
+    }
+    let resp = rb
         .send()
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
@@ -826,15 +852,83 @@ fn has_real_extension(name: &str) -> bool {
     }
 }
 
-/// 最终路径对应的临时文件路径（`movie.mp4` → `movie.mp4.veloxgrab-downloading`）。
-fn temp_path_for(target: &Path) -> PathBuf {
+/// 最终路径对应的临时文件路径。
+///
+/// `tag` 是任务 id（`t<毫秒>_<序号>`）。带上它之后，同一个标题的两个任务
+/// 各自写各自的临时文件——旧实现是 `<文件名>.veloxgrab-downloading`，两个
+/// 同名并发任务会互相覆盖对方的分块，最终各自 rename 出「看起来完整」的
+/// 损坏文件。`tag` 为空时退回旧命名（只给测试和迁移路径用）。
+fn temp_path_for(target: &Path, tag: &str) -> PathBuf {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
+    let suffix = if tag.is_empty() {
+        TEMP_SUFFIX.to_string()
+    } else {
+        format!("{TEMP_SUFFIX}.{tag}")
+    };
     let mut p = target.to_path_buf();
-    p.set_file_name(format!("{name}{TEMP_SUFFIX}"));
+    p.set_file_name(format!("{name}{suffix}"));
     p
+}
+
+/// 这个文件名是不是直链下载器留下的临时产物（新命名或升级前的旧命名）。
+///
+/// 只按后缀模糊判断会把 `notes.veloxgrab-downloading.bak` 也算进来，启动清理
+/// 就会删用户的普通文件。新命名里的 tag 必须是任务 id 的形状：`t` + 数字/下划线。
+/// （任务 id 由 `commands::next_task_id` 生成，形如 `t1759..._0`。）
+pub fn is_temp_artifact(name: &str) -> bool {
+    fn part_tail(rest: &str) -> bool {
+        rest.is_empty() || rest == ".veloxgrab-part" || rest == ".veloxgrab-part.tmp"
+    }
+    fn task_tag(tag: &str) -> bool {
+        let mut cs = tag.chars();
+        cs.next() == Some('t')
+            && tag.len() > 1
+            && cs.all(|c| c.is_ascii_digit() || c == '_')
+    }
+
+    let Some(pos) = name.find(TEMP_SUFFIX) else {
+        return false;
+    };
+    let rest = &name[pos + TEMP_SUFFIX.len()..];
+    // 旧命名：<name>.veloxgrab-downloading[.veloxgrab-part[.tmp]]
+    if part_tail(rest) {
+        return true;
+    }
+    // 新命名：<name>.veloxgrab-downloading.<task_id>[.veloxgrab-part[.tmp]]
+    let Some(rest) = rest.strip_prefix('.') else {
+        return false;
+    };
+    match rest.split_once('.') {
+        Some((tag, tail)) => task_tag(tag) && matches!(tail, "veloxgrab-part" | "veloxgrab-part.tmp"),
+        None => task_tag(rest),
+    }
+}
+
+/// 把升级前遗留的「按标题命名」临时文件认领给当前任务。
+///
+/// 升级那一刻盘上可能还躺着旧版本的 `movie.mp4.veloxgrab-downloading` 与断点。
+/// 不迁移的话，用户点「继续」会从头再下，之前下的几 GB 白费。迁移只在
+/// **本任务的新临时文件不存在**时发生，且旧名字在升级后不会再有进程写它，
+/// 所以不存在把别人的活跃数据抢走的问题。
+fn adopt_legacy_temp(final_target: &Path, target: &Path, tag: &str) {
+    if tag.is_empty() || target.exists() {
+        return;
+    }
+    let legacy = temp_path_for(final_target, "");
+    if !legacy.is_file() {
+        return;
+    }
+    if std::fs::rename(&legacy, target).is_err() {
+        return;
+    }
+    let old_part = PartMeta::path_for(&legacy);
+    let new_part = PartMeta::path_for(target);
+    if !new_part.exists() {
+        let _ = std::fs::rename(old_part, new_part);
+    }
 }
 
 /// 下载完成：把临时文件改名成最终文件名。
@@ -887,13 +981,19 @@ fn unique_target(target: &Path) -> PathBuf {
 
 /// 清理某个直链任务在下载目录里留下的临时产物。
 ///
-/// 只删「以该标题开头 + 以我们的后缀结尾」的文件，不会碰用户的其他文件。
-/// 任务被移除后 `.veloxgrab-downloading` / `.veloxgrab-part` 否则会永久留在目录里。
-pub fn cleanup_artifacts(dir: &Path, name_hint: &str) {
+/// 判据是「以该标题开头 + 带本任务的 id 标记 + 以我们的后缀结尾」：
+/// 只删这个任务自己的 `.veloxgrab-downloading.<id>` 与配套断点，绝不会碰到
+/// 同名任务的临时文件（这正是旧实现按标题前缀匹配的缺陷）。
+///
+/// 升级前的旧命名（不带 id）不在这里删：它被同标题的多个历史任务共享，
+/// 删掉任何一个任务都可能踩坏另一个任务的续传数据；交给启动时的
+/// `cleanup_stale_artifacts` 按时间窗口统一回收。
+pub fn cleanup_artifacts(dir: &Path, name_hint: &str, task_id: &str) {
     let stem = crate::util::sanitize_filename(name_hint);
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
+    let marker = format!("{TEMP_SUFFIX}.{task_id}");
     for entry in rd.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -907,16 +1007,27 @@ pub fn cleanup_artifacts(dir: &Path, name_hint: &str) {
         if !rest.starts_with('.') {
             continue;
         }
-        if rest.ends_with(TEMP_SUFFIX) || rest.ends_with(".veloxgrab-part") {
+        // marker 之后只剩空串（临时文件本体）或断点后缀。
+        // 用 rfind：标题本身若恰好含 marker（例如用户真把文件名起成
+        // `x.veloxgrab-downloading.t1_0`），只能认最后一个，否则清理不到自己的文件。
+        let Some(pos) = name.rfind(&marker) else {
+            continue;
+        };
+        let tail = &name[pos + marker.len()..];
+        if tail.is_empty() || tail == ".veloxgrab-part" || tail == ".veloxgrab-part.tmp" {
             let _ = std::fs::remove_file(&path);
         }
     }
 }
 
 /// 下载直链文件到指定目录，返回最终路径。
+///
+/// `task_id` 只用于临时文件命名：同标题的两个并发任务各写各的临时文件，
+/// 完成后再各自落到 `movie.mp4` / `movie (1).mp4`，不会互相覆盖。
 #[allow(clippy::too_many_arguments)]
 pub async fn download_direct(
     url: &str,
+    task_id: &str,
     dir: &Path,
     filename_override: Option<&str>,
     threads: usize,
@@ -925,13 +1036,14 @@ pub async fn download_direct(
     net: &NetCfg,
 ) -> Result<PathBuf, String> {
     // 前端解析时刚探过，60 秒内直接复用，省掉一整轮 HEAD + Range 往返
-    let info = match cached_probe(url) {
+    let info = match cached_probe(&probe_cache_key(url, net)) {
         Some(p) => p,
         None => probe_direct(url, Some(cancel.clone()), net).await?,
     };
     let final_target = dir.join(resolve_target_name(&info.filename, filename_override));
     // 全程只写临时文件，成功后才改名（见 finish_download）
-    let target = temp_path_for(&final_target);
+    let target = temp_path_for(&final_target, task_id);
+    let legacy_target = temp_path_for(&final_target, "");
     let total = info.total_bytes.unwrap_or(0);
     let threads = threads.clamp(1, MAX_THREADS);
     let use_multi = info.range_supported && total >= MIN_MULTI_THREAD_SIZE && threads > 1;
@@ -940,7 +1052,10 @@ pub async fn download_direct(
     // 不支持分块就只能顺序覆盖写，任何遗留断点都不再有效
     if !use_multi {
         PartMeta::remove(&target);
-        match download_single(c, url, &target, total, net.rate_kb, cancel, on_progress).await {
+        // 升级前的旧命名也一并清掉：单流没有续传，留着只会占地方
+        let _ = std::fs::remove_file(&legacy_target);
+        PartMeta::remove(&legacy_target);
+        match download_single(c, url, &target, total, net, cancel, on_progress).await {
             Ok(_) => return finish_download(&target, &final_target),
             Err(e) => {
                 // 单流没有断点续传，失败/取消后留下的半截文件只会占地方
@@ -949,6 +1064,9 @@ pub async fn download_direct(
             }
         }
     }
+
+    // 升级后的第一次续传：把旧版本的「按标题命名」临时文件认领过来
+    adopt_legacy_temp(&final_target, &target, task_id);
 
     let ranges = split_ranges(total, threads);
 
@@ -1100,19 +1218,26 @@ pub async fn download_direct(
     };
 
     let mut handles = Vec::with_capacity(ranges.len());
+    // 每个分块都要带认证头，但 host 判定只做一次：所有段共用同一个 URL
+    let auth = net
+        .auth
+        .as_ref()
+        .and_then(|a| a.for_url(url))
+        .map(str::to_string);
     for (i, (s, e)) in ranges.iter().enumerate() {
         let start = *s;
         let end = *e;
         let done = counters.bytes[i].load(Ordering::Relaxed);
         let c2 = c.clone();
         let url2 = url.to_string();
+        let auth2 = auth.clone();
         let path2 = target.clone();
         let counters2 = counters.clone();
         let cancel2 = cancel.clone();
         let rate = net.rate_kb;
         handles.push(tauri::async_runtime::spawn(async move {
             download_segment(
-                c2, url2, start, end, total, path2, done, counters2, i, rate, cancel2,
+                c2, url2, auth2, start, end, total, path2, done, counters2, i, rate, cancel2,
             )
             .await
         }));
@@ -1200,19 +1325,20 @@ pub async fn download_direct(
 }
 
 /// 不支持 Range 时的单流下载
+#[allow(clippy::too_many_arguments)]
 async fn download_single(
     c: reqwest::Client,
     url: &str,
     target: &Path,
     total: u64,
-    rate_kb: u64,
+    net: &NetCfg,
     cancel: Arc<AtomicBool>,
     on_progress: impl Fn(DirectProgress) + Send + Sync + 'static,
 ) -> Result<PathBuf, String> {
     use tokio::io::AsyncWriteExt;
+    let rate_kb = net.rate_kb;
 
-    let resp = c
-        .get(url)
+    let resp = apply_auth(c.get(url), url, net)
         .send()
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
@@ -1319,22 +1445,6 @@ async fn download_single(
         eta: None,
     });
     Ok(target.to_path_buf())
-}
-
-/// 从 URL 里取出 host（不含 userinfo 与端口），失败返回 None。
-///
-/// 不引入 `url` crate：这里只关心 host，且输入已经过 http/https 前缀校验。
-fn host_of(url: &str) -> Option<&str> {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
-    // IPv6 字面量（[::1]:8080）不会出现在媒体站名单里，按端口截断即可
-    let host = host_port.split(':').next().unwrap_or(host_port);
-    if host.is_empty() {
-        None
-    } else {
-        Some(host)
-    }
 }
 
 /// 判断 URL 是否属于已知的「需要解析器提取流地址」的媒体站点。
@@ -1464,10 +1574,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let target = dir.join("movie.mp4");
-        let temp = temp_path_for(&target);
+        let temp = temp_path_for(&target, "t1_0");
         assert_eq!(
             temp.file_name().unwrap().to_string_lossy(),
-            "movie.mp4.veloxgrab-downloading"
+            "movie.mp4.veloxgrab-downloading.t1_0"
         );
 
         std::fs::write(&temp, b"hello").unwrap();
@@ -1492,7 +1602,7 @@ mod tests {
         let target = dir.join("movie.mp4");
         std::fs::write(&target, b"IMPORTANT-USER-DATA").unwrap();
 
-        let temp = temp_path_for(&target);
+        let temp = temp_path_for(&target, "t1_0");
         std::fs::write(&temp, b"new-download").unwrap();
         let out = finish_download(&temp, &target).unwrap();
 
@@ -1503,12 +1613,125 @@ mod tests {
         assert!(!temp.exists(), "临时文件应该已经被改名");
 
         // 再撞一次：继续递增到 (2)
-        let temp2 = temp_path_for(&target);
+        let temp2 = temp_path_for(&target, "t1_0");
         std::fs::write(&temp2, b"third").unwrap();
         let out2 = finish_download(&temp2, &target).unwrap();
         assert_eq!(out2, dir.join("movie (2).mp4"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归（P1-2）：两个同名并发任务必须各写各的临时文件。
+    ///
+    /// 旧实现按标题命名，B 任务会打开 A 任务正在写的同一份文件并覆盖分块。
+    #[test]
+    fn temp_path_is_scoped_to_task_id() {
+        let dir = std::env::temp_dir().join(format!("veloxgrab_scope_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let target = dir.join("movie.mp4");
+        let a = temp_path_for(&target, "t100_0");
+        let b = temp_path_for(&target, "t100_1");
+        assert_ne!(a, b, "同标题不同任务必须落在不同临时文件");
+
+        std::fs::write(&a, b"AAA").unwrap();
+        std::fs::write(&b, b"BBB").unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"AAA");
+        assert_eq!(std::fs::read(&b).unwrap(), b"BBB");
+
+        // 清理 A 不能碰 B
+        cleanup_artifacts(&dir, "movie", "t100_0");
+        assert!(!a.exists(), "自己的临时文件应被清理");
+        assert!(b.exists(), "另一个任务的临时文件不能被误删");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 清理只认自己的任务标记，不碰用户文件、不碰其它任务。
+    #[test]
+    fn cleanup_artifacts_is_exact_to_task_marker() {
+        let dir = std::env::temp_dir().join(format!("veloxgrab_clean_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mine_tmp = dir.join("movie.mp4.veloxgrab-downloading.t9_0");
+        let mine_part = dir.join("movie.mp4.veloxgrab-downloading.t9_0.veloxgrab-part");
+        let mine_ptmp = dir.join("movie.mp4.veloxgrab-downloading.t9_0.veloxgrab-part.tmp");
+        let other_tmp = dir.join("movie.mp4.veloxgrab-downloading.t9_1");
+        let legacy_tmp = dir.join("movie.mp4.veloxgrab-downloading");
+        let user_file = dir.join("movie.mp4");
+        let lookalike = dir.join("movie.mp4.veloxgrab-downloading.bak");
+        for p in [
+            &mine_tmp,
+            &mine_part,
+            &mine_ptmp,
+            &other_tmp,
+            &legacy_tmp,
+            &user_file,
+            &lookalike,
+        ] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        cleanup_artifacts(&dir, "movie", "t9_0");
+
+        assert!(!mine_tmp.exists());
+        assert!(!mine_part.exists());
+        assert!(!mine_ptmp.exists());
+        assert!(other_tmp.exists(), "另一个任务的临时文件必须保留");
+        assert!(legacy_tmp.exists(), "旧命名被同标题任务共享，交给启动清理");
+        assert!(user_file.exists());
+        assert!(lookalike.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 升级后第一次续传：旧命名的临时文件与断点要被认领过来。
+    #[test]
+    fn legacy_temp_and_part_are_adopted() {
+        let dir = std::env::temp_dir().join(format!("veloxgrab_adopt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let final_target = dir.join("movie.mp4");
+        let legacy = temp_path_for(&final_target, "");
+        std::fs::write(&legacy, b"old-progress").unwrap();
+        std::fs::write(PartMeta::path_for(&legacy), b"{}").unwrap();
+
+        let target = temp_path_for(&final_target, "t7_0");
+        adopt_legacy_temp(&final_target, &target, "t7_0");
+
+        assert!(target.exists(), "旧临时文件应迁移到新名字");
+        assert!(!legacy.exists(), "旧临时文件不能留在原地");
+        assert!(PartMeta::path_for(&target).exists(), "断点文件应一并迁移");
+        assert!(!PartMeta::path_for(&legacy).exists());
+
+        // 新临时文件已存在时不得覆盖
+        std::fs::write(&legacy, b"stale").unwrap();
+        std::fs::write(&target, b"current").unwrap();
+        adopt_legacy_temp(&final_target, &target, "t7_0");
+        assert_eq!(std::fs::read(&target).unwrap(), b"current");
+        assert!(legacy.exists(), "有活跃临时文件时不迁移、不删除旧文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动清理的判定：只认任务 id 形状，别把用户文件当垃圾。
+    #[test]
+    fn temp_artifact_detection_is_narrow() {
+        assert!(is_temp_artifact("movie.mp4.veloxgrab-downloading"));
+        assert!(is_temp_artifact("movie.mp4.veloxgrab-downloading.veloxgrab-part"));
+        assert!(is_temp_artifact("movie.mp4.veloxgrab-downloading.t1729_0"));
+        assert!(is_temp_artifact("movie.mp4.veloxgrab-downloading.t1729_0.veloxgrab-part"));
+        assert!(is_temp_artifact(
+            "movie.mp4.veloxgrab-downloading.t1729_0.veloxgrab-part.tmp"
+        ));
+        // 用户自己的文件、备份、相似后缀
+        assert!(!is_temp_artifact("movie.mp4"));
+        assert!(!is_temp_artifact("notes.veloxgrab-downloading.bak"));
+        assert!(!is_temp_artifact("notes.veloxgrab-downloading.abc"));
+        assert!(!is_temp_artifact("movie.mp4.veloxgrab-part"));
     }
 
     /// 无扩展名 / 中文标题的递增命名同样落在 stem 之后、扩展位之前。

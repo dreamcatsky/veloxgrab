@@ -241,11 +241,44 @@ impl Settings {
     }
 }
 
+/// 一个「只在指定 host（含子域）上附加」的请求头。
+///
+/// 需要 host 作用域的原因：HuggingFace 的 `Authorization: Bearer …` 是给
+/// huggingface.co 的凭证，而直链下载器会跟随重定向到 CDN，也会被同一任务里的
+/// 其它请求复用。reqwest 默认会在跨 host 重定向时剥掉 Authorization
+/// （`remove_sensitive_headers`），但**初始请求**仍然必须由我们自己判断 host——
+/// 把 token 发给 `evil.example` 只差一次 `contains`。
+#[derive(Debug, Clone, Default)]
+pub struct HostAuth {
+    /// 允许携带该头的 host（精确匹配或子域匹配）
+    pub host: String,
+    /// 完整头值（如 `Bearer hf_xxx`）
+    pub value: String,
+}
+
+impl HostAuth {
+    /// 目标 URL 的 host 命中作用域时返回头值。
+    pub fn for_url(&self, url: &str) -> Option<&str> {
+        let host = crate::util::host_of(url)?.to_ascii_lowercase();
+        let want = self.host.trim().to_ascii_lowercase();
+        if want.is_empty() {
+            return None;
+        }
+        if host == want || host.ends_with(&format!(".{want}")) {
+            Some(&self.value)
+        } else {
+            None
+        }
+    }
+}
+
 /// 网络相关设置的快照，传给直链下载器（direct 模块不需要整个 Settings）。
 #[derive(Debug, Clone, Default)]
 pub struct NetCfg {
     pub proxy: Option<String>,
     pub rate_kb: u64,
+    /// 需要附加 Authorization 的请求（目前只有 HuggingFace）
+    pub auth: Option<HostAuth>,
 }
 
 impl NetCfg {
@@ -253,7 +286,25 @@ impl NetCfg {
         Self {
             proxy: s.proxy_url(),
             rate_kb: s.rate_limit_kb,
+            auth: None,
         }
+    }
+
+    /// 与 `from_settings` 相同，但按目标 URL 决定是否附加 HF token。
+    ///
+    /// 调用方必须在**知道 URL** 的地方用它（探测、直链下载）；不知道 URL 的
+    /// 地方（更新检查等）只能用 `from_settings`，以免把凭证带进无关请求。
+    pub fn for_url(s: &Settings, url: &str) -> Self {
+        let mut net = Self::from_settings(s);
+        if let Some(tok) = s.hf_token_trimmed() {
+            if crate::util::is_huggingface_url(url) {
+                net.auth = Some(HostAuth {
+                    host: "huggingface.co".into(),
+                    value: format!("Bearer {tok}"),
+                });
+            }
+        }
+        net
     }
 }
 

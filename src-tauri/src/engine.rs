@@ -340,7 +340,7 @@ fn temp_dir_for(dir: &std::path::Path, task: &Task) -> std::path::PathBuf {
 /// 清理任务留下的临时产物（任务被移除时调用）。
 pub fn cleanup_task_artifacts(dir: &std::path::Path, task: &Task) {
     if task.kind == "direct" {
-        crate::direct::cleanup_artifacts(dir, &task.title);
+        crate::direct::cleanup_artifacts(dir, &task.title, &task.id);
     } else {
         // 只删我们自己命名空间下的目录，不会碰下载目录里的其他内容
         let _ = std::fs::remove_dir_all(temp_dir_for(dir, task));
@@ -352,7 +352,8 @@ pub fn cleanup_task_artifacts(dir: &std::path::Path, task: &Task) {
 /// `cleanup_task_artifacts` 只在用户手动「移除任务」时触发，但下面这些情况
 /// 根本不会产生「移除」动作，产物就永久留在下载目录里：
 ///
-/// - 下载中被取消、进程崩溃、直接关程序 → `<name>.veloxgrab-downloading` + `.veloxgrab-part`
+/// - 下载中被取消、进程崩溃、直接关程序 → `<name>.veloxgrab-downloading.<任务id>`
+///   与配套的 `.veloxgrab-part`
 /// - yt-dlp 把成品移走后 → 空的 `.veloxgrab-tmp/<format_id>-<hash>/` 目录
 /// - 任务失败后用户没点移除就关了窗口
 ///
@@ -379,7 +380,9 @@ pub fn cleanup_stale_artifacts(dir: &std::path::Path, max_age: std::time::Durati
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_partial = name.ends_with(".veloxgrab-downloading")
+            // 直链临时文件现在带任务 id（`….veloxgrab-downloading.t…`），
+            // 不能再只比对固定后缀，否则启动清理永远扫不到它们。
+            let is_partial = crate::direct::is_temp_artifact(&name)
                 || name.ends_with(".veloxgrab-part")
                 || name.ends_with(".veloxgrab-part.tmp");
             if is_partial && is_stale(&path) {
@@ -475,23 +478,41 @@ fn output_template(dir: &str, task: &Task) -> String {
 /// 词法折叠 + 根内/canonicalize/信任集判定，回填的是定稿绝对路径；弹框只
 /// 发生在入口那一次，本函数不弹）。但本函数还会在 redo/清理/进度收尾等
 /// 内部路径被反复调用，任务可能来自 history 回灌——持久层在威胁模型里算
-/// 不可信输入，所以这里做最后一次词法兜底：
-/// - 绝对且折叠后不含逃逸 → 使用折叠结果（正常路径，与入口定稿一致）；
-/// - 相对写法 / 折叠仍想上跳（脏数据）→ 落回默认根，绝不把带 `..` 的路径
-///   喂给 create_dir_all / 清理逻辑。位置退到安全根比让整个任务卡死好。
+/// 不可信输入，所以每一次都要重新过闸门：
+/// - 根内 / 已信任 → 使用折叠后的绝对路径；
+/// - 其余（相对写法、`..` 上跳、根外且没被用户批准过）→ 静默落回默认根。
+///   这里不弹框是刻意的：回灌发生在启动阶段，批量弹窗既吓人又能被伪造历史
+///   刷屏；静默降级到安全根不会让任务卡死，也不会把文件写出用户批准的范围。
 pub fn resolve_task_dir(settings: &Settings, task: &Task) -> Result<std::path::PathBuf, String> {
-    let fallback = || std::path::PathBuf::from(&settings.download_dir);
+    let root = {
+        let d = settings.download_dir.trim();
+        if d.is_empty() {
+            std::path::PathBuf::from(crate::settings::default_download_dir())
+        } else {
+            std::path::PathBuf::from(d)
+        }
+    };
     let dir = match task.save_dir.as_deref().map(str::trim) {
         Some(d) if !d.is_empty() => {
             let p = std::path::Path::new(d);
             let (folded, esc) = crate::util::fold_path_lexically(p);
-            if p.is_absolute() && !esc {
+            let inside_gate = p.is_absolute() && !esc;
+            let admitted = inside_gate
+                && matches!(
+                    crate::save_dir::admit(
+                        Some(&folded.to_string_lossy()),
+                        &root,
+                        &settings.trusted_dirs
+                    ),
+                    crate::save_dir::Admit::Inside(_) | crate::save_dir::Admit::Trusted(_)
+                );
+            if admitted {
                 folded
             } else {
-                fallback()
+                root.clone()
             }
         }
-        _ => fallback(),
+        _ => root.clone(),
     };
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
     Ok(dir)
@@ -1053,14 +1074,16 @@ pub async fn run_direct_download(
         return Ok(None);
     }
 
-    let net = crate::settings::NetCfg::from_settings(&settings);
+    // 按目标 host 决定是否带上 HuggingFace token：直链请求走的是 reqwest，
+    // 不经过 yt-dlp 的参数拼装，凭证作用域必须在这一层同样成立。
+    let net = crate::settings::NetCfg::for_url(&settings, &task.url);
     let mut threads = if task.threads > 0 {
         task.threads
     } else {
         settings.default_threads.max(1)
     };
     // HuggingFace 匿名下载有限流（线程过多触发 403）：没配 token 时按设置压低线程数。
-    if task.url.contains("huggingface.co")
+    if crate::util::is_huggingface_url(&task.url)
         && settings.hf_token_trimmed().is_none()
         && settings.hf_thread_cap > 0
     {
@@ -1100,6 +1123,7 @@ pub async fn run_direct_download(
 
     let result = crate::direct::download_direct(
         &task.url,
+        &task.id,
         &dir,
         // 界面上的「保存文件名」就存在 task.title 里；直链任务没有别的来源
         Some(task.title.as_str()),

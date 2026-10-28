@@ -189,11 +189,17 @@ pub fn push_common_args(cmd: &mut Command, settings: &Settings, with_cookies: bo
     if let Some(p) = settings.proxy_url() {
         cmd.arg("--proxy").arg(p);
     }
-    // HuggingFace：带 token 走 Authorization 头（--add-headers 格式为 HOST:Name:Value）
+    // HuggingFace：带 token 走 Authorization 头。
+    //
+    // 格式是 `--add-headers FIELD:VALUE`（旧文档里的 `--add-header`）。写成
+    // `huggingface.co:Authorization:Bearer …` 会被当成字段名 `huggingface.co`，
+    // 服务端根本收不到 Authorization——要下 gated 仓库只会一直 401。
+    // host 判定必须走 is_huggingface_url：`contains("huggingface.co")` 会把
+    // 查询串里带域名的任意 URL 也判中，等于把 token 交给攻击者。
     if let Some(tok) = settings.hf_token_trimmed() {
-        if url.contains("huggingface.co") {
+        if crate::util::is_huggingface_url(url) {
             cmd.arg("--add-headers")
-                .arg(format!("huggingface.co:Authorization:Bearer {tok}"));
+                .arg(format!("Authorization:Bearer {tok}"));
         }
     }
 }
@@ -589,5 +595,50 @@ mod tests {
         // 非法值不能当成有效码率
         assert_eq!(audio_score(Some(f64::NAN), None, None), (false, 0, 0));
         assert_eq!(audio_score(Some(-1.0), None, None), (false, 0, 0));
+    }
+
+    fn args_for(url: &str, token: &str) -> Vec<String> {
+        let settings = Settings {
+            hf_token: token.into(),
+            ..Settings::default()
+        };
+        let mut cmd = Command::new("yt-dlp");
+        push_common_args(&mut cmd, &settings, false, url);
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn hf_token_is_sent_as_authorization_header() {
+        let args = args_for("https://huggingface.co/org/repo/resolve/main/x.bin", "hf_secret");
+        let i = args
+            .iter()
+            .position(|a| a == "--add-headers")
+            .expect("HF 链接必须带认证头");
+        // 关键回归：FIELD:VALUE，不是 HOST:Name:Value
+        assert_eq!(args[i + 1], "Authorization:Bearer hf_secret");
+    }
+
+    #[test]
+    fn hf_token_is_not_sent_to_lookalike_hosts() {
+        // 没有 token 时当然不加
+        assert!(!args_for("https://huggingface.co/x", "").iter().any(|a| a == "--add-headers"));
+        // 查询串里出现域名不算
+        assert!(!args_for("https://evil.example/?next=huggingface.co", "hf_secret")
+            .iter()
+            .any(|a| a == "--add-headers"));
+        // 相似域名 / 后缀伪造不算
+        assert!(!args_for("https://huggingface.co.evil.example/x", "hf_secret")
+            .iter()
+            .any(|a| a == "--add-headers"));
+        assert!(!args_for("https://nothuggingface.co/x", "hf_secret")
+            .iter()
+            .any(|a| a == "--add-headers"));
+        // 子域仍然要带上
+        assert!(args_for("https://cdn-lfs.huggingface.co/x", "hf_secret")
+            .iter()
+            .any(|a| a == "--add-headers"));
     }
 }

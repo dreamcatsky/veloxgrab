@@ -34,6 +34,39 @@ pub fn short_hash(s: &str) -> String {
     format!("{h:08x}")
 }
 
+/// 从 URL 里取出 host（不含 userinfo 与端口），失败返回 None。
+///
+/// 只做字符串层面的解析（不引入 `url` crate 到 util 层）：输入在调用方已经过
+/// http/https 前缀校验。`direct` 的媒体站判定与 HuggingFace token 的域名作用域
+/// 都必须以它为唯一入口——早先 `direct` 每个模块各写一份，`ytdlp` 则用
+/// `contains`，正是「host 判定不统一」把 token 送给了错误的主机。
+pub fn host_of(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    // IPv6 字面量（[::1]:8080）不会出现在媒体站名单里，按端口截断即可
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// 是否指向 HuggingFace 主域（精确 host 或子域）。
+///
+/// **不能用 `url.contains("huggingface.co")`**：`https://evil.example/?x=huggingface.co`
+/// 也会命中。这个函数是「要不要把 hf_token 放进 Authorization 头」的唯一判据，
+/// 判宽了等于把用户的 Access Token 交给攻击者。
+pub fn is_huggingface_url(url: &str) -> bool {
+    host_of(url)
+        .map(|h| {
+            let h = h.to_ascii_lowercase();
+            h == "huggingface.co" || h.ends_with(".huggingface.co")
+        })
+        .unwrap_or(false)
+}
+
 /// 清洗成在各平台都能落盘的文件名（不含目录）。
 pub fn sanitize_filename(s: &str) -> String {
     let bad = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
@@ -173,6 +206,24 @@ mod tests {
     #[test]
     fn short_names_untouched() {
         assert_eq!(sanitize_filename("视频 标题.mp4"), "视频 标题.mp4");
+    }
+
+    #[test]
+    fn host_of_ignores_scheme_userinfo_and_port() {
+        assert_eq!(host_of("https://user:pw@a.b.com:8443/x?y#z"), Some("a.b.com"));
+        assert_eq!(host_of("http://127.0.0.1:8000/f"), Some("127.0.0.1"));
+        assert_eq!(host_of("https:///x"), None);
+        assert_eq!(host_of(""), None);
+    }
+
+    #[test]
+    fn huggingface_host_match_is_exact_or_subdomain() {
+        assert!(is_huggingface_url("https://huggingface.co/a/b/resolve/main/x"));
+        assert!(is_huggingface_url("https://CDN-LFS.huggingface.co/x"));
+        // 关键回归：query 里出现域名不算、相似域名不算、后缀伪造不算
+        assert!(!is_huggingface_url("https://evil.example/?x=huggingface.co"));
+        assert!(!is_huggingface_url("https://huggingface.co.evil.example/x"));
+        assert!(!is_huggingface_url("https://nothuggingface.co/x"));
     }
 
     #[test]

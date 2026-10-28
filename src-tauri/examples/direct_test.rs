@@ -134,10 +134,14 @@ fn main() {
     println!("最终 URL     : {}", probe.final_url);
 
     let target = out_dir.join(&probe.filename);
-    // 下载全程只写临时文件（`<name>.veloxgrab-downloading`），成功后 rename 成最终名。
+    // 下载全程只写临时文件（`<name>.veloxgrab-downloading.<task_id>`），成功后 rename 成最终名。
     // 续传元数据挂在**临时文件**旁边，所以路径要跟着临时名走。
-    let temp = out_dir.join(format!("{}.veloxgrab-downloading", probe.filename));
-    let part = out_dir.join(format!("{}.veloxgrab-downloading.veloxgrab-part", probe.filename));
+    let task_id = "t1_0";
+    let temp = out_dir.join(format!("{}.veloxgrab-downloading.{task_id}", probe.filename));
+    let part = out_dir.join(format!(
+        "{}.veloxgrab-downloading.{task_id}.veloxgrab-part",
+        probe.filename
+    ));
     if target.exists() {
         let _ = std::fs::remove_file(&target);
     }
@@ -171,6 +175,7 @@ fn main() {
 
     let result = rt.block_on(veloxgrab_lib::direct::download_direct(
         &url,
+        task_id,
         &out_dir,
         None,
         threads,
@@ -230,7 +235,7 @@ fn main() {
         // 构造一个「下载到一半」的现场。
         //
         // 注意两个前提，早期版本都踩过：
-        // 1. 文件必须写成**临时名** `xxx.veloxgrab-downloading` —— R3 之后下载器只认临时文件，
+        // 1. 文件必须写成**临时名** `xxx.veloxgrab-downloading.<task_id>` —— R3 之后下载器只认临时文件，
         //    直接写最终名会被当成「没有断点」，从零重下。
         // 2. 内容校验必须有独立基准。旧脚本用 `%TEMP%\bigtest.bin` 当基准，但它和
         //    当前 URL 毫无关系，比对必然失败——那是脚本的 bug，不是下载器的问题。
@@ -283,6 +288,7 @@ fn main() {
         let cb2 = move |_p: veloxgrab_lib::direct::DirectProgress| {};
         match rt.block_on(veloxgrab_lib::direct::download_direct(
             &url,
+            task_id,
             &out_dir,
             None,
             segs,

@@ -289,9 +289,12 @@ pub(crate) fn find_file_for_broken_path(output_path: &str, task_dir: &Path) -> O
             continue;
         }
         let candidate = entry.file_name().to_string_lossy().into_owned();
-        if candidate.ends_with(".veloxgrab-downloading")
+        // 临时产物不能当成成品删：新命名的直链临时文件带任务 id，
+        // 不能只比对固定后缀（`.veloxgrab-downloading.<id>`）。
+        if candidate.ends_with(".part")
             || candidate.ends_with(".veloxgrab-part")
             || candidate.ends_with(".veloxgrab-part.tmp")
+            || crate::direct::is_temp_artifact(&candidate)
         {
             continue;
         }

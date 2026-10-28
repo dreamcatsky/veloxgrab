@@ -46,6 +46,7 @@ fn main() {
     let started = Instant::now();
     let result = rt.block_on(veloxgrab_lib::direct::download_direct(
         &url,
+        "t1_0",
         &out_dir,
         None,
         threads,

@@ -37,6 +37,7 @@ fn main() {
     let t1 = Instant::now();
     let r1 = rt.block_on(veloxgrab_lib::direct::download_direct(
         &url,
+        "t1_0",
         &out_dir,
         None,
         4,
@@ -78,6 +79,7 @@ fn main() {
     let t2 = Instant::now();
     let r2 = rt.block_on(veloxgrab_lib::direct::download_direct(
         &url,
+        "t1_0",
         &out_dir,
         None,
         4,

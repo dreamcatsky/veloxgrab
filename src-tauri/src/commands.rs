@@ -338,7 +338,8 @@ pub async fn probe_direct_url(
         return Err("链接必须以 http:// 或 https:// 开头".into());
     }
     let settings = load_settings(&state);
-    direct::probe_direct(&url, None, &crate::settings::NetCfg::from_settings(&settings)).await
+    let net = crate::settings::NetCfg::for_url(&settings, &url);
+    direct::probe_direct(&url, None, &net).await
 }
 
 /// 智能探测：先判断是否像媒体站点，媒体站走 yt-dlp，其余走直链探测。
@@ -370,7 +371,7 @@ pub async fn probe_auto(
             Err(ytdlp_err) => {
                 // 判成媒体站不等于 yt-dlp 一定解析得了：站点改版、需要登录、
                 // 或者这个链接本身就是 CDN 直链。再试一次直链，别直接放弃。
-                let net = crate::settings::NetCfg::from_settings(&settings);
+                let net = crate::settings::NetCfg::for_url(&settings, &url);
                 return match direct::probe_direct(&url, None, &net).await {
                     Ok(p) => Ok(serde_json::json!({ "kind": "direct", "direct": p })),
                     Err(direct_err) => Ok(serde_json::json!({
