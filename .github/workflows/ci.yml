@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# 只读权限：本工作流不发布任何东西，拿最小权限。
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust tests & clippy (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与发布环境一致：本程序只发 Windows 版本，很多行为（路径语义、
+      # FlushFileBuffers、taskkill）在别的平台上测不出真实结果。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: cargo test --lib
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      # 先只有测试能过还不够：clippy 的 lint 是「以后才会出问题」的代码
+      # 味道，放行一次就会长期烂在那里，所以直接 -D warnings。
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+  js:
+    name: JS syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 前端零构建、零依赖：没有 bundler 能在编译期抓语法错误，
+      # 这里用 node --check 把「改坏一个括号」挡在合并之前。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: node --check
+        run: |
+          node --check src/app.js
+          node --check src/progress.js
+          node --check src/theme.js
+          node --check extension/background.js
+          node --check extension/popup.js
+          node --check make-icon.js
