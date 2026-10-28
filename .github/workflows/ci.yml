@@ -26,6 +26,18 @@ jobs:
         with:
           workspaces: "src-tauri -> target"
 
+      # tauri 的构建脚本会校验 `bundle.resources` 里声明的文件是否存在，
+      # 而 `src-tauri/bin/` 是 .gitignore 的本地依赖（发布构建时才下载
+      # yt-dlp）。CI 里没有它，cargo test 会直接死在 build script：
+      #   resource path `bin\yt-dlp.exe` doesn't exist
+      # 测试不会执行这个二进制，放一个空占位即可。
+      - name: Stub yt-dlp resource
+        shell: pwsh
+        working-directory: src-tauri
+        run: |
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          Set-Content -Path bin/yt-dlp.exe -Value "" -NoNewline
+
       - name: cargo test --lib
         working-directory: src-tauri
         run: cargo test --lib
