@@ -1049,6 +1049,12 @@ pub async fn download_direct(
     let use_multi = info.range_supported && total >= MIN_MULTI_THREAD_SIZE && threads > 1;
     let c = client_with(net.proxy.as_deref())?;
 
+    // 磁盘预检（单流分支）：分块下载的检查在读完断点信息之后做，因为续传
+    // 只需要补差额。单流没有续传，需要的就是整个文件。
+    if total > 0 && !use_multi {
+        crate::disk::ensure_room(dir, total)?;
+    }
+
     // 不支持分块就只能顺序覆盖写，任何遗留断点都不再有效
     if !use_multi {
         PartMeta::remove(&target);
@@ -1090,6 +1096,10 @@ pub async fn download_direct(
 
     // 新建或复用目标文件，预分配长度避免写入碎片化
     if resume.is_none() {
+        // 磁盘预检（分块分支）：续传时盘上已有一份临时文件，只需补差额。
+        if total > 0 {
+            crate::disk::ensure_room(dir, total)?;
+        }
         let f = std::fs::File::create(&target).map_err(|e| format!("创建文件失败: {e}"))?;
         if total > 0 {
             f.set_len(total)
@@ -1103,6 +1113,7 @@ pub async fn download_direct(
             .map_err(|e| format!("打开断点文件失败: {e}"))?;
         let len = f.metadata().map(|m| m.len()).unwrap_or(0);
         if len < total {
+            crate::disk::ensure_room(dir, total - len)?;
             f.set_len(total)
                 .map_err(|e| format!("预分配大小失败: {e}"))?;
         }

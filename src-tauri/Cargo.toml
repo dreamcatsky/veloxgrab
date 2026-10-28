@@ -52,6 +52,11 @@ windows-sys = { version = "0.52", features = [
     # 把 yt-dlp 输出的 GBK/cp1252 字节按系统代码页解码（decode.rs）。
     # 见 decode.rs 头注释：PYTHONUTF8 对打包版 yt-dlp.exe 不生效，实测仍吐 GBK。
     "Win32_Globalization",
+    # SetSuspendState：计划动作里的「全部完成后睡眠」（plan.rs）。
+    # 关机/重启不需要它，走 shutdown.exe 更可靠（能带倒计时与取消）。
+    "Win32_System_Power",
+    # GetDiskFreeSpaceExW：下载前的磁盘空间预检（disk.rs）。
+    "Win32_Storage_FileSystem",
 ] }
 
 # 发布构建：LTO + 单 codegen unit 换更好的内联与更小的二进制。

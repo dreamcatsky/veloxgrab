@@ -100,6 +100,54 @@
   }
 
   /**
+   * 带一个动作按钮的 toast（目前只有「剪贴板里有链接」用）。
+   *
+   * 为什么不给 toast() 加参数：普通 toast 是「一条消息，3.2 秒消失」，全程序
+   * 有几十处调用；带按钮的版本要活得更久、要能点、还要清掉上一次的 DOM。
+   * 混在一起会让每条消息都背上这段逻辑。
+   */
+  function toastAction(msg, label, onAction, ms) {
+    const t = $("toast");
+    t.className = "toast action";
+    t.innerHTML = "";
+    const span = document.createElement("span");
+    span.textContent = msg;
+    const btn = document.createElement("button");
+    btn.className = "toast-act";
+    btn.textContent = label;
+    btn.onclick = () => {
+      t.classList.add("hidden");
+      onAction();
+    };
+    t.appendChild(span);
+    t.appendChild(btn);
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.add("hidden"), ms || 8000);
+  }
+
+  /**
+   * 显示关机/重启倒计时，带一个「取消」。
+   *
+   * 不复用 toastAction：toast 是单例，下一条普通提示会把它顶掉——倒计时
+   * 提示被顶掉，用户就没有取消关机的入口了。这里用独立元素，只有取消
+   * 或倒计时结束才会消失。
+   */
+  let countdownTimer = null;
+  function showCountdown(text, onCancel) {
+    const el = $("planCountdown");
+    $("planCountdownText").textContent = text;
+    el.classList.remove("hidden");
+    $("planCountdownCancel").onclick = () => {
+      el.classList.add("hidden");
+      clearTimeout(countdownTimer);
+      onCancel();
+    };
+    clearTimeout(countdownTimer);
+    // 比关机延迟多留 2 秒：让系统先执行，避免提示先消失造成「取消了」的错觉。
+    countdownTimer = setTimeout(() => el.classList.add("hidden"), 62000);
+  }
+
+  /**
    * 把字符串转义成可安全拼进 innerHTML 的文本。
    *
    * 后端返回的目录名来自安装/解压位置，用户完全可能把它放在 `D:\a&b\<c>`
@@ -213,6 +261,18 @@
     autostartHint: "(writes HKCU Run key on save)",
     telemetry: "Anonymous usage stats",
     telemetryHint: "(no reporting exists yet; checkbox is a placeholder)",
+    clipboardWatch: "Watch clipboard for download links",
+    clipboardWatchHint: "(shows a hint in the window; never downloads automatically)",
+    notifyComplete: "Notify when a download finishes",
+    notifyCompleteHint: "(flashes the taskbar and updates the tray tooltip)",
+    closeMode: "When closing the main window",
+    closeBackground: "Minimize to tray and keep downloading",
+    closeAsk: "Ask every time",
+    closeQuit: "Quit the app",
+    closeAskTitle: "Close VeloxGrab?",
+    closeAskBody: "Minimizing to the tray keeps downloads running. Quitting pauses all active tasks (they can resume next launch).",
+    closeToTray: "Minimize to tray",
+    closeQuitNow: "Quit",
     cookieBrowser: "Cookies source",
     cookieNone: "None",
     cookieBrowserHint: "Read login state from the browser for content that needs it",
@@ -259,6 +319,17 @@
     miPauseSel: "Pause selected",
     miDeleteSel: "Delete selected",
     miClearAll: "Clear all tasks",
+    miPlanAfterAll: "When all finish…",
+    planTitle: "When all downloads finish",
+    planHint: "Applies to this run only. It will not fire while any task has failed; retrying the failed task and succeeding still triggers it.",
+    planNone: "Do nothing",
+    planShutdown: "Shut down",
+    planRestart: "Restart",
+    planSleep: "Sleep",
+    planOpenFile: "Open the finished file",
+    planOpenFileHint: "(executables are only revealed in Explorer)",
+    planDelayHint: "(60-second countdown, can be cancelled)",
+    planSave: "Save",
     miOptions: "Options",
     miRefresh: "Refresh",
     miProgress: "Open progress window",
@@ -559,6 +630,7 @@
           threads,
           // 解析出的直链也允许指定目录：与「手动新建」共用同一选择框
           save_dir: $("ndDir").value.trim() || null,
+          expected_bytes: currentDirect.total_bytes || null,
         },
       });
       $("enqueueHint").textContent = "可在「任务」页查看进度";
@@ -686,6 +758,7 @@
           best_audio_format: currentMedia.best_audio_format || null,
           // 媒体任务也支持单独指定目录（IDM 的核心体验之一）
           save_dir: $("ndDir").value.trim() || null,
+          expected_bytes: f.filesize || null,
         },
       });
       $("enqueueHint").textContent = "可在「任务」页查看进度";
@@ -1247,6 +1320,9 @@
     $("setMergeMp4").checked = !!s.merge_to_mp4;
     $("setAutostart").checked = !!s.autostart;
     $("setTelemetry").checked = !!s.telemetry;
+    $("setClipboardWatch").checked = s.clipboard_watch ?? true;
+    $("setNotifyComplete").checked = s.notify_on_complete ?? true;
+    $("setCloseMode").value = s.close_mode || "background";
     $("setBrowser").value = s.cookies_from_browser || "none";
     $("setCookiesFile").value = s.cookies_file || "";
     $("setProxyEnabled").checked = !!s.proxy_enabled;
@@ -1293,6 +1369,9 @@
       auto_progress_popup: $("setAutoProgress").checked,
       autostart: $("setAutostart").checked,
       telemetry: $("setTelemetry").checked,
+      clipboard_watch: $("setClipboardWatch").checked,
+      notify_on_complete: $("setNotifyComplete").checked,
+      close_mode: $("setCloseMode").value,
       proxy_enabled: $("setProxyEnabled").checked,
       proxy_type: $("setProxyType").value,
       proxy_host: $("setProxyHost").value.trim(),
@@ -1362,6 +1441,93 @@
       toast(String(e), true);
     }
   }
+
+  // ---------- 关闭提示（设置里选「每次询问」） ----------
+  $("closeTray").onclick = () => {
+    $("closeOverlay").classList.add("hidden");
+    invoke("hide_main_window").catch(() => {});
+  };
+  $("closeQuit").onclick = () => {
+    $("closeOverlay").classList.add("hidden");
+    // 走 Rust 的 quit_app：它触发 ExitRequested 清理（杀子进程 + 刷历史），
+    // 直接关窗口会绕过那一套。
+    invoke("quit_app").catch(() => {});
+  };
+  $("closeCancel").onclick = () => {
+    $("closeOverlay").classList.add("hidden");
+  };
+
+  // ---------- 全部完成后动作 ----------
+  //
+  // 计划存在 Rust 内存里（不落盘），这里只负责选、存、显示。真正的触发
+  // 由后端在「队列空 + 没有活跃任务 + 至少一个成功 + 没有失败」时做。
+  const PLAN_LABELS = {
+    shutdown: "关机",
+    restart: "重启",
+    sleep: "睡眠",
+    open_file: "打开文件",
+  };
+  const PLAN_LABELS_EN = {
+    shutdown: "Shut down",
+    restart: "Restart",
+    sleep: "Sleep",
+    open_file: "Open file",
+  };
+
+  // 语言以 appSettings 为准：计划动作的提示是前端拼的，后端只发动作名。
+  function planLabel(action) {
+    const zh = !(appSettings && appSettings.language === "en");
+    return (zh ? PLAN_LABELS : PLAN_LABELS_EN)[action] || action;
+  }
+
+  function renderPlanChip(action) {
+    const chip = $("planChip");
+    if (!action || !PLAN_LABELS[action]) {
+      chip.classList.add("hidden");
+      chip.textContent = "";
+      chip.dataset.action = "";
+      return;
+    }
+    const zh = !(appSettings && appSettings.language === "en");
+    chip.textContent = zh
+      ? `完成后：${planLabel(action)}`
+      : `After: ${planLabel(action)}`;
+    chip.title = zh ? "点击修改或取消" : "Click to change or cancel";
+    chip.dataset.action = action;
+    chip.classList.remove("hidden");
+  }
+
+  async function openPlanDialog() {
+    let current = "none";
+    try {
+      current = (await invoke("get_plan")) || "none";
+    } catch (e) {
+      current = "none";
+    }
+    document.querySelectorAll('input[name="planAction"]').forEach((r) => {
+      r.checked = r.value === current;
+    });
+    $("planOverlay").classList.remove("hidden");
+  }
+
+  $("planChip").onclick = () => openPlanDialog();
+  $("planCancel").onclick = () => $("planOverlay").classList.add("hidden");
+  $("planSave").onclick = async () => {
+    const picked = document.querySelector('input[name="planAction"]:checked');
+    const action = picked ? picked.value : "none";
+    try {
+      await invoke("set_plan", { action });
+      // 回读而不是直接用 set_plan 的返回值：如果所有任务早就下完了，
+      // 后端会在 set_plan 返回的同时立刻触发动作并清空计划。这时再按
+      // 「刚保存的值」显示，状态栏就会挂着一个永远不会执行的标记。
+      const now = await invoke("get_plan");
+      renderPlanChip(now);
+      $("planOverlay").classList.add("hidden");
+      toast(now ? `已设定：全部完成后${planLabel(now)}` : "已取消完成后动作");
+    } catch (e) {
+      toast("保存失败：" + String(e), true);
+    }
+  };
 
   // ---------- 菜单栏 ----------
   //
@@ -1588,6 +1754,10 @@
         switchTab("settings");
         break;
 
+      case "planAfterAll":
+        await openPlanDialog();
+        break;
+
       case "refresh":
         refreshTasks();
         toast("已刷新");
@@ -1791,6 +1961,57 @@
       const cmd = evt && evt.payload;
       if (typeof cmd === "string" && cmd) runMenuCommand(cmd);
     });
+
+    // 剪贴板监听：复制到链接时给一条可点的提示，点「添加」才进另存为流程。
+    // 不自动入队是刻意的——剪贴板任何程序都能写，自动下载等于开了一条
+    // 「往剪贴板塞链接就能让本程序下载任意文件」的通路。
+    listen("clipboard-url", (evt) => {
+      const url = evt && evt.payload && evt.payload.url;
+      if (!url) return;
+      // 用户已经在添加/另存为流程里时不插一条 toast：提示会和弹窗抢注意力，
+      // 而他想做的事本来就已经在进行中。
+      if (!$("addOverlay").classList.contains("hidden")) return;
+      if (!$("saveAsOverlay").classList.contains("hidden")) return;
+      // 输入框里已经有同一个链接时不重复提示：用户可能正在粘贴它。
+      if (document.activeElement && document.activeElement.value === url) return;
+      toastAction("剪贴板中有下载链接", "添加", () => {
+        saveAsQueue.push({ url });
+        pumpSaveAsQueue();
+      });
+    });
+
+    // 设置里选了「关闭时询问」：Rust 侧拦下关闭，这里弹三选一。
+    listen("close-requested", () => {
+      $("closeOverlay").classList.remove("hidden");
+    });
+
+    // 全部完成后动作已触发。
+    //
+    // 关机/重启给了 60 秒倒计时，所以提示要活到倒计时结束，并且带「取消」；
+    // 睡眠没有取消一说（机器已经睡了，这条提示其实是睡醒后才看到的）。
+    listen("plan-fired", (evt) => {
+      const p = (evt && evt.payload) || {};
+      const label = planLabel(p.action);
+      renderPlanChip("none");
+      if (p.action === "shutdown" || p.action === "restart") {
+        const secs = p.delay || 60;
+        showCountdown(`全部下载完成，${label}将在 ${secs} 秒后执行`, () => {
+          invoke("cancel_shutdown")
+            .then(() => toast(`已取消${label}`))
+            .catch((e) => toast(String(e), true));
+        });
+      } else if (p.action === "sleep") {
+        toast("全部下载完成，即将进入睡眠");
+      } else {
+        toast(`全部下载完成，已${label}`);
+      }
+    });
+
+    listen("plan-failed", (evt) => {
+      const p = (evt && evt.payload) || {};
+      renderPlanChip("none");
+      toast(`${planLabel(p.action) || "完成后动作"}失败：${p.error || "未知错误"}`, true);
+    });
   }
 
   function showInfo(title, html) {
@@ -1886,6 +2107,9 @@
     // 点遮罩关闭，点对话框内部不关
     if (e.target === $("infoOverlay")) $("infoOverlay").classList.add("hidden");
   });
+  $("planOverlay").addEventListener("click", (e) => {
+    if (e.target === $("planOverlay")) $("planOverlay").classList.add("hidden");
+  });
 
   // 当前视图下的任务 id（不是 taskMap 全量）。全选、批量删除、跨视图统计都以
   // 这个为准——在「已完成」里 Ctrl+A 结果把「正在下载」的也勾上，再一按 Del
@@ -1949,6 +2173,7 @@
       closeMenus();
       $("infoOverlay").classList.add("hidden");
       closeAddUrl();
+      $("planOverlay").classList.add("hidden");
       if (!$("updateOverlay").classList.contains("hidden")) hideUpdateDialog();
       if (!$("saveAsOverlay").classList.contains("hidden")) closeSaveAs();
     }
@@ -2373,6 +2598,7 @@
             best_audio_format: media.best_audio_format || null,
             kind: "video",
             save_dir: dir,
+            expected_bytes: f.filesize || null,
           },
         });
       } else {
@@ -2517,6 +2743,14 @@
     }
     // 冷启动是从链接进来的话，链接已经躺在队列里，这里补一次取用。
     drainExternalLinks();
+
+    // 完成后动作只存在 Rust 内存里，页面重载（F5 / devtools）不会清掉它，
+    // 所以这里补一次状态，免得状态栏 chip 和真实计划对不上。
+    try {
+      renderPlanChip(await invoke("get_plan"));
+    } catch (e) {
+      renderPlanChip("none");
+    }
 
     // 安装器勾了「浏览器扩展」组件 → 引导用户去浏览器扩展页手动加载。
     // Chrome 不允许安装器静默注册扩展，这一步省不掉，只能把路铺到嘴边。

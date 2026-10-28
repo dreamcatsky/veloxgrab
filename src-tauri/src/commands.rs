@@ -35,6 +35,8 @@ pub struct AppState {
     /// 根本不够——实测 webview2 首帧往往要 1 秒以上。改成「先存后取」：
     /// 前端 boot() 完成后主动 invoke `take_pending_deep_links`，一次拿全。
     pub pending_links: std::sync::Mutex<Vec<serde_json::Value>>,
+    /// 「全部下载完成后」要执行的一次性动作。**不落盘**，见 plan.rs 的模块注释。
+    pub plan: std::sync::Mutex<Option<crate::plan::PlanAction>>,
 }
 
 // `new()` 会读磁盘上的 settings.json，不是 Default 约定的「廉价、无副作用」构造，
@@ -68,6 +70,7 @@ impl AppState {
             pump_lock: Arc::new(Mutex::new(())),
             counter: AtomicU64::new(1),
             pending_links: std::sync::Mutex::new(Vec::new()),
+            plan: std::sync::Mutex::new(None),
         }
     }
 }
@@ -322,6 +325,10 @@ pub struct EnqueueArgs {
     /// 本任务的保存目录；None / 空串表示用设置里的全局默认目录
     #[serde(default)]
     pub save_dir: Option<String>,
+    /// 探测阶段已知的预计大小（字节）。只用于提交时的磁盘预检；
+    /// 真正下载时仍以 Content-Length / yt-dlp 报告为准。
+    #[serde(default)]
+    pub expected_bytes: Option<u64>,
 }
 
 /// 探测直链：返回是否支持 Range、总大小、文件名与建议线程数
@@ -430,13 +437,21 @@ pub async fn enqueue_download(
     let save_dir = admit_save_dir(&app, state.inner(), args.save_dir).await?;
     // 先校验保存目录可写，避免任务排进去才失败。
     // 用任务自己的目录：用户指定的盘符不存在时，这里就该把话说清楚。
-    {
+    let dir = {
         let settings = load_settings(&state);
         let dir = save_dir
             .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(&settings.download_dir));
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
+        dir
+    };
+
+    // 磁盘预检：探测阶段已经知道大小的话，在提交时就拒绝，而不是排进队列
+    // 后下到一半才失败。未知大小（HLS / 分片流）跳过，由下载时的实际
+    // Content-Length 再兜一次。
+    if let Some(need) = args.expected_bytes {
+        crate::disk::ensure_room(&dir, need)?;
     }
 
     let n = state.counter.fetch_add(1, Ordering::SeqCst);
@@ -683,9 +698,24 @@ pub fn pump_queue(
                     drop(t);
                 }
 
+                // 终态判定只服务「完成提醒」：取消/暂停不该闪任务栏。
+                let done = {
+                    let guard = ctx_c.tasks.lock().await;
+                    guard
+                        .get(&task_c.id)
+                        .map(|t| t.state == TaskState::Done)
+                        .unwrap_or(false)
+                };
+                crate::notify::after_worker(&app_c, &ctx_c.tasks, done).await;
+
                 // 关键：真正把后续排队任务泵起来。
                 // 少了这一步，超过并发数的任务会永远停在「排队中」。
-                pump_queue(app_c, ctx_c).await;
+                pump_queue(app_c.clone(), ctx_c.clone()).await;
+
+                // 计划动作必须在**续泵之后**判断：泵之前槽位可能立刻被下一个
+                // 排队任务占走，「没有活跃任务」会被误判成「全下完了」。
+                crate::plan::check_and_fire(&app_c, &ctx_c.tasks, &ctx_c.queue, &ctx_c.running)
+                    .await;
             });
         }
     })
@@ -1874,7 +1904,102 @@ pub async fn copy_text(text: String) -> Result<(), String> {
     if text.is_empty() {
         return Err("没有可复制的内容".into());
     }
-    crate::clipboard::write_clipboard_text(&text)
+    crate::clipboard::write_clipboard_text(&text)?;
+    // 登记成「自己写的」：否则剪贴板监听会立刻把刚复制的链接当成用户
+    // 新复制的内容再提示一遍。
+    crate::clipboard::note_self_copy(&text);
+    Ok(())
+}
+
+/// 隐藏主窗口（关闭提示里选「最小化到托盘」）。
+#[tauri::command]
+pub fn hide_main_window(app: tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+}
+
+/// 真正退出程序。
+///
+/// 走 `app.exit(0)` 而不是 `std::process::exit`：前者会触发 `ExitRequested`，
+/// 那里才有「杀掉 yt-dlp 子进程 + 刷历史」的清理。直接退进程会把下载中的
+/// 文件留在半成品状态，还会留下没人回收的子进程。
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
+/// 设定「全部下载完成后」的动作：`none` 表示取消。
+///
+/// 计划只活在内存里（见 plan.rs 的模块注释）：关机是一次性意图，不该跨重启
+/// 存活。返回归一化之后的值，前端据此更新状态栏提示。
+#[tauri::command]
+pub fn set_plan(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    action: String,
+) -> Result<Option<String>, String> {
+    let next = if action.trim() == "none" || action.trim().is_empty() {
+        None
+    } else {
+        Some(
+            crate::plan::PlanAction::parse(&action)
+                .ok_or_else(|| format!("未知的完成动作: {action}"))?,
+        )
+    };
+    {
+        let mut guard = match state.plan.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        *guard = next;
+    }
+
+    let saved = next.map(|a| a.as_str().to_string());
+    // 设计划时队列可能已经空了（用户就是等全部下完才来设的）。不在这里
+    // 主动判一次，就得等下一个任务结束才会触发——而那时可能永远没有下一个。
+    if saved.is_some() {
+        let ctx = PumpCtx::from_state(&state);
+        tauri::async_runtime::spawn(async move {
+            crate::plan::check_and_fire(&app, &ctx.tasks, &ctx.queue, &ctx.running).await;
+        });
+    }
+    Ok(saved)
+}
+
+#[tauri::command]
+pub fn get_plan(state: tauri::State<'_, AppState>) -> Option<String> {
+    let guard = match state.plan.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    guard.map(|a| a.as_str().to_string())
+}
+
+/// 取消已经排队的关机/重启（`shutdown /a`）。
+///
+/// 只对「系统已经排上队」的情况有意义；睡眠没有取消一说，所以这里不处理。
+#[cfg(windows)]
+#[tauri::command]
+pub fn cancel_shutdown() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let status = std::process::Command::new(r"C:\Windows\System32\shutdown.exe")
+        .arg("/a")
+        .creation_flags(0x0800_0000)
+        .status()
+        .map_err(|e| format!("调用 shutdown /a 失败: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("没有正在倒计时的关机/重启".into())
+    }
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub fn cancel_shutdown() -> Result<(), String> {
+    Err("本平台未实现".into())
 }
 
 /// 打开下载文件夹（菜单「文件 → 打开下载文件夹」）。

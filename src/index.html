@@ -39,6 +39,8 @@
         <button class="menu-item" data-cmd="pauseSelected"><span data-i18n="miPauseSel">暂停选中</span></button>
         <button class="menu-item" data-cmd="deleteSelected"><span data-i18n="miDeleteSel">删除选中</span><kbd>Del</kbd></button>
         <div class="menu-sep"></div>
+        <button class="menu-item" data-cmd="planAfterAll"><span data-i18n="miPlanAfterAll">全部完成后…</span></button>
+        <div class="menu-sep"></div>
         <button class="menu-item" data-cmd="clearAll"><span data-i18n="miClearAll">清空所有任务</span></button>
         <div class="menu-sep"></div>
         <button class="menu-item" data-cmd="openSettings"><span data-i18n="miOptions">选项/设置</span><kbd>Ctrl+,</kbd></button>
@@ -297,6 +299,25 @@
             <span><span data-i18n="telemetry">匿名使用统计</span> <em class="dim" data-i18n="telemetryHint">(本程序没有任何上报，勾选仅作占位)</em></span>
           </label>
 
+          <label class="fld checkbox">
+            <input id="setClipboardWatch" type="checkbox" />
+            <span><span data-i18n="clipboardWatch">监听剪贴板中的下载链接</span> <em class="dim" data-i18n="clipboardWatchHint">(复制链接后在窗口内提示，不会自动下载)</em></span>
+          </label>
+
+          <label class="fld checkbox">
+            <input id="setNotifyComplete" type="checkbox" />
+            <span><span data-i18n="notifyComplete">任务完成时提醒</span> <em class="dim" data-i18n="notifyCompleteHint">(闪烁任务栏并更新托盘提示)</em></span>
+          </label>
+
+          <label class="fld">
+            <span data-i18n="closeMode">关闭主窗口时</span>
+            <select id="setCloseMode">
+              <option value="background" data-i18n="closeBackground">最小化到托盘，继续下载</option>
+              <option value="ask" data-i18n="closeAsk">每次询问</option>
+              <option value="quit" data-i18n="closeQuit">退出程序</option>
+            </select>
+          </label>
+
           <h3 class="sec-title" data-i18n="secVideo">视频与 Cookie</h3>
 
           <label class="fld">
@@ -398,6 +419,7 @@
     <span class="sb-sep">|</span>
     <span><span data-i18n="totalSpeed">总速度</span>: <b id="statusSpeed">0 B/s</b></span>
     <span class="spacer"></span>
+    <button id="planChip" class="plan-chip hidden" title=""></button>
     <button id="clearFinished" class="link-btn"><span data-i18n="clearFinished">清除已结束</span></button>
     <span class="sb-sep" id="selSep"></span>
     <span id="statusSelected" class="dim"></span>
@@ -598,7 +620,77 @@
     </div>
   </div>
 
+  <!-- 关闭主窗口时的三选一（设置里选「每次询问」才会出现）。
+       不用原生 confirm()：那里只有两态，而这里要「最小化 / 退出 / 取消」。 -->
+  <div id="closeOverlay" class="overlay hidden">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h3 data-i18n="closeAskTitle">关闭 VeloxGrab？</h3>
+      </div>
+      <div class="dialog-body">
+        <div class="dim" data-i18n="closeAskBody">最小化到托盘可以继续下载；退出会暂停所有正在进行的任务（下次启动可继续）。</div>
+      </div>
+      <div class="actions dialog-actions">
+        <button id="closeCancel" class="ghost"><span data-i18n="cancel">取消</span></button>
+        <button id="closeQuit" class="ghost"><span data-i18n="closeQuitNow">退出</span></button>
+        <button id="closeTray" class="primary"><span data-i18n="closeToTray">最小化到托盘</span></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 全部下载完成后的动作（关机 / 重启 / 睡眠 / 打开文件）。
+       只存在内存里：关机是一次性意图，落盘会让「昨天忘取消的计划」
+       在今天随便下个文件时把人电脑关了。 -->
+  <div id="planOverlay" class="overlay hidden">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h3 data-i18n="planTitle">全部下载完成后</h3>
+      </div>
+      <div class="dialog-body">
+        <div class="dim plan-hint" data-i18n="planHint">
+          只在本次运行内有效；有任务失败时不会执行，重试成功后仍会触发。
+        </div>
+        <div class="plan-list">
+          <label class="fld checkbox">
+            <input type="radio" name="planAction" value="none" checked />
+            <span data-i18n="planNone">什么都不做</span>
+          </label>
+          <label class="fld checkbox">
+            <input type="radio" name="planAction" value="shutdown" />
+            <span data-i18n="planShutdown">关机</span>
+            <em class="dim" data-i18n="planDelayHint">(60 秒倒计时，可取消)</em>
+          </label>
+          <label class="fld checkbox">
+            <input type="radio" name="planAction" value="restart" />
+            <span data-i18n="planRestart">重启</span>
+            <em class="dim" data-i18n="planDelayHint">(60 秒倒计时，可取消)</em>
+          </label>
+          <label class="fld checkbox">
+            <input type="radio" name="planAction" value="sleep" />
+            <span data-i18n="planSleep">睡眠</span>
+          </label>
+          <label class="fld checkbox">
+            <input type="radio" name="planAction" value="open_file" />
+            <span data-i18n="planOpenFile">打开刚下载的文件</span>
+            <em class="dim" data-i18n="planOpenFileHint">(可执行文件只在资源管理器中定位)</em>
+          </label>
+        </div>
+      </div>
+      <div class="actions dialog-actions">
+        <button id="planCancel" class="ghost"><span data-i18n="cancel">取消</span></button>
+        <button id="planSave" class="primary"><span data-i18n="planSave">保存</span></button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
+
+  <!-- 关机/重启倒计时。独立于 toast：普通提示随时会顶掉上一条，
+       如果倒计时提示也被顶掉，用户就失去了「取消关机」的入口。 -->
+  <div id="planCountdown" class="plan-countdown hidden">
+    <span id="planCountdownText"></span>
+    <button id="planCountdownCancel" class="toast-act"><span data-i18n="cancel">取消</span></button>
+  </div>
 
   <!-- 删除方式确认（顶栏「删除」/ Del 键）。
        原生 confirm() 只有「确定/取消」两态，而删文件这件事必须三选一：

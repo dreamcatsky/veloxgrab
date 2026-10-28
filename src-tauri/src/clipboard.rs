@@ -1,4 +1,5 @@
-//! 读取系统剪贴板里的文本（菜单「文件 → 从剪贴板添加URL」）。
+//! 读取系统剪贴板里的文本（菜单「文件 → 从剪贴板添加URL」），并可选地
+//! 后台监听新复制的链接。
 //!
 //! 只做一件事：拿到剪贴板里的 UTF-16 文本。之所以不用 `arboard` 之类的
 //! 现成库，是因为整个程序只在 Windows 上发布，而这功能本质上就是三个
@@ -7,6 +8,110 @@
 //! 剪贴板是全局共享资源：`OpenClipboard` 可能因为别的程序正占着而失败，
 //! 这不是错误而是常态（浏览器复制大段内容、剪贴板管理器轮询都会短暂占用），
 //! 所以这里重试几次再放弃。
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
+
+/// 上一次处理过的剪贴板内容（指纹）。用哈希而不是存原文：
+/// 剪贴板里可能是几十 MB 的文本，留着只是白占内存。
+static LAST_SEEN: Mutex<Option<u64>> = Mutex::new(None);
+
+/// 剪贴板里出现新链接时发给前端的事件名。
+pub const CLIPBOARD_URL_EVENT: &str = "clipboard-url";
+
+#[derive(Clone, serde::Serialize)]
+pub struct ClipboardHit {
+    pub url: String,
+}
+
+fn fingerprint(text: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+fn remember(text: &str) {
+    let mut g = match LAST_SEEN.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    *g = Some(fingerprint(text));
+}
+
+/// 内容是否是新出现的。是新内容就顺手记为「已见」。
+fn mark_seen(text: &str) -> bool {
+    let h = fingerprint(text);
+    let mut g = match LAST_SEEN.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if *g == Some(h) {
+        return false;
+    }
+    *g = Some(h);
+    true
+}
+
+/// 告诉监听线程「这份文本是我们自己写进去的」。
+///
+/// 「复制下载链接」会把 URL 放进剪贴板；不登记的话，监听线程下一秒就会把
+/// 它当成用户新复制的链接再提示一遍——用户会以为自己点错了什么。
+pub fn note_self_copy(text: &str) {
+    remember(text);
+}
+
+/// 启动剪贴板监听线程。
+///
+/// 800ms 轮询而不是 `AddClipboardFormatListener`：后者要一个窗口过程接收
+/// `WM_CLIPBOARDUPDATE`，而本程序的窗口归 Tauri 管，拿不到那条消息循环的
+/// 钩子。轮询的代价是一个后台线程每 800ms 做一次「打开→比对→关闭」，
+/// 实测 CPU 占用可以忽略；换来的是不用碰窗口子类化。
+pub fn spawn_watcher(app: tauri::AppHandle) {
+    use tauri::{Emitter, Manager};
+
+    std::thread::spawn(move || {
+        // 先把启动瞬间的剪贴板内容记下来：否则用户五分钟前复制的链接会在
+        // 程序启动后突然弹一次提示，看起来像程序在乱猜。
+        let initial = read_clipboard_text();
+        if !initial.is_empty() {
+            remember(&initial);
+        }
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+
+            let enabled = app
+                .try_state::<crate::AppState>()
+                .map(|s| crate::settings::load_settings(s.inner()).clipboard_watch)
+                .unwrap_or(false);
+            if !enabled {
+                continue;
+            }
+
+            let text = read_clipboard_text();
+            if text.is_empty() || !mark_seen(&text) {
+                continue;
+            }
+            let Some(url) = extract_first_url(&text) else {
+                continue;
+            };
+
+            // 窗口不可见时不提示：toast 在隐藏的 webview 里没人看得见，
+            // 攒下来只会在下次打开时补一屏过期提示。注意 mark_seen 已经
+            // 先执行了，所以「隐藏期间复制过」的内容不会被补发。
+            let visible = app
+                .get_webview_window("main")
+                .and_then(|w| w.is_visible().ok())
+                .unwrap_or(false);
+            if !visible {
+                continue;
+            }
+
+            let _ = app.emit(CLIPBOARD_URL_EVENT, ClipboardHit { url });
+        }
+    });
+}
 
 /// 读剪贴板文本。读不到返回空字符串（前端据此提示，而不是弹一个错误框）。
 #[cfg(windows)]

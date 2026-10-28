@@ -469,6 +469,21 @@ body {
 .statusbar .spacer { flex: 1; }
 .sb-sep { color: var(--border); }
 
+/* 「全部完成后」计划标记：状态栏里的一枚小胶囊，点开可改。
+   只在真的设了动作时出现，平时不占位置。 */
+.plan-chip {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: 999px;
+  padding: 0 9px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+}
+.plan-chip:hover { background: var(--accent); color: var(--bg); }
+
 .link-btn {
   background: none;
   border: 0;
@@ -885,6 +900,10 @@ input[type="number"]:focus { border-color: var(--accent); }
   overflow: hidden;
 }
 .dialog-body { display: flex; flex-direction: column; gap: 16px; margin-top: 12px; }
+
+/* 完成后动作的选项列表：比 dialog-body 的 16px 更紧，五个选项要能一屏看完 */
+.plan-list { display: flex; flex-direction: column; gap: 11px; }
+.plan-hint { line-height: 1.6; }
 .dialog-body input[type="text"], .dialog-body select { width: 100%; }
 .dialog-actions { justify-content: flex-end; margin-top: 18px; }
 
@@ -913,6 +932,47 @@ input[type="number"]:focus { border-color: var(--accent); }
   animation: rise .2s ease;
 }
 .toast.err { border-color: var(--err); color: var(--err); }
+
+/* 带动作按钮的 toast（剪贴板链接提示）：按钮是唯一的强调点，
+   消息本身保持普通文字色，避免整条提示都在喊。 */
+.toast.action {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-right: 10px;
+}
+.toast-act {
+  flex-shrink: 0;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  border-radius: 6px;
+  padding: 4px 11px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.toast-act:hover { background: var(--accent); color: var(--bg); }
+
+/* 关机/重启倒计时条。放在 toast 上方，避开普通提示；边框用 warn 色，
+   让「系统即将执行」这件事比普通消息更显眼。 */
+.plan-countdown {
+  position: fixed;
+  bottom: 74px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 12px 10px 18px;
+  background: var(--bg-elev2);
+  border: 1px solid var(--warn);
+  color: var(--text);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 28px var(--shadow-soft);
+  z-index: 101;
+  font-size: 13px;
+  animation: rise .2s ease;
+}
 
 @keyframes rise {
   from { opacity: 0; transform: translate(-50%, 10px); }

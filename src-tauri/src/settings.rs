@@ -42,6 +42,15 @@ pub struct Settings {
     pub autostart: bool,
     /// 匿名使用统计
     pub telemetry: bool,
+    /// 后台监听剪贴板：复制到 http(s) 链接时在窗口内提示。
+    ///
+    /// 只提示、不自动入队：剪贴板是任意程序都能写的地方，自动下载等于把
+    /// 「往剪贴板塞一条链接」变成「让 VeloxGrab 静默下载任意文件」的原语。
+    pub clipboard_watch: bool,
+    /// 任务完成时提醒（闪烁任务栏 + 更新托盘提示）
+    pub notify_on_complete: bool,
+    /// 点窗口「×」的行为：background（最小化到托盘）| ask（询问）| quit（退出）
+    pub close_mode: String,
     /// 外观主题：system（跟随系统）| dark | light
     pub theme: String,
     /// 启用代理（下载与视频解析都走代理）
@@ -88,6 +97,9 @@ impl Default for Settings {
             auto_progress_popup: true,
             autostart: false,
             telemetry: false,
+            clipboard_watch: true,
+            notify_on_complete: true,
+            close_mode: "background".into(),
             proxy_enabled: false,
             proxy_type: "http".into(),
             proxy_host: String::new(),
@@ -510,6 +522,7 @@ pub fn save_settings(
         settings.language = "zh".into();
     }
     settings.theme = normalize_theme(&settings.theme).to_string();
+    settings.close_mode = normalize_close_mode(&settings.close_mode).to_string();
 
     // 信任集只允许两个来源：原生确认框的同意（remember_trusted_dir）、以及
     // 「用户把默认目录从 A 改到 B」时旧值 A 的自动继承。**前端表单里带来的
@@ -550,6 +563,16 @@ pub(crate) fn normalize_theme(t: &str) -> &'static str {
         "light" => "light",
         "dark" => "dark",
         _ => "system",
+    }
+}
+
+/// 关闭行为的合法取值。认不出的一律回落到 `background`——它是升级前的老行为，
+/// 误判成 `quit` 会让「关窗继续下载」的用户丢任务。
+pub(crate) fn normalize_close_mode(m: &str) -> &'static str {
+    match m.trim() {
+        "ask" => "ask",
+        "quit" => "quit",
+        _ => "background",
     }
 }
 

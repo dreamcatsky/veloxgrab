@@ -28,6 +28,10 @@ pub const PASTE_ID: &str = "tray_paste_url";
 pub const PAUSE_ALL_ID: &str = "tray_pause_all";
 pub const RESUME_ALL_ID: &str = "tray_resume_all";
 
+/// 托盘图标的 id。`AppHandle::tray_by_id` 靠它找到实例——任务完成时要改
+/// tooltip（「3 个任务已完成」），没有 id 就只能拿到一个「某个托盘图标」。
+pub const TRAY_ID: &str = "veloxgrab_tray";
+
 /// 托盘菜单项触发的「前端命令」事件。
 ///
 /// 载荷是 runMenuCommand 认得的命令名——这样托盘菜单、菜单栏、快捷键
@@ -99,7 +103,7 @@ pub fn setup(app: &tauri::AppHandle) {
         }
     };
 
-    let mut builder = TrayIconBuilder::new()
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .tooltip("VeloxGrab")
         // 右键弹菜单是 Windows 惯例；左键设为显示窗口，符合「点一下就回来」的直觉。

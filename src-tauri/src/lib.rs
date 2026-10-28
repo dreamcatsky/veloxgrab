@@ -5,8 +5,11 @@ pub mod decode;
 pub mod deeplink;
 pub mod dpapi;
 pub mod direct;
+pub mod disk;
 pub mod engine;
 pub mod history;
+pub mod notify;
+pub mod plan;
 pub mod save_dir;
 pub mod settings;
 pub mod tray;
@@ -180,6 +183,10 @@ pub fn run() {
             // 这条回环 HTTP 是真正能用的那条路。失败不阻断启动。
             bridge::spawn(app.handle().clone());
 
+            // 剪贴板监听：复制到链接时在窗口内提示（只提示，不自动入队）。
+            // 是否启用由设置决定，线程内部每轮现读，开关改完立即生效。
+            clipboard::spawn_watcher(app.handle().clone());
+
             // 启动后 6 秒查一次新版本（错开首帧渲染与扩展引导弹窗）。
             // 结果经 "update-available" 事件交给前端：有更新才弹窗，
             // 检查失败静默——网络不畅时不该为「查不到有没有新版」打扰用户。
@@ -198,14 +205,37 @@ pub fn run() {
                 });
             }
 
-            // 点窗口的「×」不退出，只隐藏——下载还在跑。真正退出的入口是
+            // 点窗口的「×」默认不退出，只隐藏——下载还在跑。真正退出的入口是
             // 托盘菜单里的「退出」，它会走 RunEvent::ExitRequested 的清理流程。
+            // 行为可在设置里改成「询问」或「直接退出」。
             if let Some(win) = app.get_webview_window("main") {
                 let win2 = win.clone();
+                let app2 = app.handle().clone();
                 win.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = win2.hide();
+                        // 每次现读设置：用户刚在设置页改完就点 ×，应该按新值走。
+                        let mode = app2
+                            .try_state::<AppState>()
+                            .map(|s| crate::settings::load_settings(s.inner()).close_mode)
+                            .unwrap_or_else(|| "background".into());
+                        match mode.as_str() {
+                            // 直接退出：不拦窗口，交给 ExitRequested 做清理。
+                            // 注意这里不能 prevent_close 再 exit，那会多走一次
+                            // 关闭流程，历史写线程可能被刷两遍。
+                            "quit" => {}
+                            // 询问：拦住关闭，让前端弹「最小化 / 退出 / 取消」。
+                            // 用前端弹窗而不是原生 MessageBox：这里要三个选项，
+                            // 原生消息框只有两个按钮。
+                            "ask" => {
+                                api.prevent_close();
+                                let _ = app2.emit("close-requested", ());
+                            }
+                            // 默认：缩到托盘，后台继续下载。
+                            _ => {
+                                api.prevent_close();
+                                let _ = win2.hide();
+                            }
+                        }
                     }
                 });
             }
@@ -247,6 +277,11 @@ pub fn run() {
             commands::clear_all_tasks,
             commands::clipboard_url,
             commands::copy_text,
+            commands::hide_main_window,
+            commands::quit_app,
+            commands::set_plan,
+            commands::get_plan,
+            commands::cancel_shutdown,
             commands::open_task_file,
             commands::reveal_task_file,
             commands::open_download_dir,
