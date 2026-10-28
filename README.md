@@ -326,7 +326,7 @@ cargo run --release --example link_check -- cases.txt
 `direct_test` 会打印探测结果（是否支持 Range、总大小、建议线程数），下载完成后
 逐字节校验内容，并额外跑一轮“删掉一部分再续传”的一致性检查。
 
-`cargo test --lib` 覆盖 84 个单测：URL 分流、Range 判据、分块切分、续传累计值语义、
+`cargo test --lib` 覆盖 85 个单测：URL 分流、Range 判据、分块切分、续传累计值语义、
 文件名清洗、进度行解析、音频打分、陈旧清理、历史只收终态、深链解析全部形态
 （含 `add` 带斜杠、裸 URL 形态、参数别名、非 http 目标拒绝、threads clamp）、
 目录闸门（词法折叠、越界判定、可信集、可删文件校验）、代码页解码（真实 GBK 字节
