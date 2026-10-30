@@ -945,10 +945,31 @@ fn adopt_legacy_temp(final_target: &Path, target: &Path, tag: &str) {
 /// 已知残余窗口：exists 与 rename 之间别的进程刚好创建同名文件，Windows 上
 /// 仍会被替换。这个 TOCTOU 子窗口极小且需要主动竞争，相比改前「永远覆盖」
 /// 已经是质的收敛，暂不为此引入打开-重命名协议。
-fn finish_download(temp: &Path, target: &Path) -> Result<PathBuf, String> {
-    let final_target = unique_target(target);
+fn finish_download(
+    temp: &Path,
+    target: &Path,
+    url: &str,
+    overwrite: bool,
+) -> Result<PathBuf, String> {
+    // 覆盖模式也只替换「本程序为同一 URL 下过的成品」；来源不明的同名文件
+    // 仍然走递增改名。这样即使用户开了覆盖，也不会误删自己拷进来的文件。
+    let allow_overwrite = overwrite && crate::history::is_known_output(url, target);
+    let final_target = choose_final_target(target, allow_overwrite);
+    if allow_overwrite && target.exists() {
+        // 显式删除再 rename：不依赖平台 rename 的覆盖语义，失败时能给出明确原因
+        std::fs::remove_file(target).map_err(|e| format!("覆盖旧文件失败: {e}"))?;
+    }
     std::fs::rename(temp, &final_target).map_err(|e| format!("重命名临时文件失败: {e}"))?;
     Ok(final_target)
+}
+
+/// 冲突决策：允许覆盖时直接用原名，否则递增避让。
+fn choose_final_target(target: &Path, overwrite: bool) -> PathBuf {
+    if overwrite {
+        target.to_path_buf()
+    } else {
+        unique_target(target)
+    }
 }
 
 /// 同名冲突时给出下一个空闲名：`movie.mp4` → `movie (1).mp4` → `movie (2).mp4` …
@@ -1031,6 +1052,8 @@ pub async fn download_direct(
     dir: &Path,
     filename_override: Option<&str>,
     threads: usize,
+    // 同名文件是否允许覆盖（仍会校验「同一 URL 的本程序产物」）
+    overwrite: bool,
     cancel: Arc<AtomicBool>,
     on_progress: impl Fn(DirectProgress) + Send + Sync + 'static,
     net: &NetCfg,
@@ -1062,7 +1085,7 @@ pub async fn download_direct(
         let _ = std::fs::remove_file(&legacy_target);
         PartMeta::remove(&legacy_target);
         match download_single(c, url, &target, total, net, cancel, on_progress).await {
-            Ok(_) => return finish_download(&target, &final_target),
+            Ok(_) => return finish_download(&target, &final_target, url, overwrite),
             Err(e) => {
                 // 单流没有断点续传，失败/取消后留下的半截文件只会占地方
                 let _ = std::fs::remove_file(&target);
@@ -1332,7 +1355,7 @@ pub async fn download_direct(
     }
 
     PartMeta::remove(&target);
-    finish_download(&target, &final_target)
+    finish_download(&target, &final_target, url, overwrite)
 }
 
 /// 不支持 Range 时的单流下载
@@ -1592,7 +1615,7 @@ mod tests {
         );
 
         std::fs::write(&temp, b"hello").unwrap();
-        let out = finish_download(&temp, &target).unwrap();
+        let out = finish_download(&temp, &target, "https://e.com/x", false).unwrap();
 
         assert_eq!(out, target);
         assert!(!temp.exists(), "临时文件应该已经被改名");
@@ -1615,7 +1638,7 @@ mod tests {
 
         let temp = temp_path_for(&target, "t1_0");
         std::fs::write(&temp, b"new-download").unwrap();
-        let out = finish_download(&temp, &target).unwrap();
+        let out = finish_download(&temp, &target, "https://e.com/x", false).unwrap();
 
         // 用户原有文件一字未动
         assert_eq!(out, dir.join("movie (1).mp4"));
@@ -1626,7 +1649,7 @@ mod tests {
         // 再撞一次：继续递增到 (2)
         let temp2 = temp_path_for(&target, "t1_0");
         std::fs::write(&temp2, b"third").unwrap();
-        let out2 = finish_download(&temp2, &target).unwrap();
+        let out2 = finish_download(&temp2, &target, "https://e.com/x", false).unwrap();
         assert_eq!(out2, dir.join("movie (2).mp4"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1763,6 +1786,10 @@ mod tests {
 
         // 没有冲突时原样返回
         assert_eq!(unique_target(&dir.join("fresh.mp4")), dir.join("fresh.mp4"));
+
+        // 覆盖模式直接使用原名；keep_both 仍递增
+        assert_eq!(choose_final_target(&with_ext, true), with_ext);
+        assert_eq!(choose_final_target(&with_ext, false), dir.join("a.b.tar (1).gz"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

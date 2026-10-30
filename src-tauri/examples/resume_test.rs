@@ -41,6 +41,7 @@ fn main() {
         &out_dir,
         None,
         4,
+        false,
         cancel.clone(),
         move |p| {
             s1.store(p.downloaded, Ordering::Relaxed);
@@ -83,6 +84,7 @@ fn main() {
         &out_dir,
         None,
         4,
+        false,
         cancel2.clone(),
         move |p| {
             // 记录首次回调的值：它就是续传起点

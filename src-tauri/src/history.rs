@@ -28,7 +28,7 @@
 //! 丢的只是列表显示与 paused 回灌字段，且下一次状态变化会补全。
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -250,8 +250,9 @@ fn prepare_for_write(list: &mut Vec<HistoryEntry>) {
 
 /// 读取全部历史（新的在前）。文件不存在或损坏时返回空列表。
 ///
-/// 只有两个读者：进程启动时 AppState::new 回灌任务表、写线程首次启动取初值。
-/// 运行中的读一律走写线程的权威副本，不再有人对同一个文件做 read-modify-write。
+/// 读者有三处：进程启动时 AppState::new 回灌任务表、写线程首次启动取初值、
+/// 以及「覆盖同名文件」前的归属校验（见 `is_known_output`）。运行中的读一律走
+/// 写线程的权威副本，不再有人对同一个文件做 read-modify-write。
 pub fn load_history() -> Vec<HistoryEntry> {
     let path = history_path();
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -273,6 +274,45 @@ pub fn load_history() -> Vec<HistoryEntry> {
             Vec::new()
         }
     }
+}
+
+/// 目标路径是否为本程序为同一 URL 下载过的成品。
+///
+/// 覆盖模式只允许替换「自己下过的文件」：同名但来源不明的文件（用户自己拷进来
+/// 的、别的下载器的）一律不碰，退回递增改名。history.json 可能被篡改，所以这里
+/// 同时要求 URL 相同 + 路径 canonicalize 后完全一致，缺一不可。
+pub fn is_known_output(url: &str, path: &Path) -> bool {
+    let Ok(want) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    load_history().iter().any(|e| {
+        e.state == "done"
+            && e.url == url
+            && e.output_path
+                .as_deref()
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .map(|p| p == want)
+                .unwrap_or(false)
+    })
+}
+
+/// 该 URL 是否在指定目录下有过已完成的产物（yt-dlp 覆盖模式的前置条件）。
+///
+/// yt-dlp 的 `--force-overwrites` 按输出模板覆盖，无法精确到单个路径；这里用
+/// 「同一 URL + 同一目录」作为最低限度的归属证明，没有就不开覆盖。
+pub fn has_done_output_in_dir(url: &str, dir: &Path) -> bool {
+    let Ok(dir) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    load_history().iter().any(|e| {
+        e.state == "done"
+            && e.url == url
+            && e.output_path
+                .as_deref()
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .and_then(|p| p.parent().map(|d| d == dir))
+                .unwrap_or(false)
+    })
 }
 
 /// 原子写入历史文件。只有写线程调用它，所以临时文件名不会与人争抢。

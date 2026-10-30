@@ -71,7 +71,7 @@ VeloxGrab 只做 http(s) 时，这些项的价值要打折——不能照着设�
 | 队列 | 有，可置顶（`moveToFront`） | FIFO，无排序/置顶 |
 | 暂停/继续/重下 | 有 | 有 |
 | 编辑任务（线程/目录/文件名/头） | 有（`task_service.edit`） | 无（只能删了重建） |
-| 同名冲突 | keepBoth / overwrite / ask | 固定 keepBoth（`unique_path` 递增） |
+| 同名冲突 | keepBoth / overwrite / ask | keepBoth（直链递增改名）/ skip（视频），可切 overwrite（仅本程序同 URL 产物） |
 | 分类目录路由 | 有（扩展名 → `{default}/Video` 等 8 类） | 有（可选，默认关闭；五类预设可编辑，手选目录优先） |
 | 删除时删文件 | 有（开关） | 有（`delete_files` 参数） |
 | 文件被外部改动监控 | 有（`fileWatcher`） | 无 |
@@ -143,6 +143,12 @@ VeloxGrab 只做 http(s) 时，这些项的价值要打折——不能照着设�
 - **风险**：覆盖是破坏性操作，必须二次确认 + 只对「同 URL 同产物」生效。
 - **验收**：单测三档；同 URL 连下两次；目标被其它程序占用时不崩。
 - **工作量**：1.5 天（不含 ask）。
+- **已落地（批次 B）**：`Settings.name_conflict` 只做 `keep_both`（默认）与
+  `overwrite` 两档，ask 按建议留给 P1。直链在 `finish_download` 覆盖前用
+  `history::is_known_output` 校验「同一 URL + canonicalize 后同一路径」，
+  不满足就退回递增改名；yt-dlp 仅在 `history::has_done_output_in_dir` 命中时
+  追加 `--force-overwrites`，否则保持默认跳过。设置页提供下拉框，覆盖模式
+  不会碰来源不明的同名文件。
 
 #### P0-2 分类目录路由
 - **现状**：只有全局 `download_dir` + 单任务 `save_dir`；侧栏「分类」只是按 `kind` 过滤视图。

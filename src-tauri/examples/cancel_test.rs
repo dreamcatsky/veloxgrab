@@ -50,6 +50,7 @@ fn main() {
         &out_dir,
         None,
         threads,
+        false,
         cancel.clone(),
         move |p| {
             if let Ok(mut g) = lb.lock() {

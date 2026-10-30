@@ -70,6 +70,11 @@ pub struct Settings {
     /// 分类规则；同 folder 会在保存时合并，最多 24 条。
     #[serde(default = "default_categories")]
     pub categories: Vec<CategoryRule>,
+    /// 同名文件策略：keep_both（自动改名）| overwrite（覆盖旧文件）。
+    ///
+    /// 覆盖只对本程序为**同一 URL** 下载过、且路径完全一致的成品生效；
+    /// 来源不明的同名文件仍然递增避让，避免误删用户自己的文件。
+    pub name_conflict: String,
     /// 最大并发下载数
     pub max_concurrent: usize,
     /// 默认画质偏好: best / 1080 / 720 / 480 等
@@ -145,6 +150,7 @@ impl Default for Settings {
             download_dir: dir,
             categories_enabled: false,
             categories: default_categories(),
+            name_conflict: "keep_both".into(),
             max_concurrent: 3,
             default_quality: "best".into(),
             cookies_from_browser: "none".into(),
@@ -388,6 +394,7 @@ pub fn read_settings_from_disk() -> Settings {
             // 设置文件同样按不可信输入处理：旧版本/手改的规则可能带 `..` 或
             // 分隔符，进内存前先清洗，避免它绕过 save_settings 的归一化。
             s.normalize_categories();
+            s.name_conflict = normalize_name_conflict(&s.name_conflict).to_string();
             // 产品改名（VGrab → VeloxGrab）的遗留路径迁移。老用户 settings.json
             // 里存的默认下载目录还是 `...\Downloads\VGrab`——用户显式设置过的值
             // 优先于出厂默认，不迁移的话他们会一直往旧名目录里写。
@@ -685,6 +692,7 @@ pub fn save_settings(
     }
     settings.theme = normalize_theme(&settings.theme).to_string();
     settings.close_mode = normalize_close_mode(&settings.close_mode).to_string();
+    settings.name_conflict = normalize_name_conflict(&settings.name_conflict).to_string();
     // 分类规则来自前端表单：清洗目录名/扩展名、合并同目录、限制条数。
     settings.normalize_categories();
 
@@ -737,6 +745,15 @@ pub(crate) fn normalize_close_mode(m: &str) -> &'static str {
         "ask" => "ask",
         "quit" => "quit",
         _ => "background",
+    }
+}
+
+/// 同名文件策略的合法取值。认不出的按 keep_both（最安全）处理。
+pub(crate) fn normalize_name_conflict(v: &str) -> &'static str {
+    if v.trim().eq_ignore_ascii_case("overwrite") {
+        "overwrite"
+    } else {
+        "keep_both"
     }
 }
 
@@ -835,6 +852,16 @@ mod tests {
         // 空格 / 端口非数字 → 不拼出脏 URL
         assert!(proxy("bad host", "", "").is_none());
         assert!(proxy("host:abc", "", "").is_none());
+    }
+
+    #[test]
+    fn name_conflict_falls_back_to_keep_both() {
+        assert_eq!(normalize_name_conflict("overwrite"), "overwrite");
+        assert_eq!(normalize_name_conflict(" OVERWRITE "), "overwrite");
+        assert_eq!(normalize_name_conflict("keep_both"), "keep_both");
+        // 认不出的值不能变成破坏性模式
+        assert_eq!(normalize_name_conflict("ask"), "keep_both");
+        assert_eq!(normalize_name_conflict(""), "keep_both");
     }
 
     #[test]

@@ -736,6 +736,10 @@ async fn run_download_inner(
     // 每个任务的保存目录可能不同（见 Task::save_dir）
     let dir = resolve_task_dir(&settings, &task)?;
     let dir_str = dir.to_string_lossy().to_string();
+    // 覆盖只对「同一 URL 在同一目录下有过成品」开启；否则 yt-dlp 保持默认跳过，
+    // 免得一次全局设置就把用户手动放进目录的同名文件覆盖掉。
+    let overwrite = settings.name_conflict == "overwrite"
+        && crate::history::has_done_output_in_dir(&task.url, &dir);
 
     let template = output_template(&dir_str, &task);
     let expr = build_format_expr(
@@ -759,6 +763,9 @@ async fn run_download_inner(
     cmd.arg("--paths")
         .arg(format!("temp:{}", temp_dir.to_string_lossy()));
     cmd.arg("--continue");
+    if overwrite {
+        cmd.arg("--force-overwrites");
+    }
     cmd.arg("-f").arg(&expr);
     if settings.merge_to_mp4 {
         cmd.arg("--merge-output-format").arg("mp4");
@@ -1249,6 +1256,8 @@ pub async fn run_direct_download(
         // 界面上的「保存文件名」就存在 task.title 里；直链任务没有别的来源
         Some(task.title.as_str()),
         threads,
+        // 覆盖仍由 direct 侧按「同一 URL 的本程序产物」再校验一次
+        settings.name_conflict == "overwrite",
         cancel_flag.clone(),
         move |p| {
             let _ = tx.send(ProgressEvent {

@@ -287,6 +287,14 @@
             <small class="dim" data-i18n="categoriesNote">子目录只允许单层名称；同一目录的规则会自动合并，最多 24 条。</small>
           </div>
 
+          <label class="fld">
+            <span><span data-i18n="nameConflict">同名文件</span> <em class="dim" data-i18n="nameConflictHint">(覆盖仅限本程序为同一链接下载过的成品)</em></span>
+            <select id="setNameConflict">
+              <option value="keep_both" data-i18n="nameKeepBoth">保留两者（自动改名）</option>
+              <option value="overwrite" data-i18n="nameOverwrite">覆盖旧文件</option>
+            </select>
+          </label>
+
           <h3 class="sec-title" data-i18n="secBehavior">弹窗与行为</h3>
 
           <label class="fld checkbox">

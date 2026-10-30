@@ -268,6 +268,10 @@
     catExts: "Extensions (comma separated)",
     catAdd: "Add rule",
     categoriesNote: "Subfolders are single-level names; rules for the same folder are merged, max 24.",
+    nameConflict: "Same-name files",
+    nameConflictHint: "(overwrite only applies to files this app downloaded from the same link)",
+    nameKeepBoth: "Keep both (auto rename)",
+    nameOverwrite: "Overwrite existing file",
     popupSaveAs: 'Browser veloxgrab:// downloads ask "Save as" first',
     popupSaveAsHint: "(off: save straight to the default folder)",
     popupQuality: "Video sites: popup quality chooser",
@@ -1389,6 +1393,7 @@
     $("setCategoriesEnabled").checked = !!s.categories_enabled;
     renderCategoryRules(s.categories || []);
     syncCategoryDetail();
+    $("setNameConflict").value = s.name_conflict || "keep_both";
     $("setPopupSaveAs").checked = s.popup_save_as ?? true;
     $("setPopupQuality").checked = s.popup_quality ?? true;
     $("setAutoProgress").checked = s.auto_progress_popup ?? true;
@@ -1443,6 +1448,7 @@
       rate_limit_kb: Number($("setRateLimit").value) || 0,
       categories_enabled: $("setCategoriesEnabled").checked,
       categories: collectCategories(),
+      name_conflict: $("setNameConflict").value,
       auto_progress_popup: $("setAutoProgress").checked,
       autostart: $("setAutostart").checked,
       telemetry: $("setTelemetry").checked,
