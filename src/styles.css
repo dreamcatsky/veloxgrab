@@ -860,6 +860,19 @@ input[type="number"]:focus { border-color: var(--accent); }
 .proxy-grid .fld { gap: 6px; }
 .settings-actions { align-items: center; }
 
+/* ---------- 分类目录规则 ---------- */
+.cat-rules { display: flex; flex-direction: column; gap: 8px; }
+.cat-head,
+.cat-row {
+  display: grid;
+  grid-template-columns: 1fr 2fr 30px;
+  gap: 8px;
+  align-items: center;
+}
+.cat-head { font-size: 12px; color: var(--dim); padding: 0 2px; }
+.cat-row input { width: 100%; }
+.cat-row .icon-btn { justify-self: center; }
+
 /* ---------- 另存为弹窗 ---------- */
 .overlay {
   position: fixed;

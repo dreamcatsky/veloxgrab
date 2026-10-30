@@ -56,6 +56,17 @@
     return host.replace(/^www\./i, "").split(":")[0];
   }
 
+  // 从文件名 / URL 里取扩展名（小写、不带点）。取不到返回 null。
+  // 后端还会再规范化一次，这里只负责把探测阶段已知的信息带给分类目录。
+  function extOfName(name) {
+    if (!name) return null;
+    const base = String(name).split(/[?#]/)[0];
+    const last = base.split(/[\\/]/).pop() || "";
+    const i = last.lastIndexOf(".");
+    if (i <= 0 || i === last.length - 1) return null;
+    return last.slice(i + 1).toLowerCase();
+  }
+
   /**
    * 这个文件名是不是只是「URL 最后一段原样抄来的」。
    *
@@ -251,6 +262,12 @@
     hfTokenHint: "(optional, hf_xxx)",
     rateLimit: "Global speed limit",
     rateLimitHint: "(KB/s, 0 = off)",
+    categoriesEnabled: "Sort downloads into subfolders by extension",
+    categoriesHint: "(only when no save folder is chosen for the task)",
+    catFolder: "Subfolder",
+    catExts: "Extensions (comma separated)",
+    catAdd: "Add rule",
+    categoriesNote: "Subfolders are single-level names; rules for the same folder are merged, max 24.",
     popupSaveAs: 'Browser veloxgrab:// downloads ask "Save as" first',
     popupSaveAsHint: "(off: save straight to the default folder)",
     popupQuality: "Video sites: popup quality chooser",
@@ -630,6 +647,10 @@
           threads,
           // 解析出的直链也允许指定目录：与「手动新建」共用同一选择框
           save_dir: $("ndDir").value.trim() || null,
+          // 分类目录只认扩展名；优先用用户改过的文件名，其次服务器给的名字/URL
+          expected_ext: extOfName(
+            nameOverride || currentDirect.filename || currentDirect.sourceUrl
+          ),
           expected_bytes: currentDirect.total_bytes || null,
         },
       });
@@ -758,6 +779,8 @@
           best_audio_format: currentMedia.best_audio_format || null,
           // 媒体任务也支持单独指定目录（IDM 的核心体验之一）
           save_dir: $("ndDir").value.trim() || null,
+          // 用所选格式的容器扩展名做分类，而不是网页标题里的后缀
+          expected_ext: f.ext || null,
           expected_bytes: f.filesize || null,
         },
       });
@@ -1301,6 +1324,55 @@
   // ---------- 设置 ----------
   let settingsLoaded = false;
 
+  function syncCategoryDetail() {
+    $("categoryRules").classList.toggle("hidden", !$("setCategoriesEnabled").checked);
+  }
+
+  // 一条规则 = 子目录 + 扩展名列表。行是动态生成的：默认五条来自后端，
+  // 用户可以增删；保存时后端还会清洗目录名、合并同目录、限制条数。
+  function addCategoryRow(rule) {
+    const row = el("div", "cat-row");
+    const folder = el("input");
+    folder.type = "text";
+    folder.value = (rule && rule.folder) || "";
+    folder.placeholder = "Video";
+    folder.spellcheck = false;
+    const exts = el("input");
+    exts.type = "text";
+    exts.value =
+      rule && Array.isArray(rule.extensions) ? rule.extensions.join(", ") : "";
+    exts.placeholder = "mp4, mkv, webm";
+    exts.spellcheck = false;
+    const del = el("button", "icon-btn", "×");
+    del.type = "button";
+    del.title = "删除这条规则";
+    del.onclick = () => row.remove();
+    row.append(folder, exts, del);
+    $("categoryRuleRows").appendChild(row);
+  }
+
+  function renderCategoryRules(rules) {
+    const box = $("categoryRuleRows");
+    box.innerHTML = "";
+    const list = Array.isArray(rules) ? rules : [];
+    list.forEach((r) => addCategoryRow(r));
+    // 用户把规则删光后至少留一条空行，避免开关打开时是一片空白
+    if (!list.length) addCategoryRow(null);
+  }
+
+  function collectCategories() {
+    return Array.from($("categoryRuleRows").querySelectorAll(".cat-row"))
+      .map((row) => {
+        const inputs = row.querySelectorAll("input");
+        const extensions = String(inputs[1].value || "")
+          .split(/[,，;；\s]+/)
+          .map((s) => s.trim().replace(/^\.+/, "").toLowerCase())
+          .filter(Boolean);
+        return { folder: inputs[0].value.trim(), extensions };
+      })
+      .filter((r) => r.folder && r.extensions.length);
+  }
+
   function fillSettingsForm(s) {
     $("setDownloadDir").value = s.download_dir || "";
     // 手动新建的默认目录：用户没填时用全局默认目录填空，省得每次都要想
@@ -1314,6 +1386,9 @@
     $("setHfCap").value = s.hf_thread_cap ?? 4;
     $("setHfToken").value = s.hf_token || "";
     $("setRateLimit").value = s.rate_limit_kb ?? 0;
+    $("setCategoriesEnabled").checked = !!s.categories_enabled;
+    renderCategoryRules(s.categories || []);
+    syncCategoryDetail();
     $("setPopupSaveAs").checked = s.popup_save_as ?? true;
     $("setPopupQuality").checked = s.popup_quality ?? true;
     $("setAutoProgress").checked = s.auto_progress_popup ?? true;
@@ -1366,6 +1441,8 @@
       popup_quality: $("setPopupQuality").checked,
       popup_save_as: $("setPopupSaveAs").checked,
       rate_limit_kb: Number($("setRateLimit").value) || 0,
+      categories_enabled: $("setCategoriesEnabled").checked,
+      categories: collectCategories(),
       auto_progress_popup: $("setAutoProgress").checked,
       autostart: $("setAutostart").checked,
       telemetry: $("setTelemetry").checked,
@@ -2223,6 +2300,8 @@
   $("restoreDefaults").onclick = restoreDefaults;
   $("cancelSettings").onclick = () => { loadSettings(); };
   $("setProxyEnabled").addEventListener("change", syncProxyDetail);
+  $("setCategoriesEnabled").addEventListener("change", syncCategoryDetail);
+  $("addCategoryRule").onclick = () => addCategoryRow(null);
   $("setTheme").addEventListener("change", (e) => changeTheme(e.target.value));
 
   // 手动新建面板里按回车 = 开始下载
@@ -2598,6 +2677,7 @@
             best_audio_format: media.best_audio_format || null,
             kind: "video",
             save_dir: dir,
+            expected_ext: f.ext || null,
             expected_bytes: f.filesize || null,
           },
         });

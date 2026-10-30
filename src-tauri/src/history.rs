@@ -51,6 +51,9 @@ pub struct HistoryEntry {
     pub quality_label: String,
     pub output_path: Option<String>,
     pub save_dir: Option<String>,
+    /// 分类目录依赖的预计扩展名；旧版本历史没有这个字段，按 None 处理
+    #[serde(default)]
+    pub expected_ext: Option<String>,
     pub total_bytes: Option<u64>,
     pub error: Option<String>,
     pub created_at: i64,
@@ -101,6 +104,7 @@ impl HistoryEntry {
             quality_label: task.quality_label.clone(),
             output_path: task.output_path.clone(),
             save_dir: task.save_dir.clone(),
+            expected_ext: task.expected_ext.clone(),
             total_bytes: task.total_bytes,
             error: task.error.clone(),
             created_at: task.created_at,
@@ -181,6 +185,11 @@ impl HistoryEntry {
             },
             threads: self.threads,
             save_dir: self.save_dir.clone(),
+            // 历史文件是不可信输入：扩展名回灌前再收敛一次
+            expected_ext: self
+                .expected_ext
+                .as_deref()
+                .and_then(crate::util::normalize_ext),
         }
     }
 }
@@ -451,6 +460,7 @@ mod tests {
             kind: "direct".into(),
             threads: 4,
             save_dir: Some("D:\\custom".into()),
+            expected_ext: Some("bin".into()),
         }
     }
 

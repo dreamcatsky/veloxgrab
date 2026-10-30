@@ -106,6 +106,13 @@ pub struct Task {
     /// 默认目录，用户想把这个视频丢到 D 盘、那个压缩包丢到桌面，只能手动挪。
     #[serde(default)]
     pub save_dir: Option<String>,
+    /// 预计扩展名（小写、不带点），用于分类目录与历史回灌后的清理/续传。
+    ///
+    /// 直链任务在探测前只能从文件名/URL 推导；视频任务由前端取 `f.ext`。
+    /// 不持久化的话，重启后回灌的任务会因为拿不到扩展名而落回根目录，
+    /// 同一任务的成品和断点就会分居两处。
+    #[serde(default)]
+    pub expected_ext: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -539,13 +546,34 @@ pub fn resolve_task_dir(settings: &Settings, task: &Task) -> Result<std::path::P
         }
         _ => root.clone(),
     };
+    // 分类子目录只在「用户没手选保存目录」时生效：手选目录代表用户已经
+    // 明确回答了「存哪」，再套一层分类等于把文件挪到他没选的地方。
+    let uses_global_root = task
+        .save_dir
+        .as_deref()
+        .map(str::trim)
+        .map(str::is_empty)
+        .unwrap_or(true);
+    let dir = if uses_global_root {
+        match settings.category_folder_for(task.expected_ext.as_deref()) {
+            Some(folder) => dir.join(folder),
+            None => dir,
+        }
+    } else {
+        dir
+    };
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
     Ok(dir)
 }
 
 /// 构造格式选择表达式。
 /// 若用户选的格式无音轨，则自动拼上最佳音轨（yt-dlp 会调用 ffmpeg 合并）。
-pub fn build_format_expr(format_id: &str, has_audio: bool, best_audio: Option<&str>, merge_mp4: bool) -> String {
+pub fn build_format_expr(
+    format_id: &str,
+    has_audio: bool,
+    best_audio: Option<&str>,
+    merge_mp4: bool,
+) -> String {
     let mut expr = if has_audio {
         format_id.to_string()
     } else if let Some(audio) = best_audio {
@@ -1501,6 +1529,7 @@ mod tests {
             kind: "direct".into(),
             threads: 4,
             save_dir: save_dir.map(str::to_string),
+            expected_ext: None,
         }
     }
 
@@ -1548,6 +1577,32 @@ mod tests {
         settings.trusted_dirs.push(outside.to_string_lossy().to_string());
         let t = sample_task(Some(outside.to_str().unwrap()));
         assert_eq!(resolve_task_dir(&settings, &t).unwrap(), outside);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// P0-2：分类目录只对「没有手选保存目录」的任务生效。
+    #[test]
+    fn resolve_task_dir_routes_categories_only_without_explicit_dir() {
+        let base = scratch("cat");
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let settings = Settings {
+            download_dir: root.to_string_lossy().to_string(),
+            categories_enabled: true,
+            ..Settings::default()
+        };
+
+        let mut t = sample_task(None);
+        t.expected_ext = Some("mp4".into());
+        assert_eq!(resolve_task_dir(&settings, &t).unwrap(), root.join("Video"));
+
+        // 手选目录代表用户已明确回答「存哪」，分类规则不得再套一层
+        let custom = root.join("custom");
+        let mut t = sample_task(Some(custom.to_str().unwrap()));
+        t.expected_ext = Some("mp4".into());
+        assert_eq!(resolve_task_dir(&settings, &t).unwrap(), custom);
 
         let _ = std::fs::remove_dir_all(&base);
     }

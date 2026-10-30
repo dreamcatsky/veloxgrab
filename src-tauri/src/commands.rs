@@ -325,6 +325,10 @@ pub struct EnqueueArgs {
     /// 本任务的保存目录；None / 空串表示用设置里的全局默认目录
     #[serde(default)]
     pub save_dir: Option<String>,
+    /// 预计扩展名（视频任务取所选格式的 `ext`，直链可从文件名推导）。
+    /// 只用于分类目录；空/非法值不参与匹配。
+    #[serde(default)]
+    pub expected_ext: Option<String>,
     /// 探测阶段已知的预计大小（字节）。只用于提交时的磁盘预检；
     /// 真正下载时仍以 Content-Length / yt-dlp 报告为准。
     #[serde(default)]
@@ -485,6 +489,10 @@ pub async fn enqueue_download(
         // 闸门的定稿路径（None = 用全局默认目录）。原始 args.save_dir 不得
         // 再往下传——那是未经折叠/校验的原始输入。
         save_dir,
+        // 分类目录只认规范化后的扩展名；非法值直接丢弃，不阻塞建单
+        expected_ext: args
+            .expected_ext
+            .and_then(|e| crate::util::normalize_ext(&e)),
     };
 
     {
@@ -1072,6 +1080,13 @@ pub(crate) async fn create_direct_task(
             .to_string()
     });
 
+    // 直链任务此时还没有 Content-Disposition，只能先看用户给的文件名或 URL
+    // 末段。推导不出来就不分类（落回根目录），下载完成后不影响文件本身。
+    let expected_ext = filename
+        .as_deref()
+        .and_then(crate::util::ext_of_name)
+        .or_else(|| crate::util::ext_of_name(&url));
+
     let task = Task {
         id: id.clone(),
         url,
@@ -1094,6 +1109,7 @@ pub(crate) async fn create_direct_task(
         kind: "direct".into(),
         threads: threads.unwrap_or(0).min(64),
         save_dir: save_dir.clone(),
+        expected_ext,
     };
 
     {

@@ -125,6 +125,47 @@ fn truncate_keep_ext(s: &str, max: usize) -> String {
     format!("{base}{ext}")
 }
 
+/// 把用户填的扩展名收敛成「小写、不带点」的规范形态。
+///
+/// 分类目录规则里允许用户写成 `.MP4`、`MP4`、` mp4 `，落盘前统一成 `mp4`；
+/// 只保留字母数字和 `.`（复合扩展名 `tar.gz`），其余字符一律拒绝——扩展名
+/// 最终会参与「文件名是否以 `.ext` 结尾」的判断，放行路径分隔符等于给规则
+/// 开了一条往目录外匹配的口子。空串、超长、前后带点同样视为非法。
+pub fn normalize_ext(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    // `..mp4` 不是「带点的扩展名」，是路径上跳的写法，直接拒绝
+    if raw.starts_with("..") {
+        return None;
+    }
+    let e = raw.trim_start_matches('.').to_ascii_lowercase();
+    if e.is_empty() || e.len() > 24 {
+        return None;
+    }
+    if e.starts_with('.') || e.ends_with('.') || e.contains("..") {
+        return None;
+    }
+    if !e.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+        return None;
+    }
+    Some(e)
+}
+
+/// 从文件名或 URL 推导扩展名（小写、不带点）。
+///
+/// 直链任务建单时还没有 Content-Disposition，只能先看用户给的文件名或 URL
+/// 末段；查不到就返回 None（不分类，落回根目录）。URL 先切掉 query/fragment，
+/// 否则 `file.mp4?token=...` 会把整串当成扩展名。
+pub fn ext_of_name(name: &str) -> Option<String> {
+    let base = name.split(['?', '#']).next().unwrap_or(name);
+    let last = base.rsplit(['/', '\\']).next().unwrap_or(base);
+    let (stem, ext) = last.rsplit_once('.')?;
+    // 隐藏文件（`.gitignore`）或纯点结尾没有真正的扩展名
+    if stem.is_empty() || stem.ends_with('.') {
+        return None;
+    }
+    normalize_ext(ext)
+}
+
 /// 目录闸门的路径词法折叠：消化 `.`、就地折叠 `..`，并报告是否发生「上跳出根」。
 ///
 /// 为什么必须有这一步：**尚未创建的目录 `canonicalize()` 会失败**，而深链
@@ -224,6 +265,28 @@ mod tests {
         assert!(!is_huggingface_url("https://evil.example/?x=huggingface.co"));
         assert!(!is_huggingface_url("https://huggingface.co.evil.example/x"));
         assert!(!is_huggingface_url("https://nothuggingface.co/x"));
+    }
+
+    #[test]
+    fn normalize_ext_strips_dots_and_rejects_paths() {
+        assert_eq!(normalize_ext(".MP4").as_deref(), Some("mp4"));
+        assert_eq!(normalize_ext(" 7Z ").as_deref(), Some("7z"));
+        assert_eq!(normalize_ext("tar.gz").as_deref(), Some("tar.gz"));
+        assert_eq!(normalize_ext("..mp4"), None);
+        assert_eq!(normalize_ext("a/b"), None);
+        assert_eq!(normalize_ext(""), None);
+        assert_eq!(normalize_ext("."), None);
+    }
+
+    #[test]
+    fn ext_of_name_handles_urls_and_hidden_files() {
+        assert_eq!(ext_of_name("movie.MP4").as_deref(), Some("mp4"));
+        assert_eq!(
+            ext_of_name("https://e.com/a/b/file.zip?token=x#frag").as_deref(),
+            Some("zip")
+        );
+        assert_eq!(ext_of_name("https://e.com/download").as_deref(), None);
+        assert_eq!(ext_of_name(".gitignore").as_deref(), None);
     }
 
     #[test]

@@ -267,6 +267,26 @@
             <input id="setRateLimit" type="number" min="0" step="50" />
           </label>
 
+          <label class="fld checkbox">
+            <input id="setCategoriesEnabled" type="checkbox" />
+            <span><span data-i18n="categoriesEnabled">按扩展名分类到子目录</span> <em class="dim" data-i18n="categoriesHint">(仅对未手选保存目录的任务生效)</em></span>
+          </label>
+
+          <div id="categoryRules" class="cat-rules hidden">
+            <div class="cat-head">
+              <span data-i18n="catFolder">子目录</span>
+              <span data-i18n="catExts">扩展名（逗号分隔）</span>
+              <span></span>
+            </div>
+            <div id="categoryRuleRows"></div>
+            <div class="inline">
+              <button id="addCategoryRule" class="ghost" type="button">
+                <span data-i18n="catAdd">添加规则</span>
+              </button>
+            </div>
+            <small class="dim" data-i18n="categoriesNote">子目录只允许单层名称；同一目录的规则会自动合并，最多 24 条。</small>
+          </div>
+
           <h3 class="sec-title" data-i18n="secBehavior">弹窗与行为</h3>
 
           <label class="fld checkbox">

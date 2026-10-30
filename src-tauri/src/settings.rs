@@ -3,12 +3,73 @@ use std::path::PathBuf;
 
 use crate::AppState;
 
+/// 一条「按扩展名分目录」规则。
+///
+/// 只允许单层目录名（`Video`、`压缩包`），不允许 `..`、路径分隔符或盘符：
+/// 分类目录永远拼在用户已批准下载根的子目录里，规则本身不能成为第二条
+/// 目录闸门。扩展名统一存小写、不带点。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CategoryRule {
+    pub folder: String,
+    pub extensions: Vec<String>,
+}
+
+/// 出厂默认分类：覆盖最常见的五类文件。
+///
+/// 默认**关闭**——分类会改变文件落点，老用户升级后不该突然发现下载目录
+/// 里多出一堆子文件夹。用户在设置里显式打开才生效。
+pub fn default_categories() -> Vec<CategoryRule> {
+    fn rule(folder: &str, exts: &[&str]) -> CategoryRule {
+        CategoryRule {
+            folder: folder.into(),
+            extensions: exts.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+    vec![
+        rule(
+            "Video",
+            &[
+                "mp4", "mkv", "webm", "avi", "mov", "flv", "wmv", "m4v", "ts", "mpg", "mpeg", "3gp",
+            ],
+        ),
+        rule(
+            "Music",
+            &["mp3", "flac", "wav", "aac", "m4a", "ogg", "opus", "wma"],
+        ),
+        rule(
+            "Programs",
+            &[
+                "exe", "msi", "msix", "apk", "dmg", "pkg", "deb", "rpm", "appimage",
+            ],
+        ),
+        rule(
+            "Archives",
+            &["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "iso"],
+        ),
+        rule(
+            "Documents",
+            &[
+                "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "epub", "mobi", "azw3",
+            ],
+        ),
+    ]
+}
+
 /// 持久化设置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// 默认下载目录
     pub download_dir: String,
+    /// 是否按扩展名把任务分到子目录（默认关闭）。
+    ///
+    /// 只对「没有手选保存目录」的任务生效：用户明确指定了存哪，就尊重他，
+    /// 不再套分类规则。
+    pub categories_enabled: bool,
+    /// 分类规则；同 folder 会在保存时合并，最多 24 条。
+    #[serde(default = "default_categories")]
+    pub categories: Vec<CategoryRule>,
     /// 最大并发下载数
     pub max_concurrent: usize,
     /// 默认画质偏好: best / 1080 / 720 / 480 等
@@ -82,6 +143,8 @@ impl Default for Settings {
             .to_string();
         Self {
             download_dir: dir,
+            categories_enabled: false,
+            categories: default_categories(),
             max_concurrent: 3,
             default_quality: "best".into(),
             cookies_from_browser: "none".into(),
@@ -129,6 +192,82 @@ impl Settings {
         }
     }
 
+    /// 归一化分类规则：清洗目录名、扩展名，合并同目录，限制条数。
+    ///
+    /// 前端表单是任意可改的输入（受损 webview 同样能提交），所以不能只靠
+    /// 界面约束。规则里的 folder 最终会被 `Path::join` 到下载根上，必须在这里
+    /// 挡掉 `..`、分隔符和盘符；扩展名只保留字母数字与点，避免规则把
+    /// 「文件名是否以 .ext 结尾」的判断带偏。
+    pub fn normalize_categories(&mut self) {
+        const MAX_RULES: usize = 24;
+        const MAX_EXTS: usize = 64;
+
+        let mut out: Vec<CategoryRule> = Vec::new();
+        for rule in std::mem::take(&mut self.categories) {
+            let Some(folder) = normalize_category_folder(&rule.folder) else {
+                continue;
+            };
+            let mut exts: Vec<String> = Vec::new();
+            for raw in rule.extensions {
+                let Some(e) = crate::util::normalize_ext(&raw) else {
+                    continue;
+                };
+                if exts.len() >= MAX_EXTS {
+                    break;
+                }
+                if !exts.iter().any(|x| x == &e) {
+                    exts.push(e);
+                }
+            }
+            if exts.is_empty() {
+                continue;
+            }
+            // Windows 目录名大小写不敏感，`Video` 与 `video` 视为同一目录
+            if let Some(existing) = out
+                .iter_mut()
+                .find(|r| r.folder.eq_ignore_ascii_case(&folder))
+            {
+                for e in exts {
+                    if existing.extensions.len() >= MAX_EXTS {
+                        break;
+                    }
+                    if !existing.extensions.iter().any(|x| x == &e) {
+                        existing.extensions.push(e);
+                    }
+                }
+            } else {
+                out.push(CategoryRule {
+                    folder,
+                    extensions: exts,
+                });
+                if out.len() >= MAX_RULES {
+                    break;
+                }
+            }
+        }
+        self.categories = out;
+    }
+
+    /// 按扩展名查分类子目录；未启用、无扩展名或没命中时返回 None。
+    ///
+    /// 命中顺序即规则顺序（先到先得），所以保存时合并同目录不会改变
+    /// 「同一个扩展名归哪个目录」的既有语义。
+    pub fn category_folder_for(&self, ext: Option<&str>) -> Option<String> {
+        if !self.categories_enabled {
+            return None;
+        }
+        let ext = crate::util::normalize_ext(ext?)?;
+        self.categories
+            .iter()
+            .find(|r| {
+                r.extensions
+                    .iter()
+                    .any(|e| crate::util::normalize_ext(e).as_deref() == Some(ext.as_str()))
+            })
+            // 纵深防御：即便规则来自未归一化的旧设置，返回前再清洗一次目录名
+            .and_then(|r| normalize_category_folder(&r.folder))
+    }
+
     /// save_settings 专用：默认下载目录发生变更时，把**旧值**记为已信任。
     ///
     /// 没有这一步的话：用户以前经确认框同意过目录 X 并把默认改成 X，之后把
@@ -140,6 +279,26 @@ impl Settings {
             self.remember_trusted(o);
         }
     }
+}
+
+/// 清洗一条规则的目录名，非法时返回 None。
+///
+/// 只允许**单层**目录：分隔符、盘符、`.` / `..` 一律拒绝，剩下 Windows
+/// 非法字符交给 `sanitize_filename` 统一替换（它还会处理保留设备名和结尾
+/// 的点/空格）。这样 `Path::join` 的结果永远只会是下载根下的一级子目录。
+fn normalize_category_folder(raw: &str) -> Option<String> {
+    let f = raw.trim();
+    if f.is_empty() || f == "." || f == ".." {
+        return None;
+    }
+    if f.contains(['/', '\\', ':']) {
+        return None;
+    }
+    let cleaned = crate::util::sanitize_filename(f);
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return None;
+    }
+    Some(cleaned)
 }
 
 /// 把用户填的代理主机规范成 `reqwest::Proxy` 能吃的 `host` / `[v6]`。
@@ -226,6 +385,9 @@ pub fn read_settings_from_disk() -> Settings {
             // unseal 原样返回，新老世代一次读盘兼容。
             s.hf_token = crate::dpapi::unseal(&s.hf_token);
             s.proxy_pass = crate::dpapi::unseal(&s.proxy_pass);
+            // 设置文件同样按不可信输入处理：旧版本/手改的规则可能带 `..` 或
+            // 分隔符，进内存前先清洗，避免它绕过 save_settings 的归一化。
+            s.normalize_categories();
             // 产品改名（VGrab → VeloxGrab）的遗留路径迁移。老用户 settings.json
             // 里存的默认下载目录还是 `...\Downloads\VGrab`——用户显式设置过的值
             // 优先于出厂默认，不迁移的话他们会一直往旧名目录里写。
@@ -523,6 +685,8 @@ pub fn save_settings(
     }
     settings.theme = normalize_theme(&settings.theme).to_string();
     settings.close_mode = normalize_close_mode(&settings.close_mode).to_string();
+    // 分类规则来自前端表单：清洗目录名/扩展名、合并同目录、限制条数。
+    settings.normalize_categories();
 
     // 信任集只允许两个来源：原生确认框的同意（remember_trusted_dir）、以及
     // 「用户把默认目录从 A 改到 B」时旧值 A 的自动继承。**前端表单里带来的
@@ -671,6 +835,66 @@ mod tests {
         // 空格 / 端口非数字 → 不拼出脏 URL
         assert!(proxy("bad host", "", "").is_none());
         assert!(proxy("host:abc", "", "").is_none());
+    }
+
+    #[test]
+    fn categories_are_normalized_and_merged() {
+        let mut s = Settings {
+            categories_enabled: true,
+            categories: vec![
+                CategoryRule {
+                    folder: " Video ".into(),
+                    extensions: vec![".MP4".into(), "mp4".into(), "mkv".into()],
+                },
+                // 同目录（大小写不敏感）合并，扩展名去重
+                CategoryRule {
+                    folder: "video".into(),
+                    extensions: vec!["MKV".into(), "webm".into()],
+                },
+                // 越界目录与非法扩展名整条丢弃
+                CategoryRule {
+                    folder: "../escape".into(),
+                    extensions: vec!["exe".into()],
+                },
+                CategoryRule {
+                    folder: "Bad".into(),
+                    extensions: vec!["a/b".into()],
+                },
+            ],
+            ..Settings::default()
+        };
+        s.normalize_categories();
+        assert_eq!(s.categories.len(), 1);
+        assert_eq!(s.categories[0].folder, "Video");
+        assert_eq!(s.categories[0].extensions, vec!["mp4", "mkv", "webm"]);
+    }
+
+    #[test]
+    fn category_lookup_respects_switch() {
+        let mut s = Settings {
+            categories_enabled: false,
+            ..Settings::default()
+        };
+        assert_eq!(s.category_folder_for(Some("mp4")), None);
+
+        s.categories_enabled = true;
+        assert_eq!(
+            s.category_folder_for(Some(".MP4")).as_deref(),
+            Some("Video")
+        );
+        assert_eq!(
+            s.category_folder_for(Some("zip")).as_deref(),
+            Some("Archives")
+        );
+        assert_eq!(s.category_folder_for(Some("unknown")), None);
+        assert_eq!(s.category_folder_for(None), None);
+
+        // 未归一化的脏规则不能借 lookup 逃出下载根
+        s.categories = vec![CategoryRule {
+            folder: "../escape".into(),
+            extensions: vec!["mp4".into()],
+        }];
+        assert_eq!(s.category_folder_for(Some("mp4")), None);
     }
 
     #[test]
