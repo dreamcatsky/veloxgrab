@@ -70,7 +70,7 @@ VeloxGrab 只做 http(s) 时，这些项的价值要打折——不能照着设�
 |---|---|---|
 | 队列 | 有，可置顶（`moveToFront`） | FIFO，无排序/置顶 |
 | 暂停/继续/重下 | 有 | 有 |
-| 编辑任务（线程/目录/文件名/头） | 有（`task_service.edit`） | 无（只能删了重建） |
+| 编辑任务（线程/目录/文件名/头） | 有（`task_service.edit`） | 有（文件名/线程/保存目录；仅排队/暂停/失败可改，请求头走全局预设） |
 | 同名冲突 | keepBoth / overwrite / ask | keepBoth（直链递增改名）/ skip（视频），可切 overwrite（仅本程序同 URL 产物） |
 | 分类目录路由 | 有（扩展名 → `{default}/Video` 等 8 类） | 有（可选，默认关闭；五类预设可编辑，手选目录优先） |
 | 删除时删文件 | 有（开关） | 有（`delete_files` 参数） |
@@ -232,6 +232,15 @@ VeloxGrab 只做 http(s) 时，这些项的价值要打折——不能照着设�
 - **风险**：低。编辑 `save_dir` 仍要走闸门。
 - **验收**：暂停态改线程后继续生效；运行态编辑被拒且有提示。
 - **工作量**：2 天。
+- **已落地（批次 B）**：命令 `edit_task(EditTaskArgs)`，字段 `title` / `threads` /
+  `save_dir`（`None` = 不改，`save_dir = Some("")` = 改回全局默认）。只放行
+  `Queued/Paused/Failed`，同时校验令牌表，避免「状态还是 Queued、旧 worker 尚未
+  收尾」时改到正在写的断点；改 `save_dir` 仍走 `admit_save_dir`，目录没变就不
+  重复弹原生确认框。文件名复用 `sanitize_filename` 并同步 `expected_ext`；改完
+  写回 history，重启后不丢。前端右键菜单「编辑…」打开独立小弹窗（文件名 / 保存
+  目录 / 直链线程数），视频任务的线程行隐藏；改目录、文件名或线程数且已有断点时
+  先提示「断点不迁移」。排队任务与队列泵的竞态通过「在置 Downloading 的同一临界区内
+  重新取快照」解决，编辑不会被旧快照覆盖。
 
 #### P0-7 自定义请求头 / UA（含 Referer）
 - **现状**：UA 写死，无法带 Referer —— 防盗链直链基本下不动。

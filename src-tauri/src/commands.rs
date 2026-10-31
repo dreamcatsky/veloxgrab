@@ -641,6 +641,7 @@ pub fn pump_queue(
             // 短暂写回 Queued 而旧 worker 还活着，表里那个令牌就是「有活着的
             // worker」的唯一可靠凭证，见下面 contains_key 分支。
             let token = Arc::new(CancelToken::new());
+            let mut started_task: Option<Task> = None;
             let started = {
                 let mut guard = ctx.tasks.lock().await;
                 match guard.get_mut(&next_id) {
@@ -655,6 +656,11 @@ pub fn pump_queue(
                         } else {
                             t.state = TaskState::Downloading;
                             tks.insert(next_id.clone(), token.clone());
+                            // 在同一个临界区里重新取快照：上面那次 clone 发生在
+                            // 「置 Downloading」之前，用户可能刚好在排队窗口里
+                            // edit_task（改线程/目录/文件名）。用旧快照启动会把
+                            // 编辑静默丢掉；这里取到的是状态提交后的最终值。
+                            started_task = Some(t.clone());
                             true
                         }
                     }
@@ -668,7 +674,9 @@ pub fn pump_queue(
             let settings = crate::settings::read_settings_from_disk();
             let app_c = app.clone();
             let ctx_c = ctx.clone();
-            let task_c = task.clone();
+            let Some(task_c) = started_task else {
+                continue;
+            };
 
             tauri::async_runtime::spawn(async move {
                 {
@@ -970,6 +978,96 @@ pub async fn redo_tasks(
         tauri::async_runtime::spawn(pump_queue(app, ctx));
     }
     Ok(ok)
+}
+
+/// 编辑任务参数（文件名 / 线程数 / 保存目录）。
+///
+/// 只允许排队、暂停、失败三种状态：正在下载的任务先暂停再编辑，避免改到
+/// 一半的临时文件与最终落点对不上。保存目录仍然走 `admit_save_dir` 的
+/// 同一道闸门——编辑入口不能成为绕过目录信任检查的后门。
+///
+/// 字段语义：`None` = 不改；`save_dir = Some("")` = 改回全局默认目录。
+#[derive(Debug, Deserialize)]
+pub struct EditTaskArgs {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub threads: Option<usize>,
+    #[serde(default)]
+    pub save_dir: Option<String>,
+}
+
+#[tauri::command]
+pub async fn edit_task(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    args: EditTaskArgs,
+) -> Result<Task, String> {
+    use tauri::Emitter;
+
+    // 先拿快照做状态判定；真正的提交会在下面重新校验一次（admit 可能弹原生框，
+    // 期间队列泵完全可能把任务启动起来）。
+    let (task, running) = {
+        let guard = state.tasks.lock().await;
+        let running = state.tokens.lock().await.contains_key(&args.id);
+        (guard.get(&args.id).cloned(), running)
+    };
+    let Some(task) = task else {
+        return Err("任务不存在".into());
+    };
+    if running || !task.state.is_editable() {
+        return Err("只能编辑排队、暂停或失败的任务；正在下载的任务请先暂停".into());
+    }
+
+    // 目录没变就不进闸门：否则编辑一个「历史回灌来的根外目录」任务时，
+    // 只改文件名也会莫名其妙弹一次原生确认框。
+    let new_dir = match args.save_dir {
+        Some(raw) if raw.trim() != task.save_dir.as_deref().unwrap_or("").trim() => {
+            admit_save_dir(&app, &state, Some(raw)).await?
+        }
+        _ => task.save_dir.clone(),
+    };
+
+    let new_title = match args.title {
+        Some(t) => {
+            let raw = t.trim();
+            if raw.is_empty() {
+                return Err("文件名不能为空".into());
+            }
+            Some(crate::util::sanitize_filename(raw))
+        }
+        None => None,
+    };
+    let new_threads = args.threads.map(|t| t.min(64));
+
+    let updated = {
+        let mut guard = state.tasks.lock().await;
+        let running_now = state.tokens.lock().await.contains_key(&args.id);
+        let Some(t) = guard.get_mut(&args.id) else {
+            return Err("任务不存在".into());
+        };
+        if running_now || !t.state.is_editable() {
+            return Err("任务状态已变化，请刷新后重试".into());
+        }
+        if let Some(title) = new_title {
+            t.title = title;
+            // 文件名带扩展名时同步更新分类依据；视频任务通常没有扩展名，
+            // 此时保留探测阶段拿到的 f.ext。
+            if let Some(ext) = crate::util::ext_of_name(&t.title) {
+                t.expected_ext = Some(ext);
+            }
+        }
+        if let Some(threads) = new_threads {
+            t.threads = threads;
+        }
+        t.save_dir = new_dir;
+        crate::history::upsert_entry(t);
+        t.clone()
+    };
+
+    let _ = app.emit("tasks-changed", ());
+    Ok(updated)
 }
 
 #[tauri::command]

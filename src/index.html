@@ -641,6 +641,38 @@
     </div>
   </div>
 
+  <!-- 编辑任务：只允许排队/暂停/失败三种状态（运行中先暂停）。
+       保存目录仍走后端的目录闸门，前端不自行判定信任。 -->
+  <div id="editOverlay" class="overlay hidden">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h3 data-i18n="editTitle">编辑任务</h3>
+      </div>
+      <div class="dialog-body">
+        <label class="fld">
+          <span data-i18n="filenameLabel">保存文件名</span>
+          <input id="editName" type="text" spellcheck="false" />
+        </label>
+        <label class="fld">
+          <span data-i18n="saveToLabel">保存到</span>
+          <div class="inline">
+            <input id="editDir" type="text" spellcheck="false" />
+            <button id="editPickDir" class="ghost"><span data-i18n="pickDirBtn">选择…</span></button>
+          </div>
+        </label>
+        <label class="fld" id="editThreadsRow">
+          <span data-i18n="threadsLabel">下载线程数</span>
+          <select id="editThreads"></select>
+        </label>
+        <small class="dim" data-i18n="editHint">只能编辑排队、暂停或失败的任务；修改文件名、保存目录或线程数后，已有断点不会迁移。</small>
+      </div>
+      <div class="actions dialog-actions">
+        <button id="editSave" class="primary"><span data-i18n="editSaveBtn">保存</span></button>
+        <button id="editCancel" class="ghost"><span data-i18n="cancel">取消</span></button>
+      </div>
+    </div>
+  </div>
+
   <!-- 更新对话框：发现新版本 / 下载进度共用一个壳，正文随状态切换 -->
   <div id="updateOverlay" class="overlay hidden">
     <div class="dialog">
@@ -766,6 +798,7 @@
     <button class="ctx-item" data-ctx="pause"><span data-i18n="cxPause">暂停</span></button>
     <button class="ctx-item" data-ctx="resume"><span data-i18n="cxResume">继续</span></button>
     <button class="ctx-item" data-ctx="redo"><span data-i18n="cxRedo">重新下载</span></button>
+    <button class="ctx-item" data-ctx="edit"><span data-i18n="cxEdit">编辑…</span></button>
     <div class="ctx-sep"></div>
     <button class="ctx-item danger" data-ctx="remove"><span data-i18n="cxRemove">移除任务</span></button>
     <button class="ctx-item danger" data-ctx="removeWithFile">

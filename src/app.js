@@ -368,8 +368,12 @@
     cxPause: "Pause",
     cxResume: "Resume",
     cxRedo: "Redownload",
+    cxEdit: "Edit…",
     cxRemove: "Remove task",
     cxRemoveFile: "Delete task and file",
+    editTitle: "Edit task",
+    editHint: "Only queued, paused or failed tasks can be edited; changing the file name, folder or thread count does not move existing partial data.",
+    editSaveBtn: "Save",
     upInstall: "Update now",
     upLater: "Later",
     upAvailable: "New version available",
@@ -841,6 +845,97 @@
     if (ctxMenu) ctxMenu.classList.add("hidden");
   }
 
+  // ---------- 编辑任务 ----------
+  let editTargetId = null;
+
+  function fillEditThreads(sel, n) {
+    fillThreadSelect(sel, n);
+    const en = appSettings && appSettings.language === "en";
+    // 0 = 自动（后端按文件大小和分块上限自己决定）。保留这个语义，
+    // 否则用户只想改文件名，保存时却把「自动」悄悄变成了某个固定线程数。
+    if (n === 0) {
+      const o = el("option");
+      o.value = "0";
+      o.textContent = en ? "Auto" : "自动";
+      sel.appendChild(o);
+      sel.value = "0";
+      return;
+    }
+    // 历史任务可能存了枚举外的线程数（比如 6）：补一个精确选项，
+    // 否则 select 会吸附到 4/8，用户只想改文件名却顺手改了线程。
+    if (n > 0 && ![...sel.options].some((o) => o.value === String(n))) {
+      const o = el("option");
+      o.value = String(n);
+      o.textContent = en ? n + " threads" : n + " 线程";
+      sel.appendChild(o);
+    }
+    if (n > 0) sel.value = String(n);
+  }
+
+  function openEditDialog(task) {
+    if (!task) return;
+    editTargetId = task.id;
+    $("editName").value = task.title || "";
+    $("editDir").value = task.save_dir || "";
+    $("editDir").placeholder =
+      (appSettings && appSettings.download_dir) || "默认下载目录";
+    const direct = task.kind === "direct";
+    $("editThreadsRow").classList.toggle("hidden", !direct);
+    if (direct) {
+      const current =
+        typeof task.threads === "number"
+          ? task.threads
+          : (appSettings && appSettings.default_threads) || 8;
+      fillEditThreads($("editThreads"), current);
+    }
+    $("editOverlay").classList.remove("hidden");
+    $("editName").focus();
+  }
+
+  function closeEditDialog() {
+    $("editOverlay").classList.add("hidden");
+    editTargetId = null;
+  }
+
+  async function saveEditDialog() {
+    const task = editTargetId ? taskMap.get(editTargetId) : null;
+    if (!task) return;
+    const title = $("editName").value.trim();
+    if (!title) return toast("文件名不能为空", true);
+    const dir = $("editDir").value.trim();
+    // 改目录 / 文件名 / 线程数都会让断点失效：临时文件与分段布局分别绑在
+    // 「最终路径」和 .veloxgrab-meta 上，换任何一个都只能从头重下。
+    const dirChanged = dir !== (task.save_dir || "").trim();
+    const titleChanged = title !== (task.title || "").trim();
+    const threadsChanged =
+      task.kind === "direct" && Number($("editThreads").value) !== task.threads;
+    if ((dirChanged || titleChanged || threadsChanged) && task.downloaded_bytes > 0) {
+      const what = [
+        dirChanged ? "保存目录" : null,
+        titleChanged ? "文件名" : null,
+        threadsChanged ? "线程数" : null,
+      ]
+        .filter(Boolean)
+        .join("、");
+      const ok = confirm(
+        `这个任务已经下载了一部分。修改${what}后，已有断点不会迁移，任务会从头重新开始。\n\n继续吗？`
+      );
+      if (!ok) return;
+    }
+    const args = { id: task.id, title, save_dir: dir };
+    if (task.kind === "direct") {
+      args.threads = Number($("editThreads").value) || 0;
+    }
+    try {
+      await invoke("edit_task", { args });
+      closeEditDialog();
+      toast("任务已更新");
+      refreshTasks();
+    } catch (e) {
+      toast(String(e), true);
+    }
+  }
+
   function showCtxMenu(x, y, task) {
     if (!ctxMenu || !task) return;
     ctxTargetId = task.id;
@@ -876,6 +971,11 @@
     setEnabled("pause", acting);
     setEnabled("resume", paused);
     setEnabled("redo", !acting && task.state !== "done");
+    // 编辑只对排队/暂停/失败开放；运行中先暂停，终态请重建
+    setEnabled(
+      "edit",
+      ["queued", "paused", "failed"].includes(task.state)
+    );
     setEnabled("remove", true);
     // 「删除任务和文件」只在主目标是已完成且有成品时可用：其余情况删无可删，
     // 灰掉比点了弹「没有可删的文件」更清楚。
@@ -950,6 +1050,8 @@
         const n = await invoke("redo_tasks", { args: { ids: picked.map((t) => t.id) } });
         toast(n > 0 ? `已重新下载 ${n} 个任务` : "没有可重下的任务");
         refreshTasks();
+      } else if (action === "edit") {
+        openEditDialog(main);
       } else if (action === "remove") {
         const ids = picked.map((t) => t.id);
         const ok = confirm(
@@ -2330,6 +2432,7 @@
       $("planOverlay").classList.add("hidden");
       if (!$("updateOverlay").classList.contains("hidden")) hideUpdateDialog();
       if (!$("saveAsOverlay").classList.contains("hidden")) closeSaveAs();
+      closeEditDialog();
     }
   });
 
@@ -2372,6 +2475,28 @@
   $("addOverlay").addEventListener("click", (e) => {
     // 点遮罩关闭，点对话框内部不关
     if (e.target === $("addOverlay")) closeAddUrl();
+  });
+
+  // 编辑任务弹窗：选择目录复用同一个原生对话框插件；保存目录的信任判定
+  // 在后端 admit_save_dir，前端只负责把路径带过去。
+  $("editPickDir").onclick = () => {
+    invoke("plugin:dialog|open", {
+      options: { directory: true, multiple: false, title: "选择保存目录" },
+    })
+      .then((v) => { if (v) $("editDir").value = v; })
+      .catch((e) => toast("选择目录失败：" + String(e), true));
+  };
+  $("editCancel").onclick = closeEditDialog;
+  $("editSave").onclick = saveEditDialog;
+  $("editOverlay").addEventListener("click", (e) => {
+    if (e.target === $("editOverlay")) closeEditDialog();
+  });
+  // 文件名输入框回车 = 保存（和「添加下载」弹窗一致）
+  $("editName").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      saveEditDialog();
+    }
   });
   $("saveSettings").onclick = saveSettings;
   $("restoreDefaults").onclick = restoreDefaults;

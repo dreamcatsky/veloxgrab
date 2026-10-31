@@ -271,6 +271,7 @@ pub fn run() {
             commands::resume_tasks,
             commands::redo_task,
             commands::redo_tasks,
+            commands::edit_task,
             commands::remove_tasks,
             commands::start_all,
             commands::pause_all,

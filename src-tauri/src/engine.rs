@@ -69,6 +69,18 @@ impl TaskState {
             TaskState::Queued | TaskState::Paused | TaskState::Failed
         )
     }
+
+    /// 是否允许编辑任务参数。
+    ///
+    /// 只开放给「还没在跑」的三种状态：排队（还没启动）、暂停（断点已落盘）、
+    /// 失败（等用户重试）。下载中/合并中改目录或文件名，会让正在写的临时文件
+    /// 与最终落点对不上；已完成/已取消则应该重新建任务。
+    pub fn is_editable(self) -> bool {
+        matches!(
+            self,
+            TaskState::Queued | TaskState::Paused | TaskState::Failed
+        )
+    }
 }
 
 /// 单个下载任务
@@ -1614,6 +1626,18 @@ mod tests {
         assert_eq!(resolve_task_dir(&settings, &t).unwrap(), custom);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// P0-6：只有排队/暂停/失败可以编辑；运行中与终态一律拒绝。
+    #[test]
+    fn only_idle_states_are_editable() {
+        assert!(TaskState::Queued.is_editable());
+        assert!(TaskState::Paused.is_editable());
+        assert!(TaskState::Failed.is_editable());
+        assert!(!TaskState::Downloading.is_editable());
+        assert!(!TaskState::Merging.is_editable());
+        assert!(!TaskState::Done.is_editable());
+        assert!(!TaskState::Canceled.is_editable());
     }
 
     /// P2：兜底找成品时不能把「同前缀的别的文件」或十分钟前的旧文件算进来。
