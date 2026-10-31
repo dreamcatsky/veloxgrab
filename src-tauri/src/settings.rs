@@ -56,6 +56,27 @@ pub fn default_categories() -> Vec<CategoryRule> {
     ]
 }
 
+/// 一组自定义请求头（`Name: value`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeaderKV {
+    pub name: String,
+    pub value: String,
+}
+
+/// 请求头预设：可限定只对某个 host（含子域）生效。
+///
+/// `host` 为空表示对所有站点生效。为了不让设置页变成「任意请求伪造器」，
+/// 保存时会过滤掉 `Host` / `Range` / `Cookie` 等由下载器自己管理的头；
+/// 空 host 的预设还会拒绝 `Authorization`（避免 token 跟着任意站点走）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeaderPreset {
+    pub name: String,
+    pub host: String,
+    pub headers: Vec<HeaderKV>,
+}
+
 /// 持久化设置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -75,6 +96,9 @@ pub struct Settings {
     /// 覆盖只对本程序为**同一 URL** 下载过、且路径完全一致的成品生效；
     /// 来源不明的同名文件仍然递增避让，避免误删用户自己的文件。
     pub name_conflict: String,
+    /// 自定义请求头预设（防盗链 Referer、UA 等）。
+    #[serde(default)]
+    pub header_presets: Vec<HeaderPreset>,
     /// 最大并发下载数
     pub max_concurrent: usize,
     /// 默认画质偏好: best / 1080 / 720 / 480 等
@@ -151,6 +175,7 @@ impl Default for Settings {
             categories_enabled: false,
             categories: default_categories(),
             name_conflict: "keep_both".into(),
+            header_presets: Vec::new(),
             max_concurrent: 3,
             default_quality: "best".into(),
             cookies_from_browser: "none".into(),
@@ -274,6 +299,107 @@ impl Settings {
             .and_then(|r| normalize_category_folder(&r.folder))
     }
 
+    /// 归一化请求头预设：校验头名/头值、过滤危险头、限制条数。
+    ///
+    /// 请求头是直接拼进 HTTP 请求的原始文本：头名里的空格/冒号会让解析器
+    /// 把后半段当成新头，头值里的 CRLF 就是标准的响应/请求拆分注入。这里
+    /// 只放行 RFC 7230 的 token 字符，值里出现控制字符直接丢弃整条。
+    pub fn normalize_header_presets(&mut self) {
+        const MAX_PRESETS: usize = 8;
+        const MAX_HEADERS: usize = 16;
+
+        let mut out: Vec<HeaderPreset> = Vec::new();
+        for (i, preset) in std::mem::take(&mut self.header_presets)
+            .into_iter()
+            .enumerate()
+        {
+            if out.len() >= MAX_PRESETS {
+                break;
+            }
+            let Some(host) = normalize_header_host(&preset.host) else {
+                continue;
+            };
+            let name = {
+                let n = preset.name.trim();
+                if n.is_empty() {
+                    format!("预设 {}", i + 1)
+                } else {
+                    n.chars().take(48).collect()
+                }
+            };
+            let mut headers: Vec<HeaderKV> = Vec::new();
+            for kv in preset.headers {
+                let Some(name) = normalize_header_name(&kv.name) else {
+                    continue;
+                };
+                let Some(value) = normalize_header_value(&kv.value) else {
+                    continue;
+                };
+                if is_blocked_header(&name) {
+                    continue;
+                }
+                // 空 host = 对所有站点生效，此时不允许携带 Authorization
+                if host.is_empty() && name.eq_ignore_ascii_case("authorization") {
+                    continue;
+                }
+                if headers.len() >= MAX_HEADERS {
+                    break;
+                }
+                if headers.iter().any(|h| h.name.eq_ignore_ascii_case(&name)) {
+                    continue;
+                }
+                headers.push(HeaderKV { name, value });
+            }
+            if headers.is_empty() {
+                continue;
+            }
+            out.push(HeaderPreset {
+                name,
+                host,
+                headers,
+            });
+        }
+        self.header_presets = out;
+    }
+
+    /// 取目标 URL 应携带的自定义头（按 host 作用域过滤，后出现的预设覆盖同名头）。
+    ///
+    /// 返回值直接喂给 reqwest / yt-dlp。这里再做一次校验是纵深防御：
+    /// settings.json 可能被手改，不能假设它一定经过 `save_settings`。
+    pub fn headers_for_url(&self, url: &str) -> Vec<(String, String)> {
+        let Some(host) = crate::util::host_of(url) else {
+            return Vec::new();
+        };
+        let host = host.to_ascii_lowercase();
+        let mut out: Vec<(String, String)> = Vec::new();
+        for p in &self.header_presets {
+            let scope = p.host.trim().to_ascii_lowercase();
+            if !scope.is_empty() && host != scope && !host.ends_with(&format!(".{scope}")) {
+                continue;
+            }
+            for kv in &p.headers {
+                let Some(name) = normalize_header_name(&kv.name) else {
+                    continue;
+                };
+                let Some(value) = normalize_header_value(&kv.value) else {
+                    continue;
+                };
+                if is_blocked_header(&name) {
+                    continue;
+                }
+                if scope.is_empty() && name.eq_ignore_ascii_case("authorization") {
+                    continue;
+                }
+                if let Some(slot) = out.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                    slot.1 = value;
+                } else {
+                    out.push((name, value));
+                }
+            }
+        }
+        out
+    }
+
     /// save_settings 专用：默认下载目录发生变更时，把**旧值**记为已信任。
     ///
     /// 没有这一步的话：用户以前经确认框同意过目录 X 并把默认改成 X，之后把
@@ -285,6 +411,136 @@ impl Settings {
             self.remember_trusted(o);
         }
     }
+}
+
+/// 清洗请求头预设的 host 作用域。空串表示「对所有站点生效」。
+///
+/// 只接受裸主机名（可带子域）：协议、端口、路径、通配符一律拒绝，避免
+/// 「看起来像 example.com，实际匹配到别处」的作用域歧义。`*.example.com`
+/// 与 `.example.com` 都按 `example.com` 处理（子域匹配本来就包含它）。
+fn normalize_header_host(raw: &str) -> Option<String> {
+    let mut h = raw.trim().to_ascii_lowercase();
+    if h.is_empty() {
+        return Some(String::new());
+    }
+    h = h
+        .trim_start_matches("*.")
+        .trim_start_matches('.')
+        .to_string();
+    if h.is_empty() || h.len() > 253 {
+        return None;
+    }
+    if h.contains(['/', ':', '?', '#', '@', ' ', '\\']) {
+        return None;
+    }
+    if !h
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return None;
+    }
+    if h.starts_with('.') || h.ends_with('.') || h.contains("..") {
+        return None;
+    }
+    Some(h)
+}
+
+/// 清洗请求头名：只放行 RFC 7230 的 token 字符。
+///
+/// 头名里出现空格/冒号/控制字符时，HTTP 解析器会把后半段当成新的头——
+/// 那等于让设置页变成任意请求伪造器。这里不做大小写转换（保留用户写法），
+/// 比较时统一用 `eq_ignore_ascii_case`。
+fn normalize_header_name(raw: &str) -> Option<String> {
+    let n = raw.trim();
+    if n.is_empty() || n.len() > 64 {
+        return None;
+    }
+    if !n.bytes().all(is_http_token_byte) {
+        return None;
+    }
+    Some(n.to_string())
+}
+
+/// 清洗请求头值：拒绝 CR/LF/NUL 及其它控制字符（防请求拆分注入）。
+///
+/// 空值直接丢弃：用户在表单里留一行空 `Name:` 通常是误操作，发出去只会
+/// 让服务端困惑。值里的首尾空白按 HTTP 语义没有意义，统一 trim。
+fn normalize_header_value(raw: &str) -> Option<String> {
+    let v = raw.trim();
+    if v.is_empty() || v.len() > 4096 {
+        return None;
+    }
+    if v.chars().any(|c| c.is_control() && c != '\t') {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+/// RFC 7230 `token` 允许的字节。
+fn is_http_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// 由下载器自己管理、绝不允许用户预设覆盖的头。
+///
+/// 这些头直接决定请求的语义：`Range` 决定分块边界、`Content-Length` 参与
+/// 续传校验、`Host` 决定连接目标、`Cookie` 属于现有 Cookie 机制。放行它们
+/// 轻则下坏文件，重则把请求指向别的主机。
+fn is_blocked_header(name: &str) -> bool {
+    const BLOCKED: &[&str] = &[
+        "host",
+        "content-length",
+        "content-range",
+        "range",
+        "if-range",
+        "connection",
+        "cookie",
+        "set-cookie",
+        "transfer-encoding",
+        "content-encoding",
+        "accept-encoding",
+        "expect",
+        "upgrade",
+        "te",
+        "trailer",
+        "proxy-connection",
+        "proxy-authorization",
+    ];
+    BLOCKED.iter().any(|b| name.eq_ignore_ascii_case(b))
+}
+
+/// 请求头名是否属于「不该跟着跨站重定向跑」的敏感身份。
+///
+/// reqwest 只会自动剥掉 Authorization/Cookie/Proxy-Authorization；像
+/// `X-Api-Key` 这类自定义凭证它会原样带到下一跳。直链侧用这个判定
+/// 「有敏感头就不自动跨站跳转」，宁可报错也不把 token 交给第三方 CDN。
+fn is_sensitive_header(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "authorization"
+        || n == "proxy-authorization"
+        || n == "cookie"
+        || n.contains("token")
+        || n.contains("secret")
+        || n.contains("api-key")
+        || n.contains("apikey")
+        || n.contains("session")
 }
 
 /// 清洗一条规则的目录名，非法时返回 None。
@@ -395,6 +651,9 @@ pub fn read_settings_from_disk() -> Settings {
             // 分隔符，进内存前先清洗，避免它绕过 save_settings 的归一化。
             s.normalize_categories();
             s.name_conflict = normalize_name_conflict(&s.name_conflict).to_string();
+            // 请求头预设同样按不可信输入处理：手改的 settings.json 可能带
+            // CRLF 头值或 `Host` 覆盖，进内存前先过一遍白名单。
+            s.normalize_header_presets();
             // 产品改名（VGrab → VeloxGrab）的遗留路径迁移。老用户 settings.json
             // 里存的默认下载目录还是 `...\Downloads\VGrab`——用户显式设置过的值
             // 优先于出厂默认，不迁移的话他们会一直往旧名目录里写。
@@ -524,6 +783,8 @@ pub struct NetCfg {
     pub rate_kb: u64,
     /// 需要附加 Authorization 的请求（目前只有 HuggingFace）
     pub auth: Option<HostAuth>,
+    /// 命中当前 host 作用域的自定义请求头（已通过白名单校验）
+    pub custom: Vec<(String, String)>,
 }
 
 impl NetCfg {
@@ -532,10 +793,11 @@ impl NetCfg {
             proxy: s.proxy_url(),
             rate_kb: s.rate_limit_kb,
             auth: None,
+            custom: Vec::new(),
         }
     }
 
-    /// 与 `from_settings` 相同，但按目标 URL 决定是否附加 HF token。
+    /// 与 `from_settings` 相同，但按目标 URL 决定是否附加 HF token 与自定义头。
     ///
     /// 调用方必须在**知道 URL** 的地方用它（探测、直链下载）；不知道 URL 的
     /// 地方（更新检查等）只能用 `from_settings`，以免把凭证带进无关请求。
@@ -549,7 +811,13 @@ impl NetCfg {
                 });
             }
         }
+        net.custom = s.headers_for_url(url);
         net
+    }
+
+    /// 这批自定义头里是否含有不能跟着跨站重定向跑的身份凭证。
+    pub fn has_sensitive_headers(&self) -> bool {
+        self.custom.iter().any(|(n, _)| is_sensitive_header(n))
     }
 }
 
@@ -695,6 +963,8 @@ pub fn save_settings(
     settings.name_conflict = normalize_name_conflict(&settings.name_conflict).to_string();
     // 分类规则来自前端表单：清洗目录名/扩展名、合并同目录、限制条数。
     settings.normalize_categories();
+    // 请求头预设：头名/头值白名单、危险头过滤、条数上限。
+    settings.normalize_header_presets();
 
     // 信任集只允许两个来源：原生确认框的同意（remember_trusted_dir）、以及
     // 「用户把默认目录从 A 改到 B」时旧值 A 的自动继承。**前端表单里带来的
@@ -862,6 +1132,181 @@ mod tests {
         // 认不出的值不能变成破坏性模式
         assert_eq!(normalize_name_conflict("ask"), "keep_both");
         assert_eq!(normalize_name_conflict(""), "keep_both");
+    }
+
+    #[test]
+    fn header_presets_reject_injection_and_managed_headers() {
+        let mut s = Settings {
+            header_presets: vec![HeaderPreset {
+                name: "  ".into(),
+                host: " *.Example.COM ".into(),
+                headers: vec![
+                    HeaderKV {
+                        name: "Referer".into(),
+                        value: " https://example.com/watch ".into(),
+                    },
+                    // 危险/由下载器管理的头必须被丢弃
+                    HeaderKV {
+                        name: "Host".into(),
+                        value: "evil.example".into(),
+                    },
+                    HeaderKV {
+                        name: "Range".into(),
+                        value: "bytes=0-1".into(),
+                    },
+                    HeaderKV {
+                        name: "Cookie".into(),
+                        value: "sid=1".into(),
+                    },
+                    // CRLF 注入
+                    HeaderKV {
+                        name: "X-Test".into(),
+                        value: "ok\r\nX-Evil: 1".into(),
+                    },
+                    // 头名里带冒号/空格 = 解析歧义
+                    HeaderKV {
+                        name: "X Bad".into(),
+                        value: "1".into(),
+                    },
+                    HeaderKV {
+                        name: "X-Ok".into(),
+                        value: "1".into(),
+                    },
+                ],
+            }],
+            ..Settings::default()
+        };
+        s.normalize_header_presets();
+        assert_eq!(s.header_presets.len(), 1);
+        let p = &s.header_presets[0];
+        assert_eq!(p.host, "example.com");
+        assert_eq!(p.name, "预设 1");
+        let names: Vec<&str> = p.headers.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, vec!["Referer", "X-Ok"]);
+        assert_eq!(p.headers[0].value, "https://example.com/watch");
+    }
+
+    #[test]
+    fn global_preset_may_not_carry_authorization() {
+        let mut s = Settings {
+            header_presets: vec![HeaderPreset {
+                name: "global".into(),
+                host: "".into(),
+                headers: vec![
+                    HeaderKV {
+                        name: "Authorization".into(),
+                        value: "Bearer x".into(),
+                    },
+                    HeaderKV {
+                        name: "User-Agent".into(),
+                        value: "UA/1".into(),
+                    },
+                ],
+            }],
+            ..Settings::default()
+        };
+        s.normalize_header_presets();
+        assert_eq!(s.header_presets[0].headers.len(), 1);
+        assert_eq!(s.header_presets[0].headers[0].name, "User-Agent");
+
+        // 限定 host 时允许带 Authorization
+        s.header_presets[0].host = "api.example.com".into();
+        s.header_presets[0].headers.insert(
+            0,
+            HeaderKV {
+                name: "Authorization".into(),
+                value: "Bearer x".into(),
+            },
+        );
+        s.normalize_header_presets();
+        assert_eq!(s.header_presets[0].headers.len(), 2);
+    }
+
+    #[test]
+    fn headers_for_url_is_host_scoped_and_last_wins() {
+        let s = Settings {
+            header_presets: vec![
+                HeaderPreset {
+                    name: "global".into(),
+                    host: "".into(),
+                    headers: vec![HeaderKV {
+                        name: "User-Agent".into(),
+                        value: "global-UA".into(),
+                    }],
+                },
+                HeaderPreset {
+                    name: "site".into(),
+                    host: "example.com".into(),
+                    headers: vec![
+                        HeaderKV {
+                            name: "Referer".into(),
+                            value: "https://example.com/".into(),
+                        },
+                        HeaderKV {
+                            name: "User-Agent".into(),
+                            value: "site-UA".into(),
+                        },
+                    ],
+                },
+            ],
+            ..Settings::default()
+        };
+        // 精确 host 与子域都命中，后出现的预设覆盖同名头
+        let h = s.headers_for_url("https://cdn.example.com/a.bin");
+        assert_eq!(
+            h,
+            vec![
+                ("User-Agent".to_string(), "site-UA".to_string()),
+                ("Referer".to_string(), "https://example.com/".to_string()),
+            ]
+        );
+        // 相似域名不能命中
+        let h = s.headers_for_url("https://example.com.evil.test/a.bin");
+        assert_eq!(h, vec![("User-Agent".to_string(), "global-UA".to_string())]);
+        // query 里出现域名同样不算
+        let h = s.headers_for_url("https://evil.test/?x=example.com");
+        assert_eq!(h, vec![("User-Agent".to_string(), "global-UA".to_string())]);
+    }
+
+    #[test]
+    fn header_host_normalization_rejects_ambiguous_scopes() {
+        assert_eq!(normalize_header_host("").as_deref(), Some(""));
+        assert_eq!(
+            normalize_header_host("*.Example.com").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(normalize_header_host("example.com:8080"), None);
+        assert_eq!(normalize_header_host("https://example.com"), None);
+        assert_eq!(normalize_header_host("bad host"), None);
+        assert_eq!(normalize_header_host(".."), None);
+    }
+
+    #[test]
+    fn netcfg_scopes_custom_headers_and_flags_sensitive() {
+        let s = Settings {
+            header_presets: vec![HeaderPreset {
+                name: "api".into(),
+                host: "example.com".into(),
+                headers: vec![
+                    HeaderKV {
+                        name: "X-Api-Key".into(),
+                        value: "k".into(),
+                    },
+                    HeaderKV {
+                        name: "Referer".into(),
+                        value: "https://example.com/".into(),
+                    },
+                ],
+            }],
+            ..Settings::default()
+        };
+        let net = NetCfg::for_url(&s, "https://cdn.example.com/a.bin");
+        assert_eq!(net.custom.len(), 2);
+        assert!(net.has_sensitive_headers());
+
+        let net = NetCfg::for_url(&s, "https://other.test/a.bin");
+        assert!(net.custom.is_empty());
+        assert!(!net.has_sensitive_headers());
     }
 
     #[test]

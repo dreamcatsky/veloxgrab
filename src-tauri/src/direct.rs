@@ -57,7 +57,12 @@ pub struct DirectProgress {
 }
 
 /// 构造 HTTP 客户端。`proxy` 是 settings.proxy_url() 的结果（None = 直连）。
-fn client_with(proxy: Option<&str>) -> Result<reqwest::Client, String> {
+///
+/// `block_cross_host`：当前请求带有敏感自定义头（API key 等）时为 true。
+/// reqwest 只会自动剥掉 Authorization/Cookie，自定义凭证会原样带到下一跳；
+/// 我们没有「按跳改头」的钩子，所以跨站重定向直接拒绝——宁可报错，也不把
+/// token 交给第三方 CDN。用户把预设 host 限定到最终站点后即可正常下载。
+fn client_with(proxy: Option<&str>, block_cross_host: bool) -> Result<reqwest::Client, String> {
     let mut b = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) VeloxGrab/0.1")
         .connect_timeout(Duration::from_secs(20))
@@ -73,7 +78,7 @@ fn client_with(proxy: Option<&str>) -> Result<reqwest::Client, String> {
         // 边界要诚实：只拦 URL 字面量级别的违规。域名解析到内网（true SSRF）不防——
         // 每次跳转前做 DNS 预检既有 TOCTOU，又误伤「下载 NAS 上的文件」的正当用途：
         // 局域网/回环是刻意放行的，桌面下载器对用户的内网没有默认敌意。
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 10 {
                 return attempt.error("重定向次数过多");
             }
@@ -81,6 +86,16 @@ fn client_with(proxy: Option<&str>) -> Result<reqwest::Client, String> {
             // follow()/error() 要移动它，放在 match 分支里会撞上借用检查。
             let ok = match attempt.previous().last() {
                 Some(from) => {
+                    if block_cross_host
+                        && !from
+                            .host_str()
+                            .unwrap_or("")
+                            .eq_ignore_ascii_case(attempt.url().host_str().unwrap_or(""))
+                    {
+                        return attempt.error(
+                            "跨站重定向会携带敏感请求头，已阻止；请把请求头预设限定到目标站点",
+                        );
+                    }
                     redirect_is_allowed(from.as_str(), attempt.url().as_str()).is_ok()
                 }
                 None => true,
@@ -100,15 +115,35 @@ fn client_with(proxy: Option<&str>) -> Result<reqwest::Client, String> {
         .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))
 }
 
-/// 给请求附加按 host 作用域限定的认证头（目前只有 HuggingFace）。
+/// 给请求附加自定义头与按 host 作用域限定的认证头（目前只有 HuggingFace）。
 ///
+/// `NetCfg.custom` 已经在 `Settings::headers_for_url` 里按 host 过滤过，
+/// 这里再做一次头名/头值校验（纵深防御：设置文件可能被手改）。
 /// `NetCfg.auth` 可能出现在任何直链任务里，但只有 URL 的 host 命中作用域时
 /// 才真正带上——这是「token 跟着设置走」与「token 跟着请求走」的分界线。
-fn apply_auth(rb: reqwest::RequestBuilder, url: &str, net: &NetCfg) -> reqwest::RequestBuilder {
-    match net.auth.as_ref().and_then(|a| a.for_url(url)) {
-        Some(v) => rb.header(reqwest::header::AUTHORIZATION, v),
-        None => rb,
+fn apply_net(rb: reqwest::RequestBuilder, url: &str, net: &NetCfg) -> reqwest::RequestBuilder {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
+
+    if net.custom.is_empty() && net.auth.is_none() {
+        return rb;
     }
+    let mut map = HeaderMap::new();
+    for (name, value) in &net.custom {
+        let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) else {
+            continue;
+        };
+        // insert 而不是 append：同名头只保留最后一条，避免重复值
+        map.insert(n, v);
+    }
+    if let Some(v) = net.auth.as_ref().and_then(|a| a.for_url(url)) {
+        if let Ok(v) = HeaderValue::from_str(v) {
+            map.insert(AUTHORIZATION, v);
+        }
+    }
+    rb.headers(map)
 }
 
 /// 一个 URL 作为下载目标是否放行（初始 URL 与每一跳共用）。
@@ -336,7 +371,20 @@ fn store_probe(key: &str, probe: &DirectProbe) {
 /// 同一个 URL「带 token」与「不带 token」的结果完全不同（gated 仓库是 401 vs 200），
 /// 只按 URL 缓存会把一次 401 复用给刚填好 token 的下载，或反过来。
 fn probe_cache_key(url: &str, net: &NetCfg) -> String {
-    format!("{url}\u{1}{}", net.auth.is_some())
+    // 自定义头也会改变响应（防盗链站点的 Referer/UA 不同，结果可能 403 vs 200），
+    // 所以把「头名+头值」的指纹一并放进缓存键。用短哈希避免键太长。
+    let mut fp = String::new();
+    for (n, v) in &net.custom {
+        fp.push('\u{1}');
+        fp.push_str(n);
+        fp.push('=');
+        fp.push_str(v);
+    }
+    format!(
+        "{url}\u{1}{}\u{1}{}",
+        net.auth.is_some(),
+        crate::util::short_hash(&fp)
+    )
 }
 
 /// 轮询取消标志，供 `select!` 使用（AtomicBool 本身没有 await 接口）
@@ -380,7 +428,7 @@ pub async fn probe_direct(
 
 /// 实际的探测逻辑（无超时、无缓存），由 `probe_direct` 包装后调用。
 async fn probe_uncached(url: &str, net: &NetCfg) -> Result<DirectProbe, String> {
-    let c = client_with(net.proxy.as_deref())?;
+    let c = client_with(net.proxy.as_deref(), net.has_sensitive_headers())?;
 
     // HEAD 和 Range 探测并发发出，谁先回先用谁。
     //
@@ -396,7 +444,7 @@ async fn probe_uncached(url: &str, net: &NetCfg) -> Result<DirectProbe, String> 
     let head_fut = async {
         match tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            apply_auth(c.head(url), url, net).send(),
+            apply_net(c.head(url), url, net).send(),
         )
         .await
         {
@@ -405,7 +453,7 @@ async fn probe_uncached(url: &str, net: &NetCfg) -> Result<DirectProbe, String> 
         }
     };
     let range_fut = async {
-        apply_auth(c.get(url), url, net)
+        apply_net(c.get(url), url, net)
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send()
             .await
@@ -1070,7 +1118,7 @@ pub async fn download_direct(
     let total = info.total_bytes.unwrap_or(0);
     let threads = threads.clamp(1, MAX_THREADS);
     let use_multi = info.range_supported && total >= MIN_MULTI_THREAD_SIZE && threads > 1;
-    let c = client_with(net.proxy.as_deref())?;
+    let c = client_with(net.proxy.as_deref(), net.has_sensitive_headers())?;
 
     // 磁盘预检（单流分支）：分块下载的检查在读完断点信息之后做，因为续传
     // 只需要补差额。单流没有续传，需要的就是整个文件。
@@ -1372,7 +1420,7 @@ async fn download_single(
     use tokio::io::AsyncWriteExt;
     let rate_kb = net.rate_kb;
 
-    let resp = apply_auth(c.get(url), url, net)
+    let resp = apply_net(c.get(url), url, net)
         .send()
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
@@ -1789,7 +1837,10 @@ mod tests {
 
         // 覆盖模式直接使用原名；keep_both 仍递增
         assert_eq!(choose_final_target(&with_ext, true), with_ext);
-        assert_eq!(choose_final_target(&with_ext, false), dir.join("a.b.tar (1).gz"));
+        assert_eq!(
+            choose_final_target(&with_ext, false),
+            dir.join("a.b.tar (1).gz")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

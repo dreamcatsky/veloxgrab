@@ -873,6 +873,37 @@ input[type="number"]:focus { border-color: var(--accent); }
 .cat-row input { width: 100%; }
 .cat-row .icon-btn { justify-self: center; }
 
+/* ---------- 自定义请求头预设 ---------- */
+.hdr-presets { display: flex; flex-direction: column; gap: 10px; }
+.hdr-preset {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+}
+.hdr-row { display: grid; grid-template-columns: 1fr 1.4fr 30px; gap: 8px; align-items: center; }
+.hdr-row input { width: 100%; }
+.hdr-row .icon-btn { justify-self: center; }
+.hdr-headers {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 9px 11px;
+  font-size: 12.5px;
+  font-family: ui-monospace, Consolas, monospace;
+  line-height: 1.5;
+  outline: none;
+  resize: vertical;
+  user-select: text;
+}
+.hdr-headers:focus { border-color: var(--accent); }
+
 /* ---------- 另存为弹窗 ---------- */
 .overlay {
   position: fixed;

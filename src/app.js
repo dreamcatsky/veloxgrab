@@ -272,6 +272,9 @@
     nameConflictHint: "(overwrite only applies to files this app downloaded from the same link)",
     nameKeepBoth: "Keep both (auto rename)",
     nameOverwrite: "Overwrite existing file",
+    secHeaders: "Custom request headers",
+    headersNote: "For hotlink-protected sites add Referer / User-Agent; one Name: value per line. Empty host means all sites, where Authorization is not allowed. Host, Range, Cookie and other managed headers are ignored.",
+    headerAdd: "Add preset",
     popupSaveAs: 'Browser veloxgrab:// downloads ask "Save as" first',
     popupSaveAsHint: "(off: save straight to the default folder)",
     popupQuality: "Video sites: popup quality chooser",
@@ -1377,6 +1380,72 @@
       .filter((r) => r.folder && r.extensions.length);
   }
 
+  // 一套请求头预设 = 名称 + host 作用域 + 多行 `Name: value`。
+  // host 留空表示对所有站点生效；具体白名单/危险头过滤由后端做，
+  // 前端只负责把用户输入原样带过去。
+  function addHeaderPresetRow(preset) {
+    const card = el("div", "hdr-preset");
+    const row = el("div", "hdr-row");
+    const name = el("input");
+    name.type = "text";
+    name.className = "hdr-name";
+    name.value = (preset && preset.name) || "";
+    name.placeholder = "预设名称（可选）";
+    name.spellcheck = false;
+    const host = el("input");
+    host.type = "text";
+    host.className = "hdr-host";
+    host.value = (preset && preset.host) || "";
+    host.placeholder = "example.com（留空 = 所有站点）";
+    host.spellcheck = false;
+    const del = el("button", "icon-btn", "×");
+    del.type = "button";
+    del.title = "删除这套预设";
+    del.onclick = () => card.remove();
+    row.append(name, host, del);
+
+    const headers = el("textarea", "hdr-headers");
+    headers.rows = 4;
+    headers.spellcheck = false;
+    headers.placeholder = "Referer: https://example.com/\nUser-Agent: Mozilla/5.0 ...";
+    headers.value = Array.isArray(preset && preset.headers)
+      ? preset.headers.map((h) => `${h.name}: ${h.value}`).join("\n")
+      : "";
+
+    card.append(row, headers);
+    $("headerPresetRows").appendChild(card);
+  }
+
+  function renderHeaderPresets(presets) {
+    const box = $("headerPresetRows");
+    box.innerHTML = "";
+    const list = Array.isArray(presets) ? presets : [];
+    list.forEach((p) => addHeaderPresetRow(p));
+  }
+
+  function collectHeaderPresets() {
+    return Array.from($("headerPresetRows").querySelectorAll(".hdr-preset"))
+      .map((card) => {
+        const name = card.querySelector(".hdr-name").value.trim();
+        const host = card.querySelector(".hdr-host").value.trim();
+        const headers = String(card.querySelector(".hdr-headers").value || "")
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => line && !line.startsWith("#"))
+          .map((line) => {
+            const i = line.indexOf(":");
+            if (i <= 0) return null;
+            return {
+              name: line.slice(0, i).trim(),
+              value: line.slice(i + 1).trim(),
+            };
+          })
+          .filter((h) => h && h.name && h.value);
+        return { name, host, headers };
+      })
+      .filter((p) => p.headers.length);
+  }
+
   function fillSettingsForm(s) {
     $("setDownloadDir").value = s.download_dir || "";
     // 手动新建的默认目录：用户没填时用全局默认目录填空，省得每次都要想
@@ -1394,6 +1463,7 @@
     renderCategoryRules(s.categories || []);
     syncCategoryDetail();
     $("setNameConflict").value = s.name_conflict || "keep_both";
+    renderHeaderPresets(s.header_presets || []);
     $("setPopupSaveAs").checked = s.popup_save_as ?? true;
     $("setPopupQuality").checked = s.popup_quality ?? true;
     $("setAutoProgress").checked = s.auto_progress_popup ?? true;
@@ -1449,6 +1519,7 @@
       categories_enabled: $("setCategoriesEnabled").checked,
       categories: collectCategories(),
       name_conflict: $("setNameConflict").value,
+      header_presets: collectHeaderPresets(),
       auto_progress_popup: $("setAutoProgress").checked,
       autostart: $("setAutostart").checked,
       telemetry: $("setTelemetry").checked,
@@ -2308,6 +2379,7 @@
   $("setProxyEnabled").addEventListener("change", syncProxyDetail);
   $("setCategoriesEnabled").addEventListener("change", syncCategoryDetail);
   $("addCategoryRule").onclick = () => addCategoryRow(null);
+  $("addHeaderPreset").onclick = () => addHeaderPresetRow(null);
   $("setTheme").addEventListener("change", (e) => changeTheme(e.target.value));
 
   // 手动新建面板里按回车 = 开始下载

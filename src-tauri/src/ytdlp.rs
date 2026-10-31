@@ -189,6 +189,24 @@ pub fn push_common_args(cmd: &mut Command, settings: &Settings, with_cookies: bo
     if let Some(p) = settings.proxy_url() {
         cmd.arg("--proxy").arg(p);
     }
+    // 自定义请求头（防盗链 Referer / UA / API key）。yt-dlp 对 UA 和 Referer
+    // 有专门参数，其余走 --add-headers；这里只做映射，校验已在
+    // Settings::headers_for_url 里完成（白名单 + host 作用域）。
+    let hf_auth = settings.hf_token_trimmed().is_some() && crate::util::is_huggingface_url(url);
+    for (name, value) in settings.headers_for_url(url) {
+        // HuggingFace token 已经用同一头名注入，避免发出两条 Authorization
+        if hf_auth && name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("user-agent") {
+            cmd.arg("--user-agent").arg(value);
+        } else if name.eq_ignore_ascii_case("referer") {
+            cmd.arg("--referer").arg(value);
+        } else {
+            cmd.arg("--add-headers").arg(format!("{name}:{value}"));
+        }
+    }
+
     // HuggingFace：带 token 走 Authorization 头。
     //
     // 格式是 `--add-headers FIELD:VALUE`（旧文档里的 `--add-header`）。写成
@@ -595,6 +613,65 @@ mod tests {
         // 非法值不能当成有效码率
         assert_eq!(audio_score(Some(f64::NAN), None, None), (false, 0, 0));
         assert_eq!(audio_score(Some(-1.0), None, None), (false, 0, 0));
+    }
+
+    #[test]
+    fn custom_headers_map_to_ytdlp_flags() {
+        let settings = Settings {
+            header_presets: vec![crate::settings::HeaderPreset {
+                name: "site".into(),
+                host: "example.com".into(),
+                headers: vec![
+                    crate::settings::HeaderKV {
+                        name: "Referer".into(),
+                        value: "https://example.com/".into(),
+                    },
+                    crate::settings::HeaderKV {
+                        name: "User-Agent".into(),
+                        value: "UA/1".into(),
+                    },
+                    crate::settings::HeaderKV {
+                        name: "X-Api-Key".into(),
+                        value: "k".into(),
+                    },
+                    // 由下载器管理的头必须被过滤
+                    crate::settings::HeaderKV {
+                        name: "Host".into(),
+                        value: "evil.example".into(),
+                    },
+                ],
+            }],
+            ..Settings::default()
+        };
+        let mut cmd = Command::new("yt-dlp");
+        push_common_args(&mut cmd, &settings, false, "https://www.example.com/v");
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let value_after = |flag: &str| {
+            let i = args
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("缺少 {flag}"));
+            args[i + 1].clone()
+        };
+        assert_eq!(value_after("--referer"), "https://example.com/");
+        assert_eq!(value_after("--user-agent"), "UA/1");
+        assert!(args.iter().any(|a| a == "X-Api-Key:k"));
+        assert!(!args.iter().any(|a| a.contains("Host:evil.example")));
+
+        // 作用域外的 host 不应带任何自定义头
+        let mut other = Command::new("yt-dlp");
+        push_common_args(&mut other, &settings, false, "https://evil.test/v");
+        let args: Vec<String> = other
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(!args.iter().any(|a| a == "--referer"));
+        assert!(!args.iter().any(|a| a == "X-Api-Key:k"));
     }
 
     fn args_for(url: &str, token: &str) -> Vec<String> {

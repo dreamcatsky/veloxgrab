@@ -84,8 +84,8 @@ VeloxGrab 只做 http(s) 时，这些项的价值要打折——不能照着设�
 | 能力 | GD3 | VeloxGrab |
 |---|---|---|
 | 代理 | Auto / Off / 自定义 + 最近列表 | 手动 http/socks5 + 认证 |
-| 自定义请求头 | 有（多套预设，可切换） | 无 |
-| User-Agent | 可配（含身份预设按 host 匹配） | 写死 `Mozilla/5.0 … VeloxGrab/0.1` |
+| 自定义请求头 | 有（多套预设，可切换） | 有（多套预设，按 host 作用域；危险头白名单过滤） |
+| User-Agent | 可配（含身份预设按 host 匹配） | 可配（请求头预设里的 `User-Agent`，直链与 yt-dlp 都生效） |
 | 客户端指纹模拟 | 有（`clientProfile`） | 无 |
 | 每 host 凭证 | 身份预设按 host 注入 UA | 仅 HuggingFace `Authorization`（作用域校验） |
 | Cookie | 无（靠请求头预设塞） | 浏览器读取 / Netscape 文件，**按需降级** |
@@ -245,6 +245,16 @@ VeloxGrab 只做 http(s) 时，这些项的价值要打折——不能照着设�
   ——`HostAuth` 的作用域校验逻辑可以直接复用。
 - **验收**：带 Referer 的防盗链可下；跨 host 重定向不携带敏感头；非法头名被拒。
 - **工作量**：2 天。
+- **已落地（批次 B）**：`Settings.header_presets: Vec<HeaderPreset>`（`name` + `host` +
+  `headers`）。头名只放行 RFC 7230 token 字符，头值拒绝 CR/LF/NUL，`Host` /
+  `Range` / `Content-Length` / `Connection` / `Cookie` / `Accept-Encoding` 等由
+  下载器管理的头一律丢弃；空 host（全局）不允许 `Authorization`，最多 8 套预设、
+  每套 16 个头。`headers_for_url` 按 host（精确或子域）过滤，相似域名与 query
+  里的域名不算。直链在 `apply_net` 里统一注入探测 HEAD/Range 与分块/单流请求；
+  若命中敏感头（Authorization、`*token*`、`*api-key*` 等），跨站重定向直接拒绝，
+  避免凭证跟着 302 交给第三方 CDN。yt-dlp 侧映射为 `--user-agent` / `--referer` /
+  `--add-headers`，并在 HF token 已注入时跳过重复的 Authorization。设置页支持
+  增删预设、填 host 与多行 `Name: value`。
 
 #### P0-8 磁盘空间预检
 - **现状**：无，3 GB 的文件下到 99% 才报错。

@@ -295,6 +295,18 @@
             </select>
           </label>
 
+          <h3 class="sec-title" data-i18n="secHeaders">自定义请求头</h3>
+
+          <div class="hdr-presets">
+            <small class="dim" data-i18n="headersNote">防盗链站点可加 Referer / User-Agent；每行一条 <code>Name: value</code>。host 留空表示所有站点，此时不允许 Authorization。Host、Range、Cookie 等由下载器管理的头会被忽略。</small>
+            <div id="headerPresetRows"></div>
+            <div class="inline">
+              <button id="addHeaderPreset" class="ghost" type="button">
+                <span data-i18n="headerAdd">添加预设</span>
+              </button>
+            </div>
+          </div>
+
           <h3 class="sec-title" data-i18n="secBehavior">弹窗与行为</h3>
 
           <label class="fld checkbox">
