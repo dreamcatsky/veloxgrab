@@ -569,6 +569,76 @@ fn try_acquire_slot(running: &AtomicU64, max: usize) -> bool {
     }
 }
 
+/// worker 兜底：`run_download` / `run_direct_download` 返回 Err 但任务仍停在
+/// 中间态时，强制落 Failed。
+///
+/// 两个执行器的**常规失败分支**会自己写 Failed 并 emit，但所有 `?` 早退路径
+/// ——`resolve_ytdlp`（yt-dlp 缺失/被杀软隔离）、`resolve_task_dir`（移动硬盘
+/// 拔出、目录权限变化）、`cmd.spawn`、`child.wait`——发生在任何状态写入之前，
+/// 错误串随返回值被 `let _ =` 丢弃。后果：任务永远停在「下载中」，进度 0，
+/// 错误不可见；resume/redo 都拒绝非可恢复态，只有重启能解套。
+///
+/// 写入条件刻意收紧，避免覆盖别人已落好的状态：
+/// - 令牌 ptr_eq：归属校验，防止把「恢复后新一轮」的下载误标成失败；
+/// - 状态仍是中间态（Queued/Downloading/Merging）：终态/暂停说明引擎或停止
+///   命令已经写过状态（它们同样可能返回 Err，比如「已取消」）。
+async fn force_fail_unfinished(
+    app: &tauri::AppHandle,
+    tasks: engine::SharedTasks,
+    tokens: engine::SharedTokens,
+    id: &str,
+    token: &Arc<CancelToken>,
+    err: &str,
+) {
+    use tauri::Emitter;
+
+    // 与 engine 失败分支同一上限：错误串可能带整段 yt-dlp stderr
+    let msg: String = err.chars().take(1200).collect();
+    let written = {
+        // 锁序与泵一致：tasks → tokens。
+        let mut guard = tasks.lock().await;
+        let still_ours = tokens
+            .lock()
+            .await
+            .get(id)
+            .map(|cur| Arc::ptr_eq(cur, token))
+            .unwrap_or(false);
+        match guard.get_mut(id) {
+            Some(t)
+                if still_ours
+                    && matches!(
+                        t.state,
+                        TaskState::Queued | TaskState::Downloading | TaskState::Merging
+                    ) =>
+            {
+                t.state = TaskState::Failed;
+                t.error = Some(msg.clone());
+                t.speed = None;
+                t.eta = None;
+                crate::history::upsert_entry(t);
+                true
+            }
+            _ => false,
+        }
+    };
+    if written {
+        let _ = app.emit(
+            "task-progress",
+            &engine::ProgressEvent {
+                id: id.to_string(),
+                state: TaskState::Failed,
+                progress: 0.0,
+                downloaded_bytes: 0,
+                total_bytes: None,
+                speed: None,
+                eta: None,
+                error: Some(msg),
+                output_path: None,
+            },
+        );
+    }
+}
+
 /// 队列泵：在并发限额内尽量多启动任务。
 ///
 /// 返回 `Pin<Box<dyn Future>>` 而不是直接 `async fn`：任务结束时需要再次调用自己，
@@ -684,23 +754,48 @@ pub fn pump_queue(
                     let _slot = slot;
 
                     if task_c.kind == "direct" {
-                        let _ = engine::run_direct_download(
+                        if let Err(e) = engine::run_direct_download(
                             app_c.clone(),
                             task_c.clone(),
                             settings,
                             token.clone(),
                             ctx_c.tasks.clone(),
                         )
-                        .await;
+                        .await
+                        {
+                            // 常规失败分支之外的 `?` 早退（yt-dlp 缺失、目录失效等）
+                            // 不会自己写状态，这里兜底落 Failed，任务才不会永远
+                            // 卡在「下载中」。
+                            force_fail_unfinished(
+                                &app_c,
+                                ctx_c.tasks.clone(),
+                                ctx_c.tokens.clone(),
+                                &task_c.id,
+                                &token,
+                                &e,
+                            )
+                            .await;
+                        }
                     } else {
-                        let _ = engine::run_download(
+                        if let Err(e) = engine::run_download(
                             app_c.clone(),
                             task_c.clone(),
                             settings,
                             token.clone(),
                             ctx_c.tasks.clone(),
                         )
-                        .await;
+                        .await
+                        {
+                            force_fail_unfinished(
+                                &app_c,
+                                ctx_c.tasks.clone(),
+                                ctx_c.tokens.clone(),
+                                &task_c.id,
+                                &token,
+                                &e,
+                            )
+                            .await;
+                        }
                     }
 
                     // 只摘「这一轮自己的」令牌：resume→泵可能在本 worker 收尾之前

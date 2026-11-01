@@ -106,13 +106,17 @@ pub(crate) fn lexically_inside(root: &Path, cand: &Path) -> bool {
 /// 尾段里若还藏着 `..` 已在词法级被拒（lexically_inside），这里只剩新建目录名。
 fn canonicalize_best_effort(p: &Path) -> Option<PathBuf> {
     if let Ok(c) = p.canonicalize() {
-        return Some(c);
+        // canonicalize 在 Windows 上返回 `\\?\` verbatim 拼写：不剥的话，这个
+        // 结果一旦经 finalize 持久化（task.save_dir / trusted_dirs），与普通
+        // 拼写的根做词法比较永远失配——手选子目录静默回落默认根、信任过的
+        // 目录反复弹确认框。所有出口统一还原为普通拼写。
+        return Some(crate::util::strip_verbatim_prefix(&c));
     }
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = p;
     loop {
         if let Ok(base) = cur.canonicalize() {
-            let mut out = base;
+            let mut out = crate::util::strip_verbatim_prefix(&base);
             for seg in tail.iter().rev() {
                 out.push(seg);
             }
@@ -479,5 +483,60 @@ mod tests {
         assert!(find_file_for_broken_path(&too_short, &base).is_none());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 回归：canonicalize 的 verbatim（`\\?\`）拼写不得污染持久化与闸门判定。
+    ///
+    /// 历史缺陷：`finalize` 把 `\\?\C:\...` 原样写进 task.save_dir /
+    /// trusted_dirs，而闸门比较是纯词法——`\\?\C:` 与 `C:` 永远不等。后果：
+    /// 手选的根内子目录在下载时被判越界、静默回落默认根；经确认框批准的
+    /// 目录下次以普通拼写传入时重新弹框。修复：canonicalize 出口统一剥
+    /// verbatim 前缀，词法折叠入口也剥（兼容已持久化的旧 verbatim 串）。
+    #[test]
+    #[cfg(windows)]
+    fn verbatim_canonicalize_output_stays_comparable() {
+        let dir = std::env::temp_dir().join(format!("vxg_verbatim_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 根用普通拼写（模拟 settings.json 里存的下载目录），
+        // canonicalize 产物是 verbatim（模拟经 finalize 持久化的 save_dir）。
+        let root_plain = dir.clone();
+        let root_canon = dir.canonicalize().unwrap();
+        assert!(
+            root_canon
+                .as_os_str()
+                .to_string_lossy()
+                .starts_with(r"\\?\"),
+            "测试前提：canonicalize 返回 verbatim 拼写"
+        );
+
+        // 1) finalize 的输出必须可回写、可比较：不再带 verbatim 前缀
+        //    （目标不存在，顺便覆盖「最近存在祖先 + 尾段」的 best-effort 路径）
+        let sub = dir.join("手动子目录");
+        let finalized = finalize(&sub).unwrap();
+        assert!(
+            !finalized.starts_with(r"\\?\"),
+            "finalize 不得落盘 verbatim 串: {finalized}"
+        );
+
+        // 2) verbatim 候选（旧数据里的 save_dir）对普通拼写根必须判「根内」
+        let cand_verbatim = root_canon.join("sub");
+        assert!(
+            is_inside(&root_plain, &cand_verbatim),
+            "verbatim 拼写的根内子目录不得被判越界"
+        );
+
+        // 3) 信任集里的 verbatim 条目必须命中普通拼写的输入；反向亦然
+        let trusted_verbatim = vec![root_canon.join("approved").to_string_lossy().to_string()];
+        let fresh = dir.join("approved");
+        assert!(
+            is_trusted(&root_plain, &trusted_verbatim, &fresh),
+            "已批准过的目录不得因拼写差异重新弹确认框"
+        );
+        let trusted_plain = vec![fresh.to_string_lossy().to_string()];
+        assert!(is_trusted(&root_plain, &trusted_plain, &root_canon.join("approved")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1412,32 +1412,57 @@
   }
 
   // 全量同步：只在启动、切换视图、增删任务时调用
+  //
+  // 与 task-progress 增量通道的竞态防护（两条都要）：
+  //  - refreshGen 递增代号：两轮全量刷新并发时，晚发出却先返回的快照先落地，
+  //    晚返回的旧快照会被代号检查丢弃，不会把新状态打回去。
+  //  - refreshDirty：快照在途时收到过 task-progress 事件，说明这份快照
+  //    （invoke 时刻取的数）必然不包含该事件——落地后补刷一轮，否则「暂停」
+  //    等状态跃迁会被旧快照回退成「下载中」，而进入暂停/终态的任务不再发
+  //    任何事件，错误状态永远无法自愈。
+  let refreshGen = 0;
+  let refreshInFlight = false;
+  let refreshDirty = false;
+
   async function refreshTasks() {
+    const gen = ++refreshGen;
+    refreshInFlight = true;
     try {
       const list = await invoke("list_tasks");
-      taskMap = new Map(list.map((t) => [t.id, t]));
+      if (gen === refreshGen) {
+        taskMap = new Map(list.map((t) => [t.id, t]));
 
-      const host = $("taskList");
-      host.innerHTML = "";
-      const visible = list.filter(matchView);
-      visible.forEach((t) => host.appendChild(renderTask(t)));
+        const host = $("taskList");
+        host.innerHTML = "";
+        const visible = list.filter(matchView);
+        visible.forEach((t) => host.appendChild(renderTask(t)));
 
-      // 空态提示按视图换措辞：分类里空着说「还没有下载任务」会让人
-      // 以为任务没了，其实只是这个分类下没有。
-      const empty = $("listEmpty");
-      empty.classList.toggle("hidden", visible.length > 0);
-      // 列表容器和空提示都带 flex:1，同时可见会各占一半高度，
-      // 空提示就跑到屏幕中间偏上了。有任务时把空提示藏掉，没任务时把
-      // 列表容器藏掉，让留下的那个吃满高度。
-      host.classList.toggle("hidden", visible.length === 0);
-      empty.textContent =
-        currentView === "all"
-          ? "还没有下载任务。点「添加URL」或使用浏览器嗅探。"
-          : "这个分类下还没有任务。";
+        // 空态提示按视图换措辞：分类里空着说「还没有下载任务」会让人
+        // 以为任务没了，其实只是这个分类下没有。
+        const empty = $("listEmpty");
+        empty.classList.toggle("hidden", visible.length > 0);
+        // 列表容器和空提示都带 flex:1，同时可见会各占一半高度，
+        // 空提示就跑到屏幕中间偏上了。有任务时把空提示藏掉，没任务时把
+        // 列表容器藏掉，让留下的那个吃满高度。
+        host.classList.toggle("hidden", visible.length === 0);
+        empty.textContent =
+          currentView === "all"
+            ? "还没有下载任务。点「添加URL」或使用浏览器嗅探。"
+            : "这个分类下还没有任务。";
 
-      updateSummary();
+        updateSummary();
+      }
     } catch (e) {
       // 静默
+    } finally {
+      // 只有仍是「最新一轮」才清在途标记：旧快照晚到时，在途的是新一轮。
+      if (gen === refreshGen) {
+        refreshInFlight = false;
+        if (refreshDirty) {
+          refreshDirty = false;
+          scheduleRefresh();
+        }
+      }
     }
   }
 
@@ -2614,6 +2639,10 @@
   if (listen) {
     listen("task-progress", (evt) => {
       const p = evt.payload;
+      // 全量快照在途时收到增量：这份快照（取数早于本事件）落地后会把本事件
+      // 打回去。记 dirty 让 refreshTasks 落地后补刷一轮——否则暂停/终态这类
+      // 不再发后续事件的跃迁会被旧快照永久回退（见 refreshTasks 的竞态注释）。
+      if (refreshInFlight) refreshDirty = true;
       const prev = taskMap.get(p.id) || {};
 
       // 事件里的 null 表示「本轮没有这一项」，不能覆盖已有值：

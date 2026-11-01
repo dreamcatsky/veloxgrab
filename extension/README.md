@@ -78,9 +78,9 @@ VeloxGrab 启动时在 `127.0.0.1:58943` 起一个极小的 HTTP 服务
 | `storage` | 记住你填过的目录、线程数、接管开关 |
 | `downloads` | **拦截浏览器下载**（`onCreated` → `cancel` → 转给 VeloxGrab） |
 | `notifications` | 转交成功 / VeloxGrab 未运行时提示 |
-| `<all_urls>` | 扫描页面里的媒体直链 |
 
-脚本只用 `scripting.executeScript` 抓当前页的 `video/audio/img/a[href]`，
+脚本只用 `scripting.executeScript`（`activeTab` 授权：点开弹窗那一刻才对当前标签页生效）
+抓当前页的 `video/audio/img/a[href]`，
 不上传任何数据，不与任何第三方通信。唯一的网络请求是 `127.0.0.1:58943`
 （VeloxGrab 自己）。
 

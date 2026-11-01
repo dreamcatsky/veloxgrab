@@ -673,7 +673,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 async fn download_segment(
     c: reqwest::Client,
     url: String,
-    auth: Option<String>,
+    net: NetCfg,
     start: u64,
     end: u64,
     total: u64,
@@ -681,7 +681,6 @@ async fn download_segment(
     already_done: u64,
     counters: Arc<SegCounters>,
     seg_index: usize,
-    rate_kb: u64,
     cancel: Arc<AtomicBool>,
 ) -> Result<u64, String> {
     let seg_len = end - start + 1;
@@ -690,12 +689,12 @@ async fn download_segment(
     }
     let from = start + already_done;
 
-    let mut rb = c
-        .get(&url)
+    // 与探测/单流同源走 apply_net：自定义请求头（Referer/Origin 等）与 host
+    // 作用域认证头在这里一并带上。之前只有探测和单流走 apply_net，分块请求
+    // 裸奔——防盗链站点探测 206、分块 403，表现为「一开多线程就失败」。
+    // apply_net 内部同样按 URL 判定 auth 作用域，语义与旧的独立 auth 参数一致。
+    let rb = apply_net(c.get(&url), &url, &net)
         .header(reqwest::header::RANGE, format!("bytes={from}-{end}"));
-    if let Some(v) = auth {
-        rb = rb.header(reqwest::header::AUTHORIZATION, v);
-    }
     let resp = rb
         .send()
         .await
@@ -766,7 +765,7 @@ async fn download_segment(
             // 限速按「已下载的字节」计：数据已经收进内存，先过闸再落盘。
             // 放在 write 前而不是 stream 里，是为了只在每 256 KiB 抢一次全局锁，
             // 而不是每个 8 KiB 流块抢一次。
-            rate_wait(rate_kb, buf.len() as u64).await;
+            rate_wait(net.rate_kb, buf.len() as u64).await;
             file.write_all(&buf)
                 .await
                 .map_err(|e| format!("写入失败: {e}"))?;
@@ -782,7 +781,7 @@ async fn download_segment(
     // 收尾：缓冲区里剩下的也写掉（取消时同样要写，这些字节已经收下了，
     // 不写就等于白下载，而且 written 与磁盘内容会不一致）
     if !buf.is_empty() {
-        rate_wait(rate_kb, buf.len() as u64).await;
+        rate_wait(net.rate_kb, buf.len() as u64).await;
         file.write_all(&buf)
             .await
             .map_err(|e| format!("写入失败: {e}"))?;
@@ -1300,26 +1299,21 @@ pub async fn download_direct(
     };
 
     let mut handles = Vec::with_capacity(ranges.len());
-    // 每个分块都要带认证头，但 host 判定只做一次：所有段共用同一个 URL
-    let auth = net
-        .auth
-        .as_ref()
-        .and_then(|a| a.for_url(url))
-        .map(str::to_string);
     for (i, (s, e)) in ranges.iter().enumerate() {
         let start = *s;
         let end = *e;
         let done = counters.bytes[i].load(Ordering::Relaxed);
         let c2 = c.clone();
         let url2 = url.to_string();
-        let auth2 = auth.clone();
+        // 请求头跟着 net 走（自定义头 + host 作用域认证头，作用域判定按本段
+        // 共用的同一个 URL 做），每个分块一份克隆。
+        let net2 = net.clone();
         let path2 = target.clone();
         let counters2 = counters.clone();
         let cancel2 = cancel.clone();
-        let rate = net.rate_kb;
         handles.push(tauri::async_runtime::spawn(async move {
             download_segment(
-                c2, url2, auth2, start, end, total, path2, done, counters2, i, rate, cancel2,
+                c2, url2, net2, start, end, total, path2, done, counters2, i, cancel2,
             )
             .await
         }));

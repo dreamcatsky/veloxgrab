@@ -166,6 +166,31 @@ pub fn ext_of_name(name: &str) -> Option<String> {
     normalize_ext(ext)
 }
 
+/// 剥掉 Windows 的 verbatim（`\\?\`）前缀，还原为普通 Win32 拼写。
+///
+/// `std::fs::canonicalize` 在 Windows 上返回 `\\?\C:\Users\...`，UNC 返回
+/// `\\?\UNC\server\share\...`。这个拼写一旦持久化（settings.json 的
+/// `trusted_dirs`、任务的 `save_dir`），再与用户/设置里书写的普通路径做
+/// **词法**比较时永远不相等——前缀分量 `\\?\C:` 与 `C:` 是两个不同的
+/// Component，目录闸门与信任集会整体静默失配。所有「canonicalize 结果要
+/// 与外部字符串比较或持久化」的场合都必须先过这里。
+pub(crate) fn strip_verbatim_prefix(p: &Path) -> std::path::PathBuf {
+    if !cfg!(windows) {
+        return p.to_path_buf();
+    }
+    let s = p.as_os_str().to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        // verbatim UNC → 普通 UNC（`\\server\share`）
+        let mut out = String::from(r"\\");
+        out.push_str(rest);
+        std::path::PathBuf::from(out)
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
+
 /// 目录闸门的路径词法折叠：消化 `.`、就地折叠 `..`，并报告是否发生「上跳出根」。
 ///
 /// 为什么必须有这一步：**尚未创建的目录 `canonicalize()` 会失败**，而深链
@@ -178,9 +203,13 @@ pub fn ext_of_name(name: &str) -> Option<String> {
 ///
 /// 这是纵深第一层（纯词法，可单测、不碰文件系统）；第二层在调用方：拿真实
 /// 文件系统 canonicalize 最近的存在祖先再做前缀比对，兜住软链/junction 重定向。
-/// 盘符与 UNC 前缀原样保留；相对路径保留相对性（相对根解析由调用方负责）。
+/// 盘符与 UNC 前缀原样保留（canonicalize 的 verbatim 拼写除外——入口先剥，
+/// 见 `strip_verbatim_prefix`：不剥的话持久化下来的 verbatim 串永远比不过
+/// 普通拼写的根与信任集）；相对路径保留相对性（相对根解析由调用方负责）。
 pub fn fold_path_lexically(p: &Path) -> (std::path::PathBuf, bool) {
     use std::path::{Component, PathBuf};
+
+    let p = &strip_verbatim_prefix(p);
 
     let mut out = PathBuf::new();
     let mut escaped_up = false;
