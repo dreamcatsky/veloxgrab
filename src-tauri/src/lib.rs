@@ -323,6 +323,7 @@ pub fn run() {
             commands::clipboard_url,
             commands::copy_text,
             commands::hide_main_window,
+            commands::window_control,
             commands::quit_app,
             commands::set_plan,
             commands::get_plan,

@@ -12,7 +12,7 @@
   <!-- 菜单栏（对齐 IDM 的五大项 + 二级菜单）。
        用 HTML 自绘而不是 tauri::Menu：原生菜单画在 webview 之外的窗口客户区，
        既吃不到本程序的深色主题（Windows 上会是浅色一块），也没法在截图里验证。 -->
-  <nav class="menubar" id="menubar">
+  <nav class="menubar" id="menubar" data-tauri-drag-region>
     <!-- 18px 品牌标记：应用名已在系统标题栏，这里只留识别标记 -->
     <div class="brand" aria-hidden="true">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
@@ -74,6 +74,24 @@
     </div>
 
     <span id="menuSelHint" class="menu-sel-hint"></span>
+
+    <!-- 自绘标题栏（decorations:false 后原生框没了）：
+         菜单栏整行在 nav 上挂了拖拽区属性（只命中 nav 自身的空白处，
+         按钮/菜单不受影响，双击空白 = 最大化/还原），右侧补回窗口控制按钮。
+         close 必须走 window_control 的 "close"——它调窗口的 close()，
+         让 close_mode（询问/最小化/退出）语义继续生效，而不是直接退出。 -->
+    <div class="wincontrols" role="group" aria-label="窗口控制">
+      <button class="winbtn" id="winMin" title="最小化" tabindex="-1">
+        <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M0 5h10" stroke="currentColor" stroke-width="1" /></svg>
+      </button>
+      <button class="winbtn" id="winMax" title="最大化 / 还原" tabindex="-1">
+        <svg class="ic-max" viewBox="0 0 10 10" aria-hidden="true"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1" /></svg>
+        <svg class="ic-restore" viewBox="0 0 10 10" aria-hidden="true"><rect x="0.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1" /><path d="M2.5 2.5v-2h7v7h-2" fill="none" stroke="currentColor" stroke-width="1" /></svg>
+      </button>
+      <button class="winbtn winbtn-close" id="winClose" title="关闭" tabindex="-1">
+        <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M0 0l10 10M10 0L0 10" stroke="currentColor" stroke-width="1" /></svg>
+      </button>
+    </div>
   </nav>
 
   <!-- 图标工具栏（第二排）：对齐 TDM Fast 的「图标 + 下方文字」。

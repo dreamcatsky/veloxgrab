@@ -202,6 +202,37 @@ body {
 }
 .brand svg { width: 10px; height: 10px; color: var(--on-accent); }
 
+/* ---------- 自绘标题栏（decorations:false） ----------
+   原生框去掉后，菜单栏整行就是标题栏：nav 挂 data-tauri-drag-region，
+   只命中 nav 自身的空白处（Tauri 按事件 target 判定，按钮/菜单不受影响），
+   双击空白 = 最大化/还原，按住空白 = 拖动窗口；边缘缩放由 tao 的
+   无边框窗口命中测试提供。右侧三个按钮补回最小化/最大化/关闭。 */
+.wincontrols {
+  margin-left: 6px;
+  display: flex;
+  align-self: stretch;
+  flex-shrink: 0;
+}
+.winbtn {
+  width: 44px;
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  display: grid;
+  place-items: center;
+  padding: 0;
+  cursor: default;
+  border-radius: 0;
+}
+.winbtn svg { width: 10px; height: 10px; }
+.winbtn:hover { background: var(--hover); color: var(--text); }
+/* 关闭按钮按 Windows 惯例悬停变红 */
+.winbtn-close:hover { background: #e81123; color: #fff; }
+/* 最大化状态切换两枚图标（body.is-max 由 app.js 维护） */
+#winMax .ic-restore { display: none; }
+body.is-max #winMax .ic-max { display: none; }
+body.is-max #winMax .ic-restore { display: block; }
+
 .menu { position: relative; display: flex; }
 
 .menu-btn {

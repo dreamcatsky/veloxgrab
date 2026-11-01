@@ -2193,6 +2193,42 @@ pub fn hide_main_window(app: tauri::AppHandle) {
     }
 }
 
+/// 自绘标题栏的窗口控制（decorations:false 后原生按钮没了）。
+///
+/// 返回动作后的最大化状态，前端据此切换最大化/还原图标；`query` 只查不改，
+/// 供 resize 事件兜底刷新（拖拽区双击、Win+方向键贴靠走的都是系统路径，
+/// 前端按钮感知不到，只能靠事件 + 查询）。
+///
+/// `close` 走窗口的 `close()` 而不是 hide/exit：`on_window_event` 的
+/// CloseRequested 处理器里挂着 close_mode（询问/最小化到托盘/直接退出）
+/// 语义，自绘关闭按钮必须复用同一条路。
+#[tauri::command]
+pub fn window_control(app: tauri::AppHandle, action: String) -> Result<bool, String> {
+    use tauri::Manager;
+    let Some(w) = app.get_webview_window("main") else {
+        return Err("主窗口不存在".into());
+    };
+    match action.as_str() {
+        "minimize" => {
+            let _ = w.minimize();
+        }
+        "maximize_toggle" => {
+            if w.is_maximized().unwrap_or(false) {
+                let _ = w.unmaximize();
+            } else {
+                let _ = w.maximize();
+            }
+        }
+        "close" => {
+            let _ = w.close();
+        }
+        // 只查询
+        "query" => {}
+        _ => return Err(format!("未知窗口动作: {action}")),
+    }
+    Ok(w.is_maximized().unwrap_or(false))
+}
+
 /// 真正退出程序。
 ///
 /// 走 `app.exit(0)` 而不是 `std::process::exit`：前者会触发 `ExitRequested`，

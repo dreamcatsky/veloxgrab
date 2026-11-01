@@ -2566,6 +2566,34 @@
   };
 
   // ---------- 事件绑定 ----------
+  // ---------- 自绘标题栏的窗口控制（decorations:false） ----------
+  function applyMaxIcon(max) {
+    document.body.classList.toggle("is-max", !!max);
+  }
+  $("winMin").onclick = () => invoke("window_control", { action: "minimize" }).catch(() => {});
+  $("winMax").onclick = () =>
+    invoke("window_control", { action: "maximize_toggle" })
+      .then(applyMaxIcon)
+      .catch(() => {});
+  // close 走后端窗口 close()：CloseRequested 处理器里的 close_mode
+  // （询问/最小化到托盘/退出）必须继续生效，这里绝不直接调 quit。
+  $("winClose").onclick = () => invoke("window_control", { action: "close" }).catch(() => {});
+  // 拖拽区双击最大化、Win+方向键贴靠、任务栏还原都会改最大化状态，
+  // 用 resize 事件兜底刷图标（高频事件，150ms 节流）。
+  let maxIconTimer = null;
+  if (listen) {
+    listen("tauri://resize", () => {
+      if (maxIconTimer) return;
+      maxIconTimer = setTimeout(() => {
+        maxIconTimer = null;
+        invoke("window_control", { action: "query" })
+          .then(applyMaxIcon)
+          .catch(() => {});
+      }, 150);
+    });
+  }
+  invoke("window_control", { action: "query" }).then(applyMaxIcon).catch(() => {});
+
   $("parseBtn").onclick = doParse;
   $("urlInput").addEventListener("keydown", (e) => {
     // Enter 走与按钮同一个 disabled 守卫：IPC 往返窗口内连按 Enter
