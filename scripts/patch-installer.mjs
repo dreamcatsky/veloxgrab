@@ -305,11 +305,13 @@ if (fs.existsSync(outputExe) && detectSignature(outputExe) === "signed") {
 let patched = 0;
 let rebuilt = 0;
 for (const d of dirs) {
-  // /DARCH=x64 是硬编码的：非 x86_64 目录若也走重打包，会用 x64 的 nsi 产出
-  // 错架构包还写同一个输出文件名（后者静默覆盖前者）。跳过并明说。
+  // /DARCH=x64 是硬编码的：非 x64 目录若也走重打包，会用 x64 的 nsi 产出
+  // 错架构包还写同一个输出文件名（后者静默覆盖前者）。tauri 的目录名实测是
+  // `x64`（早期评审误以为是 target triple `x86_64-pc-windows-msvc`）——
+  // 两种写法都认，其余架构明确跳过。
   const arch = path.basename(d);
-  if (!arch.includes("x86_64")) {
-    console.warn(`  [skip] ${arch}：本脚本按 x64 处理（/DARCH=x64），跳过非 x86_64 目录`);
+  if (!/^(x64|x86_64)/i.test(arch)) {
+    console.warn(`  [skip] ${arch}：本脚本按 x64 处理（/DARCH=x64），跳过非 x64 目录`);
     continue;
   }
   console.log(`patch ${d}`);
