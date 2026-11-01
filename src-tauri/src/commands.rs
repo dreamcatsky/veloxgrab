@@ -1798,7 +1798,7 @@ async fn remove_one(state: &AppState, id: &str, delete_files: bool) -> RemoveOut
                     .unwrap_or_else(|_| std::path::PathBuf::from(&settings.download_dir));
                 if let Some(out) = task.output_path.as_deref() {
                     match delete_output_file(out, &dir) {
-                        Ok(()) => outcome.file_deleted = true,
+                        Ok(deleted) => outcome.file_deleted = deleted,
                         Err(why) => {
                             // 文件没删掉 → 任务一个字都不动，直接带着原因返回。
                             // 用户重试时走的还是同一条路径，问题解决后即可成功。
@@ -1860,10 +1860,13 @@ async fn remove_one(state: &AppState, id: &str, delete_files: bool) -> RemoveOut
 
 /// 删除一个任务的成品文件，返回面向用户的失败原因。
 ///
+/// 返回值表示**这次是否真的删掉了文件**：文件早已不存在时返回 `Ok(false)`，
+/// 让调用方把任务记录正常移除，同时不把「本来就没有的文件」算进删除计数。
+///
 /// 三层处理：精确路径 → 编码损坏的兜底查找 → 明确报错。
 /// 单独抽出来是因为它同时要照顾「路径合法但文件被占用」和
 /// 「路径本身是坏的（历史遗留 cp936 编码）」两类情况。
-fn delete_output_file(output_path: &str, task_dir: &std::path::Path) -> Result<(), String> {
+fn delete_output_file(output_path: &str, task_dir: &std::path::Path) -> Result<bool, String> {
     let target = match save_dir::check_deletable_file(output_path, task_dir) {
         Ok(p) => p,
         Err(why) => {
@@ -1872,6 +1875,10 @@ fn delete_output_file(output_path: &str, task_dir: &std::path::Path) -> Result<(
             // 这些任务的 output_path 指向一个不存在的文件。
             match save_dir::find_file_for_broken_path(output_path, task_dir) {
                 Some(p) => p,
+                // 文件本来就不在了（用户手工删过）：没有东西可删，算成功。
+                // 必须在救援路径之后判断——坏编码路径的真实文件可能还在盘上，
+                // 先按「不存在」放行会把任务删掉、文件却留下。
+                None if file_is_gone(output_path) => return Ok(false),
                 None => {
                     let name = std::path::Path::new(output_path)
                         .file_name()
@@ -1884,9 +1891,9 @@ fn delete_output_file(output_path: &str, task_dir: &std::path::Path) -> Result<(
     };
 
     match std::fs::remove_file(&target) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         // 已经不在了：用户要的结果已经达成，不算失败
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => {
             let name = target
                 .file_name()
@@ -1895,6 +1902,20 @@ fn delete_output_file(output_path: &str, task_dir: &std::path::Path) -> Result<(
             Err(format!("{name}：{e}（可能正被其他程序占用）"))
         }
     }
+}
+
+/// 路径是否**确实不存在**（而不是没有权限 / 不是文件）。
+///
+/// 只认绝对路径：相对路径在 `check_deletable_file` 里本来就该被拒绝，
+/// 不能因为「当前目录下没有」就当成用户已经删掉、放行删任务。
+fn file_is_gone(output_path: &str) -> bool {
+    if !std::path::Path::new(output_path).is_absolute() {
+        return false;
+    }
+    matches!(
+        std::fs::symlink_metadata(output_path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 /// 清空所有任务（不分状态），同时删掉各自的临时文件。
@@ -2180,4 +2201,64 @@ pub async fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| format!("打开进度窗口失败: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vg-delete-{}-{}-{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 用户手工删掉成品后，「连文件一起删」不能因为文件不存在就卡住任务。
+    #[test]
+    fn delete_output_file_accepts_already_missing_file() {
+        let dir = temp_dir("missing");
+        let out = dir.join("gone.mp4");
+        assert_eq!(delete_output_file(out.to_str().unwrap(), &dir), Ok(false));
+        assert!(!out.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_output_file_still_removes_existing_file() {
+        let dir = temp_dir("existing");
+        let out = dir.join("keep.mp4");
+        std::fs::write(&out, b"x").unwrap();
+        assert_eq!(delete_output_file(out.to_str().unwrap(), &dir), Ok(true));
+        assert!(!out.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 目录闸门不能被「文件不存在」这条捷径绕过：越界且存在的文件仍拒绝。
+    #[test]
+    fn delete_output_file_rejects_existing_file_outside_task_dir() {
+        let dir = temp_dir("inside");
+        let outside = temp_dir("outside");
+        let out = outside.join("secret.txt");
+        std::fs::write(&out, b"x").unwrap();
+        let err = delete_output_file(out.to_str().unwrap(), &dir).unwrap_err();
+        assert!(out.exists(), "越界文件必须保留：{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// 相对路径在闸门里本来就该拒绝，不能因为「当前目录下没有」放行。
+    #[test]
+    fn delete_output_file_rejects_relative_missing_path() {
+        let dir = temp_dir("relative");
+        assert!(delete_output_file("gone.mp4", &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
