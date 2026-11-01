@@ -200,7 +200,12 @@ body {
   flex-shrink: 0;
   box-shadow: 0 0 14px rgba(63, 224, 240, .28);
 }
-.brand svg { width: 10px; height: 10px; color: var(--on-accent); }
+.brand img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: 6px;
+}
 
 /* ---------- 自绘标题栏（decorations:false） ----------
    原生框去掉后，菜单栏整行就是标题栏：nav 挂 data-tauri-drag-region，
@@ -208,7 +213,9 @@ body {
    双击空白 = 最大化/还原，按住空白 = 拖动窗口；边缘缩放由 tao 的
    无边框窗口命中测试提供。右侧三个按钮补回最小化/最大化/关闭。 */
 .wincontrols {
-  margin-left: 6px;
+  /* auto 必须在这里而不是 menu-sel-hint 上：提示条空置时带 hidden
+     （display:none），flex item 消失，auto 也一起消失 */
+  margin-left: auto;
   display: flex;
   align-self: stretch;
   flex-shrink: 0;
@@ -311,7 +318,8 @@ body.is-max #winMax .ic-restore { display: block; }
 }
 
 .menu-sel-hint {
-  margin-left: auto;
+  /* 位置跟随控件组（见 .wincontrols 的注释），不再自己吃空白 */
+  margin-left: 0;
   align-self: center;
   font-family: var(--mono);
   font-size: 11px;

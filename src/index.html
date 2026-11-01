@@ -13,11 +13,10 @@
        用 HTML 自绘而不是 tauri::Menu：原生菜单画在 webview 之外的窗口客户区，
        既吃不到本程序的深色主题（Windows 上会是浅色一块），也没法在截图里验证。 -->
   <nav class="menubar" id="menubar" data-tauri-drag-region>
-    <!-- 18px 品牌标记：应用名已在系统标题栏，这里只留识别标记 -->
+    <!-- 18px 品牌标记：用 exe 同款应用图标（src-tauri/icons 的 PNG 拷贝为
+         appicon.png 随前端分发；换了图标要重新拷一次）。应用名已不重复写。 -->
     <div class="brand" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M4 5l8 14 8-14" />
-      </svg>
+      <img src="appicon.png" alt="" />
     </div>
     <div class="menu" data-menu="task">
       <button class="menu-btn" data-i18n="menuTask">任务(T)</button>

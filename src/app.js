@@ -1752,6 +1752,8 @@
         $("saveHint").textContent = "语言已保存，重启后完全生效";
       }
       setTimeout(() => ($("saveHint").textContent = ""), 2500);
+      // 保存完成回主界面：设置页是「进来做个决定」的地方，不是常驻页
+      showView("all");
     } catch (e) {
       toast("保存失败：" + String(e), true);
     }
@@ -2633,7 +2635,11 @@
   });
   $("saveSettings").onclick = saveSettings;
   $("restoreDefaults").onclick = restoreDefaults;
-  $("cancelSettings").onclick = () => { loadSettings(); };
+  $("cancelSettings").onclick = () => {
+    // 丢弃表单改动（重读磁盘值）并回主界面
+    loadSettings();
+    showView("all");
+  };
   $("setProxyEnabled").addEventListener("change", syncProxyDetail);
   $("setCategoriesEnabled").addEventListener("change", syncCategoryDetail);
   $("addCategoryRule").onclick = () => addCategoryRow(null);
