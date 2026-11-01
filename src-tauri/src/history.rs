@@ -281,11 +281,13 @@ pub fn load_history() -> Vec<HistoryEntry> {
 /// 覆盖模式只允许替换「自己下过的文件」：同名但来源不明的文件（用户自己拷进来
 /// 的、别的下载器的）一律不碰，退回递增改名。history.json 可能被篡改，所以这里
 /// 同时要求 URL 相同 + 路径 canonicalize 后完全一致，缺一不可。
+///
+/// 读的是写线程维护的内存镜像（见 `MIRROR`），不再每次整文件读盘。
 pub fn is_known_output(url: &str, path: &Path) -> bool {
     let Ok(want) = std::fs::canonicalize(path) else {
         return false;
     };
-    load_history().iter().any(|e| {
+    mirror().iter().any(|e| {
         e.state == "done"
             && e.url == url
             && e.output_path
@@ -300,11 +302,13 @@ pub fn is_known_output(url: &str, path: &Path) -> bool {
 ///
 /// yt-dlp 的 `--force-overwrites` 按输出模板覆盖，无法精确到单个路径；这里用
 /// 「同一 URL + 同一目录」作为最低限度的归属证明，没有就不开覆盖。
+///
+/// 读的是写线程维护的内存镜像（见 `MIRROR`），不再每次整文件读盘。
 pub fn has_done_output_in_dir(url: &str, dir: &Path) -> bool {
     let Ok(dir) = std::fs::canonicalize(dir) else {
         return false;
     };
-    load_history().iter().any(|e| {
+    mirror().iter().any(|e| {
         e.state == "done"
             && e.url == url
             && e.output_path
@@ -335,6 +339,33 @@ fn write_history(list: &[HistoryEntry]) -> Result<(), String> {
     Ok(())
 }
 
+/// 写线程权威副本的运行中只读镜像。
+///
+/// `is_known_output` / `has_done_output_in_dir` 在下载启动热路径上要整文件
+/// 读盘并解析 JSON（几千条历史时是每任务一次的同步 IO，全压在 tokio worker
+/// 上）。写线程本来就是唯一落盘者——它每次重放完操作后把副本同步进来，
+/// 查询方读镜像即可，磁盘上只有写线程一个读者。
+///
+/// 一致性边界（如实声明）：镜像在写线程重放后更新，最多滞后一个攒批窗口
+/// （200ms）。刚完成的记录若还没落进镜像，「覆盖判定」拿不到它 → 退化为
+/// 避让改名——方向是安全的（绝不误覆盖）。查询发生在写线程首次起来之前
+/// 的极端窗口里同样按「无记录」处理，退化方向一致。
+static MIRROR: Mutex<Vec<HistoryEntry>> = Mutex::new(Vec::new());
+
+fn sync_mirror(list: &[HistoryEntry]) {
+    let mut m = match MIRROR.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    m.clear();
+    m.extend_from_slice(list);
+}
+
+/// 读镜像快照（毒锁也继续：查询方向安全，见 MIRROR 注释）。
+fn mirror() -> std::sync::MutexGuard<'static, Vec<HistoryEntry>> {
+    MIRROR.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 写线程句柄：全局唯一，首次使用时惰性起线程。
 static WRITER: OnceLock<Mutex<Sender<Op>>> = OnceLock::new();
 
@@ -361,6 +392,7 @@ fn submit(op: Op) {
 /// 唯一的落盘者：重放操作 → 攒批 → 合并窗口到期才写。
 fn writer_loop(rx: mpsc::Receiver<Op>) {
     let mut list = load_history();
+    sync_mirror(&list);
     let mut pending: Vec<Op> = Vec::new();
     let mut dirty = false;
     let mut deadline: Option<Instant> = None;
@@ -387,6 +419,7 @@ fn writer_loop(rx: mpsc::Receiver<Op>) {
                 let mut ops = std::mem::take(&mut pending);
                 ops.push(Op::Clear);
                 apply_ops(&mut list, ops);
+                sync_mirror(&list);
                 prepare_for_write(&mut list);
                 if let Err(e) = write_history(&list) {
                     eprintln!("{e}");
@@ -399,6 +432,7 @@ fn writer_loop(rx: mpsc::Receiver<Op>) {
                 // use-after-move）；它只当攒批边界：重放、落盘、回执。
                 let ops = std::mem::take(&mut pending);
                 apply_ops(&mut list, ops);
+                sync_mirror(&list);
                 if dirty {
                     prepare_for_write(&mut list);
                     if let Err(e) = write_history(&list) {
@@ -414,6 +448,7 @@ fn writer_loop(rx: mpsc::Receiver<Op>) {
                 if dirty {
                     let ops = std::mem::take(&mut pending);
                     apply_ops(&mut list, ops);
+                    sync_mirror(&list);
                     prepare_for_write(&mut list);
                     if let Err(e) = write_history(&list) {
                         eprintln!("{e}");
@@ -427,6 +462,7 @@ fn writer_loop(rx: mpsc::Receiver<Op>) {
                 let ops = std::mem::take(&mut pending);
                 let had_ops = !ops.is_empty();
                 apply_ops(&mut list, ops);
+                sync_mirror(&list);
                 if dirty || had_ops {
                     prepare_for_write(&mut list);
                     if let Err(e) = write_history(&list) {

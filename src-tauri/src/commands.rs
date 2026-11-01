@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+// catch_unwind 只在 worker 兜底那一处用；FutureExt 以 trait 形式提供它。
+use futures_util::FutureExt;
+
 use crate::direct::{self, DirectProbe};
 use crate::engine::{self, CancelToken, Task, TaskState};
 use crate::save_dir;
@@ -15,7 +18,9 @@ use crate::ytdlp::{self, MediaInfo};
 pub struct AppState {
     pub tasks: engine::SharedTasks,
     pub tokens: engine::SharedTokens,
-    pub settings: std::sync::Mutex<Settings>,
+    /// 设置的内存权威副本。Arc 包一层：队列泵（PumpCtx）与命令层共享同一份，
+    /// 泵的续泵/启动热路径从这里读快照，不再每次读盘 + DPAPI 解密。
+    pub settings: Arc<std::sync::Mutex<Settings>>,
     /// 排队中待启动的任务 id（VecDeque：队首取出是 O(1)）
     pub queue: Arc<Mutex<VecDeque<String>>>,
     /// 当前已占用的并发槽位
@@ -64,7 +69,7 @@ impl AppState {
         Self {
             tasks: Arc::new(Mutex::new(tasks)),
             tokens: Arc::new(Mutex::new(HashMap::new())),
-            settings: std::sync::Mutex::new(settings),
+            settings: Arc::new(std::sync::Mutex::new(settings)),
             queue: Arc::new(Mutex::new(VecDeque::new())),
             running: Arc::new(AtomicU64::new(0)),
             pump_lock: Arc::new(Mutex::new(())),
@@ -526,6 +531,8 @@ pub struct PumpCtx {
     queue: Arc<Mutex<VecDeque<String>>>,
     running: Arc<AtomicU64>,
     pump_lock: Arc<Mutex<()>>,
+    /// 设置内存权威副本：泵与 worker 启动的热路径从这读，不读盘。
+    settings: Arc<std::sync::Mutex<Settings>>,
 }
 
 impl PumpCtx {
@@ -535,6 +542,7 @@ impl PumpCtx {
             tokens: state.tokens.clone(),
             queue: state.queue.clone(),
             running: state.running.clone(),
+            settings: state.settings.clone(),
             pump_lock: state.pump_lock.clone(),
         }
     }
@@ -639,6 +647,18 @@ async fn force_fail_unfinished(
     }
 }
 
+/// 从 panic payload 里尽量抠出可读消息（tokio 任务里 panic 的信息只在
+/// stderr 看得到一瞬，把它带进任务表用户才能知道发生了什么）。
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".into()
+    }
+}
+
 /// 队列泵：在并发限额内尽量多启动任务。
 ///
 /// 返回 `Pin<Box<dyn Future>>` 而不是直接 `async fn`：任务结束时需要再次调用自己，
@@ -652,8 +672,11 @@ pub fn pump_queue(
         // 泵本身只负责 spawn，不会 await 任务完成，所以这里持锁不会死锁。
         let _pump = ctx.pump_lock.lock().await;
 
-        // 每次续泵都重读一次设置，用户改了并发数能立刻生效
-        let max_concurrent = crate::settings::read_settings_from_disk()
+        // 每次续泵都重读一次设置，用户改了并发数能立刻生效。
+        // 读内存权威副本而不是磁盘：旧写法每次续泵都做「整文件读 + JSON 解析
+        // + 两次 DPAPI 解密」，全在 tokio worker 上同步执行，还被本把 pump_lock
+        // 串行放大。内存副本由 save_settings 回写，改并发数照样立刻生效。
+        let max_concurrent = crate::settings::load_settings_from_shared(&ctx.settings)
             .max_concurrent
             .max(1);
 
@@ -741,7 +764,7 @@ pub fn pump_queue(
                 continue; // 槽位随作用域释放；失败分支没插过令牌，无需回收
             }
 
-            let settings = crate::settings::read_settings_from_disk();
+            let settings = crate::settings::load_settings_from_shared(&ctx.settings);
             let app_c = app.clone();
             let ctx_c = ctx.clone();
             let Some(task_c) = started_task else {
@@ -753,49 +776,54 @@ pub fn pump_queue(
                     // 槽位在作用域结束时归还，panic 也不会泄漏
                     let _slot = slot;
 
-                    if task_c.kind == "direct" {
-                        if let Err(e) = engine::run_direct_download(
+                    // 两个执行器先装箱成同一类型的 future，再用 catch_unwind 包住：
+                    // worker future 任何一行 panic，旧写法会直接跳出整个闭包——
+                    // 令牌留在表里（后续 resume/redo 全被「上次停止还在收尾」挡死），
+                    // 下面的续泵也被跳过，队列就此停摆。槽位有 SlotGuard 兜着，
+                    // 令牌和续泵没有——这里补齐：panic 当作普通错误走兜底路径，
+                    // 令牌摘除与续泵照常执行。
+                    let run: std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send>,
+                    > = if task_c.kind == "direct" {
+                        Box::pin(engine::run_direct_download(
                             app_c.clone(),
                             task_c.clone(),
                             settings,
                             token.clone(),
                             ctx_c.tasks.clone(),
-                        )
-                        .await
-                        {
-                            // 常规失败分支之外的 `?` 早退（yt-dlp 缺失、目录失效等）
-                            // 不会自己写状态，这里兜底落 Failed，任务才不会永远
-                            // 卡在「下载中」。
-                            force_fail_unfinished(
-                                &app_c,
-                                ctx_c.tasks.clone(),
-                                ctx_c.tokens.clone(),
-                                &task_c.id,
-                                &token,
-                                &e,
-                            )
-                            .await;
-                        }
+                        ))
                     } else {
-                        if let Err(e) = engine::run_download(
+                        Box::pin(engine::run_download(
                             app_c.clone(),
                             task_c.clone(),
                             settings,
                             token.clone(),
                             ctx_c.tasks.clone(),
-                        )
+                        ))
+                    };
+                    let outcome = match std::panic::AssertUnwindSafe(run)
+                        .catch_unwind()
                         .await
-                        {
-                            force_fail_unfinished(
-                                &app_c,
-                                ctx_c.tasks.clone(),
-                                ctx_c.tokens.clone(),
-                                &task_c.id,
-                                &token,
-                                &e,
-                            )
-                            .await;
-                        }
+                    {
+                        Ok(r) => r,
+                        Err(p) => Err(format!(
+                            "内部错误（worker panic）：{}",
+                            panic_message(&p)
+                        )),
+                    };
+                    if let Err(e) = outcome {
+                        // 常规失败分支之外的 `?` 早退（yt-dlp 缺失、目录失效等）
+                        // 不会自己写状态，这里兜底落 Failed，任务才不会永远
+                        // 卡在「下载中」。
+                        force_fail_unfinished(
+                            &app_c,
+                            ctx_c.tasks.clone(),
+                            ctx_c.tokens.clone(),
+                            &task_c.id,
+                            &token,
+                            &e,
+                        )
+                        .await;
                     }
 
                     // 只摘「这一轮自己的」令牌：resume→泵可能在本 worker 收尾之前
@@ -978,12 +1006,14 @@ pub async fn redo_task(
 }
 
 /// 单个任务的重下内核（`redo_task` 与 `redo_tasks` 共用）。
+///
+/// 时序：**快照判定（临界区 1）→ 磁盘清理（锁外）→ 复查提交（临界区 2）**。
+/// 两段临界区之间夹着 `cleanup_task_artifacts`（含 `remove_dir_all`，大临时
+/// 目录可达秒级），这段窗口里并发 resume_task / start_all 可以插队提交
+/// Queued+令牌——所以临界区 2 必须**复查**「状态仍是快照值且无令牌」才准写，
+/// 否则会删掉活跃 worker 正在写的断点、把 Downloading 无条件踩回 Queued
+/// （泵看到有令牌会把该 id 从队列丢弃，界面成了「排队中」实际在下的幽灵）。
 async fn redo_one(state: &AppState, id: &str) -> Result<(), String> {
-    // 「查令牌 + 查状态 + 置 Queued + 入队」合并进一个 tasks 临界区（锁序
-    // tasks→tokens 与泵一致）。旧写法先单独查令牌再单独查状态，两次加锁之间
-    // 泵可以完成原子提交——拿着「还没启动」的结论却遇到已经在跑的 worker，
-    // 清断点与写盘打架；末尾那次无条件摘令牌又正好把泵刚插的新轮令牌拆掉。
-    // 合并后这些组合都不存在：要么看到真令牌拒绝，要么状态转换与令牌表一致。
     let (task, running) = {
         let guard = state.tasks.lock().await;
         let running = state.tokens.lock().await.contains_key(id);
@@ -1021,6 +1051,14 @@ async fn redo_one(state: &AppState, id: &str) -> Result<(), String> {
         let mut guard = state.tasks.lock().await;
         match guard.get_mut(id) {
             Some(t) => {
+                // 复查（见函数文档）：与快照判定之间隔着无界磁盘 IO，并发
+                // resume/start_all 可能已把任务提交成「Queued+令牌」甚至
+                // Downloading。状态对不上或有令牌，一律拒绝重下。
+                if t.state != task.state
+                    || state.tokens.lock().await.contains_key(id)
+                {
+                    return Err("任务状态刚发生了变化，请重新操作".into());
+                }
                 let was_canceled = t.state == TaskState::Canceled;
                 t.state = TaskState::Queued;
                 t.error = None;

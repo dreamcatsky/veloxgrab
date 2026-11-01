@@ -203,6 +203,18 @@ impl CancelToken {
     pub fn set_pid(&self, pid: u32) {
         self.pid.store(pid as u64, Ordering::SeqCst);
     }
+
+    /// worker 确认子进程已被收割后调用：把 token 里记录的 pid 失效化。
+    ///
+    /// 余下的强杀路径（cancel/pause/remove）都凭 `token.pid()` 这个**数字**去
+    /// `taskkill /PID <n>`。进程退出后 Windows 会快速复用 pid——worker 正常
+    /// 收尾与令牌摘除之间的任何一次「补刀」，都可能命中的一个毫不相关的
+    /// 新进程树。进程确认退出后这个数字就是纯害的过期信息，立刻清零
+    /// （`kill_process_tree(0)` 本身是空操作）。残余窗口只剩「进程退出 →
+    /// wait() 返回」的毫秒级间隙，根治要换 JOB 对象，另行处理。
+    pub fn clear_pid(&self) {
+        self.pid.store(0, Ordering::SeqCst);
+    }
     pub fn pid(&self) -> u32 {
         self.pid.load(Ordering::SeqCst) as u32
     }
@@ -650,6 +662,9 @@ pub async fn run_download(
                     t.downloaded_bytes = 0;
                     t.speed = None;
                     t.eta = None;
+                    // 重试窗口内退出的话，重启后任务会以历史里的旧终态复活；
+                    // 与其它状态迁移同纪律，落一次历史。
+                    crate::history::upsert_entry(t);
                 }
             }
             let _ = app.emit(
@@ -817,6 +832,10 @@ async fn run_download_inner(
     if token.is_canceled() {
         kill_process_tree(child.id().unwrap_or(0));
         let _ = child.wait().await;
+        // 进程已被收割，token 里记录的 pid 从这一刻起是悬空数字（可能已被
+        // 系统复用），立刻失效化——余下的 kill 路径按 pid 杀，复用号会误杀
+        // 无关进程树。见 CancelToken::clear_pid。
+        token.clear_pid();
         let (state, msg) = stopped_state(&token);
         let (prog, bytes, total) = {
             let mut guard = tasks.lock().await;
@@ -824,6 +843,9 @@ async fn run_download_inner(
                 Some(t) => {
                     t.state = state;
                     t.error = Some(msg.clone());
+                    // 与 wait 后的取消分支同一纪律：停止也要落历史，否则重启后
+                    // 任务以「入队时的旧状态」复活，与用户「已取消」的认知冲突。
+                    crate::history::upsert_entry(t);
                     stop_snapshot(t, state)
                 }
                 None => (0.0, 0, None),
@@ -980,7 +1002,16 @@ async fn run_download_inner(
         (lines.into_iter().collect::<Vec<_>>(), read_err)
     });
 
-    let status = child.wait().await.map_err(|e| format!("等待进程失败: {e}"))?;
+    let status = match child.wait().await {
+        Ok(st) => {
+            // 进程已被收割：立即失效化 token 里记录的 pid，防复用号误杀
+            // （与 spawn 前取消分支同一纪律，见 CancelToken::clear_pid）。
+            token.clear_pid();
+            st
+        }
+        // wait 出错时进程状态未知（可能仍活着），保留 pid 让用户取消时还能补刀
+        Err(e) => return Err(format!("等待进程失败: {e}")),
+    };
     let (final_path, stdout_err, stdout_read_err) =
         stdout_handle.await.unwrap_or((None, None, None));
     let (stderr_lines, stderr_read_err) = stderr_handle.await.unwrap_or_default();

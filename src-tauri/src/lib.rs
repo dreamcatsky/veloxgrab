@@ -76,6 +76,12 @@ pub(crate) fn dispatch_external_link(app: &tauri::AppHandle, link: String) {
             Err(err) => err.into_inner(),
         };
         guard.push(payload);
+        // 上限保护：桥/深链被脚本灌任务时，待取队列不能无限膨胀（内存 +
+        // 前端逐条弹窗都会失控）。正常用户远到不了这个数；超限丢**最旧**的
+        // ——用户刚点的链接必须活下来，积压里最早的本来也最可能已经过期。
+        while guard.len() > 64 {
+            guard.remove(0);
+        }
         drop(guard);
     } else {
         eprintln!("[deeplink] AppState 尚未就绪，链接未能入队: {link}");

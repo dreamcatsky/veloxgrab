@@ -103,6 +103,12 @@ pub struct UpdateInfo {
     pub release_url: String,
     pub download_url: String,
     pub asset_size: u64,
+    /// 所选资产的发布摘要（`sha256:<64位十六进制>`，GitHub digest 字段原样）。
+    ///
+    /// check_update 已经拿到完整 release JSON——摘要在这里带上，update_now
+    /// 就不必再打一次 GitHub API（匿名限流 60 次/小时/IP，与启动检查共享；
+    /// 旧实现「限流取不到 → 跳过校验静默装」对可执行文件不可接受）。
+    pub digest: Option<String>,
     /// 检查失败的原因（网络、限流等）。前端据此决定静默还是报错。
     pub error: Option<String>,
 }
@@ -145,30 +151,34 @@ pub fn parse_release(v: &serde_json::Value, current: &str) -> UpdateInfo {
     let release_url = v.get("html_url").and_then(|x| x.as_str()).unwrap_or("").to_string();
 
     // 资产里挑 x64 安装包：名字必须带 setup.exe，优先带 x64 的那个
-    let mut chosen: Option<(String, u64, String)> = None;
+    let mut chosen: Option<(String, u64, String, Option<String>)> = None;
     if let Some(assets) = v.get("assets").and_then(|x| x.as_array()) {
         for a in assets {
             let name = a.get("name").and_then(|x| x.as_str()).unwrap_or("");
             let url = a.get("browser_download_url").and_then(|x| x.as_str()).unwrap_or("");
             let size = a.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
+            let digest = a
+                .get("digest")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
             if !name.to_ascii_lowercase().ends_with("setup.exe")
                 || url.is_empty()
                 || !is_trusted_download(url)
             {
                 continue;
             }
-            let better = chosen.as_ref().map_or(true, |(_, _, c)| {
+            let better = chosen.as_ref().map_or(true, |(_, _, c, _)| {
                 name.to_ascii_lowercase().contains("x64") && !c.to_ascii_lowercase().contains("x64")
             });
             if better {
-                chosen = Some((url.to_string(), size, name.to_string()));
+                chosen = Some((url.to_string(), size, name.to_string(), digest));
             }
         }
     }
 
-    let (download_url, asset_size) = match chosen {
-        Some((u, s, _)) => (u, s),
-        None => (String::new(), 0),
+    let (download_url, asset_size, digest) = match chosen {
+        Some((u, s, _, d)) => (u, s, d),
+        None => (String::new(), 0, None),
     };
 
     UpdateInfo {
@@ -179,6 +189,7 @@ pub fn parse_release(v: &serde_json::Value, current: &str) -> UpdateInfo {
         release_url,
         download_url,
         asset_size,
+        digest,
         error: None,
     }
 }
@@ -192,6 +203,7 @@ fn failed(current: &str, msg: String) -> UpdateInfo {
         release_url: String::new(),
         download_url: String::new(),
         asset_size: 0,
+        digest: None,
         error: Some(msg),
     }
 }
@@ -376,11 +388,18 @@ struct Prog {
 ///
 /// 前端只会在 check_update 给出 available=true 后带着那个 download_url 调用，
 /// 但这里仍然独立校验主机——命令面是公共入口，不能指望调用方守规矩。
+///
+/// `digest` 是 check_update 从 release JSON 里带出来的发布摘要
+/// （`sha256:<hex>`）。前端传了就不再打第二次 GitHub API（限流面减半）；
+/// 没传则兜底拉一次，仍拿不到时：Content-Length 严格核对通过才放行，且
+/// emit `update-unverified` 明示用户「本次未做摘要校验」——长度缺失直接
+/// 拒绝安装。零校验静默安装可执行文件，旧实现里这条降级是静默的。
 #[tauri::command]
 pub async fn update_now(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     url: String,
+    digest: Option<String>,
 ) -> Result<(), String> {
     if !is_trusted_download(&url) {
         return Err("下载地址不在信任清单内".into());
@@ -394,10 +413,15 @@ pub async fn update_now(
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
     let tmp = dir.join("VeloxGrab-setup.exe");
 
-    // 摘要先取：取不到就放行（理由见 fetch_asset_digest），取到就得对得上。
-    // 放在下载前是为了少下一个注定要删的坏包，不是为了省那点带宽。
+    // 摘要来源优先级：前端透传（check_update 已拿到的）> 本地兜底拉一次。
+    // 两者都拿不到不是「放行」而是「降级」，见下载完成后的分支。
     #[cfg(windows)]
-    let expected_digest = fetch_asset_digest(proxy.as_deref(), &url).await;
+    let expected_digest: Option<[u8; 32]> = match digest.as_deref().and_then(parse_digest) {
+        Some(d) => Some(d),
+        None => fetch_asset_digest(proxy.as_deref(), &url).await,
+    };
+    #[cfg(not(windows))]
+    let _ = digest;
 
     // 清掉上次中断留下的半成品，避免续到坏文件上
     let _ = std::fs::remove_file(&tmp);
@@ -434,10 +458,25 @@ pub async fn update_now(
     }
 
     // Content-Length 只能证明「长度对」，证明不了「内容对」：代理返回错误页、
-    // CDN 半截文件、连接中断都可能长度恰好一致或没有 Length。有摘要就逐字节校验。
+    // CDN 半截文件、连接中断都可能长度恰好一致或没有 Length。有摘要就逐字节校验；
+    // 摘要拿不到时，长度核对通过才允许降级放行，且必须明示用户「本次未校验」，
+    // 长度都没有（Content-Length 缺失）直接拒绝安装——半截/被调包的安装包
+    // 不能在零校验下被执行。
     #[cfg(windows)]
-    if let Some(expected) = expected_digest {
-        verify_downloaded(&tmp, expected)?;
+    match expected_digest {
+        Some(expected) => verify_downloaded(&tmp, expected)?,
+        None if total == 0 => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(
+                "无法校验安装包完整性（拿不到发布摘要，服务器也未声明长度），已取消更新。\
+                 请到 GitHub Releases 手动下载。"
+                    .into(),
+            );
+        }
+        None => {
+            // 走到这里说明 downloaded == total 已核对过。降级放行但要可见。
+            let _ = app.emit("update-unverified", ());
+        }
     }
 
     #[cfg(windows)]

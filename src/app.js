@@ -2224,8 +2224,10 @@
     $("upBarWrap").classList.remove("hidden");
     $("upPct").textContent = "准备下载…";
     try {
-      // 成功后 Rust 侧会直接退出本进程去安装，这里不会有返回值可言
-      await invoke("update_now", { url: info.download_url });
+      // 成功后 Rust 侧会直接退出本进程去安装，这里不会有返回值可言。
+      // digest 是 check_update 里 release JSON 带出来的发布摘要：后端拿它做
+      // 逐字节校验，避免为取摘要再打一次限流的 GitHub API。
+      await invoke("update_now", { url: info.download_url, digest: info.digest || null });
     } catch (e) {
       $("upPct").textContent = "";
       btn.disabled = false;
@@ -2265,6 +2267,17 @@
     // 用户点了「以后再说」这次运行就不再自动弹（手动「检查更新」不受此限）。
     listen("update-available", (evt) => {
       showUpdateDialog(evt.payload);
+    });
+    // 更新包摘要没拿到（GitHub API 限流等）、但长度核对通过了：后端会降级
+    // 放行安装。这是可执行文件，降级必须可见——用户可以取消重试或手动下载。
+    listen("update-unverified", () => {
+      toast("本次更新未能做摘要校验（发布摘要拉取失败），仅核对了文件长度", true);
+    });
+    // 本地桥端口被占/监听失败：浏览器扩展的链接转发整条不可用。旧实现只在
+    // stderr 里打一行——GUI 进程里没人看得见，用户只知道「扩展没反应」。
+    listen("bridge-offline", (evt) => {
+      const port = evt && evt.payload;
+      toast(`浏览器扩展桥启动失败（端口 ${port || 58943} 被占用），扩展暂时无法连接 VeloxGrab`, true);
     });
 
     // 托盘菜单的常用动作：Rust 侧只负责把窗口拉到前台 + 发命令名，
@@ -2658,15 +2671,22 @@
       // 用 .task-row 而不是 .task：历史页条目也带 .task，两者会同时命中
       const card = document.querySelector(`.task-row[data-id="${p.id}"]`);
       if (card) {
-        // 状态没变时只改进度条宽度和数字，不重建整行：
-        // 重建会顺带销毁按钮、丢焦点，10Hz × N 个任务时纯属浪费。
         if (stateChanged) {
-          card.replaceWith(renderTask(merged));
+          // 状态变了先过一遍视图过滤：任务在「正在下载」视图里下完、或在
+          // 「视频」分类里开始下 .zip 时，旧行必须离开当前视图。只在全量
+          // 刷新跑 matchView 的话，行会「赖着不走」，与侧边栏计数互相矛盾。
+          if (!matchView(merged)) {
+            card.remove();
+          } else {
+            card.replaceWith(renderTask(merged));
+          }
         } else {
           updateCardProgress(card, merged);
         }
       } else {
-        // 本地还没有这一行（任务刚入队 / 刚进入当前筛选条件）
+        // 本地还没有这一行（任务刚入队 / 刚进入当前筛选条件）；
+        // 是否属于当前视图由全量刷新判定，这里不做本地 matchView——
+        // 事件 patch 里没有 kind/url 等字段，判不准，宁可多刷一次。
         scheduleRefresh();
       }
       if (stateChanged) {

@@ -42,6 +42,10 @@ pub struct DirectProbe {
     pub final_url: String,
     /// 建议并发数
     pub suggested_threads: usize,
+    /// 服务器实体标签（断点续传的服务器侧锚点，见 PartMeta）
+    pub etag: Option<String>,
+    /// 服务器最后修改时间（ETag 缺席时的次级锚点）
+    pub last_modified: Option<String>,
 }
 
 /// 进度回调数据
@@ -176,6 +180,14 @@ pub(crate) fn url_target_guarded(u: &str) -> Result<(), String> {
                 return Err("下载地址指向链路本地/保留地址".into());
             }
         } else if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+            // IPv4-mapped IPv6（`::ffff:169.254.169.254`）在 OS/hyper 里按 IPv4
+            // 直连——是 v4 字面量闸的等价拼写绕过：先映射回 IPv4 复判同一条规则
+            // （`::ffff:0.0.0.0` 同样由此拦下）。
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                if v4.is_link_local() || v4.is_unspecified() {
+                    return Err("下载地址指向链路本地/保留地址".into());
+                }
+            }
             // fe80::/10：顶部 10 位固定为 1111111010
             let first = (u128::from(ip) >> 112) as u16;
             if ip.is_unspecified() || first & 0xffc0 == 0xfe80 {
@@ -506,6 +518,17 @@ async fn probe_uncached(url: &str, net: &NetCfg) -> Result<DirectProbe, String> 
         .get(reqwest::header::CONTENT_DISPOSITION)
         .and_then(|v| v.to_str().ok());
 
+    // 服务器侧续传锚点：断点元数据记下它们，续传时不一致即弃断点（见
+    // resume_is_consistent）。两者都缺席的服务器退回旧行为。
+    let etag = headers
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let last_modified = headers
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let filename = guess_filename(&final_url, content_disposition, content_type.as_deref());
 
     let suggested_threads = if range_supported {
@@ -526,6 +549,8 @@ async fn probe_uncached(url: &str, net: &NetCfg) -> Result<DirectProbe, String> 
         range_supported,
         final_url,
         suggested_threads,
+        etag,
+        last_modified,
     })
 }
 
@@ -536,6 +561,14 @@ pub struct PartMeta {
     pub total: u64,
     pub segments_done: Vec<u64>,
     pub segments_total: Vec<u64>,
+    /// 下载开始时的 ETag。续传时不一致 = 服务器上的资源已经换过（同长度换
+    /// 内容旧字节拼新字节会产出静默损坏的成品），弃断点从头下。
+    /// `#[serde(default)]`：旧版本写入的断点文件没有这两个字段，必须能解析。
+    #[serde(default)]
+    pub etag: Option<String>,
+    /// ETag 缺席的服务器用 Last-Modified 做次级锚点，语义同上。
+    #[serde(default)]
+    pub last_modified: Option<String>,
 }
 
 impl PartMeta {
@@ -668,6 +701,18 @@ const WRITE_BATCH: usize = 256 * 1024;
 /// 低速时按时间兜底 flush，避免进度条长时间不动
 const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 
+/// 从 `Content-Range: bytes <first>-<last>/<total>` 里取首字节偏移。
+///
+/// 畸形/缺席（`bytes */1234`、非 bytes 单位）返回 None，调用方按「不拦截」
+/// 处理——本段写入量被 seg_len 夹住，超发有超额闸兜底，这里只拦「起点漂移」。
+/// 纯函数，便于单测。
+fn parse_content_range_first_byte(v: &str) -> Option<u64> {
+    let rest = v.trim().strip_prefix("bytes")?.trim_start_matches(['=', ' ']);
+    let range = rest.split('/').next()?;
+    let first = range.split('-').next()?.trim();
+    first.parse::<u64>().ok()
+}
+
 /// 下载一段区间并写入文件的指定偏移
 #[allow(clippy::too_many_arguments)]
 async fn download_segment(
@@ -711,6 +756,25 @@ async fn download_segment(
         && (already_done > 0 || from != 0 || total == 0 || end + 1 != total)
     {
         return Err("服务器忽略了 Range 请求，无法分块下载".into());
+    }
+    // 206 必须核对 Content-Range 的区间起点：服务器/中间代理对 bytes=from-end
+    // 回一段**内容不同**的 206（换缓存节点、文件已更换、区间被 clamp）时，
+    // 字节会被写到声明的偏移上——成品「长度正确、内容错乱」，完成度校验
+    // 发现不了。起点对不上按对端违规报错（与下面的超额闸同一风格）。
+    // 规范允许 206 不带 Content-Range，缺席时不拦：本段写入量被 seg_len
+    // 夹住，超额仍由超额闸负责。
+    if st == reqwest::StatusCode::PARTIAL_CONTENT {
+        let cr = resp
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok());
+        if let Some(first) = cr.and_then(parse_content_range_first_byte) {
+            if first != from {
+                return Err(format!(
+                    "服务器返回的区间起点 {first} 与请求的 {from} 不一致"
+                ));
+            }
+        }
     }
 
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -842,6 +906,8 @@ fn resume_is_consistent(
     total: u64,
     ranges: &[(u64, u64)],
     file_len: u64,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
 ) -> bool {
     m.url == url
         && (total == 0 || m.total == total)
@@ -857,6 +923,16 @@ fn resume_is_consistent(
             .iter()
             .zip(&m.segments_done)
             .all(|((s, e), d)| *d <= e - s + 1 && s.saturating_add(*d) <= file_len)
+        // 服务器侧锚点：断点记下的 ETag / Last-Modified 与本次探测不一致 =
+        // 服务器上的资源已更换。旧字节 + 新字节拼出的成品「长度正确、内容
+        // 错乱」，任何文件系统侧校验都发现不了——这是之前注释承认拦不住的
+        // 那类损坏，现在用服务器自己给的身份挡住。两侧任一缺席（服务器不给
+        // / 旧版本断点没记）就跳过该项，退回原判据。
+        && m.etag.as_deref().zip(etag).map_or(true, |(a, b)| a == b)
+        && m.last_modified
+            .as_deref()
+            .zip(last_modified)
+            .map_or(true, |(a, b)| a == b)
 }
 
 /// 决定最终落盘的文件名。
@@ -1116,7 +1192,11 @@ pub async fn download_direct(
     let legacy_target = temp_path_for(&final_target, "");
     let total = info.total_bytes.unwrap_or(0);
     let threads = threads.clamp(1, MAX_THREADS);
-    let use_multi = info.range_supported && total >= MIN_MULTI_THREAD_SIZE && threads > 1;
+    // 分块框架只在「服务器确认支持 Range 且长度已知且够大」时让位给单流；
+    // **threads==1 也走分块框架**（1 段）：它自带断点续传，暂停/取消不再把
+    // 已下字节全部作废。单流分支只剩三类真的没法续传的场景——服务器忽略
+    // Range、长度未知、小文件（续传收益趋零，还多一个元数据文件）。
+    let use_multi = info.range_supported && total >= MIN_MULTI_THREAD_SIZE;
     let c = client_with(net.proxy.as_deref(), net.has_sensitive_headers())?;
 
     // 磁盘预检（单流分支）：分块下载的检查在读完断点信息之后做，因为续传
@@ -1158,7 +1238,17 @@ pub async fn download_direct(
     let mut resume = PartMeta::load(&target);
     if let Some(m) = &resume {
         let file_len = std::fs::metadata(&target).map(|md| md.len()).unwrap_or(0);
-        if !target.is_file() || !resume_is_consistent(m, url, total, &ranges, file_len) {
+        if !target.is_file()
+            || !resume_is_consistent(
+                m,
+                url,
+                total,
+                &ranges,
+                file_len,
+                info.etag.as_deref(),
+                info.last_modified.as_deref(),
+            )
+        {
             resume = None;
             PartMeta::remove(&target);
         }
@@ -1216,6 +1306,8 @@ pub async fn download_direct(
         let stop = stop_flag.clone();
         let part_target = target.clone();
         let url_owned = url.to_string();
+        let etag_owned = info.etag.clone();
+        let lm_owned = info.last_modified.clone();
         let totals_for_task = totals_vec.clone();
         tauri::async_runtime::spawn(async move {
             // 速度用真正的滑动窗口算：保留最近约 1.2 秒内每次采样的
@@ -1253,6 +1345,8 @@ pub async fn download_direct(
                         total,
                         segments_total: totals_for_task.clone(),
                         segments_done: snapshot,
+                        etag: etag_owned.clone(),
+                        last_modified: lm_owned.clone(),
                     };
                     meta.save(&part_target);
                 }
@@ -1352,6 +1446,8 @@ pub async fn download_direct(
         total,
         segments_total: totals_vec.clone(),
         segments_done: final_done,
+        etag: info.etag.clone(),
+        last_modified: info.last_modified.clone(),
     };
     for (i, r) in results.iter().enumerate() {
         if let Ok(written) = r {
@@ -1873,6 +1969,11 @@ mod tests {
         }
     }
 
+    /// 测试便捷封装：服务器锚点两侧都缺席（旧版本行为）的判定路径。
+    fn ric(m: &PartMeta, url: &str, total: u64, ranges: &[(u64, u64)], file_len: u64) -> bool {
+        resume_is_consistent(m, url, total, ranges, file_len, None, None)
+    }
+
     /// 回归（M-3 断点互证）：伪造/损坏的 `.veloxgrab-part` 不能骗过续传判定。
     ///
     /// 判据是纯函数，逐条对应注释里列的三种盘上损坏 + 两种合法场景。
@@ -1886,50 +1987,142 @@ mod tests {
             total,
             segments_total: ranges.iter().map(|(s, e)| e - s + 1).collect(),
             segments_done: vec![seg_len; 4],
+            etag: None,
+            last_modified: None,
         };
         // 写满但文件短了三段：done 总和 > file_len，不成立
-        assert!(!resume_is_consistent(&good, "https://e.com/f.bin", total, &ranges, total - seg_len));
+        assert!(!ric(&good, "https://e.com/f.bin", total, &ranges, total - seg_len));
         // 完整文件 + 全部写满 → 放行（已下完的边界，交给 merge 校验，无害）
-        assert!(resume_is_consistent(&good, "https://e.com/f.bin", total, &ranges, total));
+        assert!(ric(&good, "https://e.com/f.bin", total, &ranges, total));
 
         // 某段谎报进度：done > seg_len（伪造）
         let mut over = good.clone();
         over.segments_done[0] = seg_len + 1024;
-        assert!(!resume_is_consistent(&over, "https://e.com/f.bin", total, &ranges, total));
+        assert!(!ric(&over, "https://e.com/f.bin", total, &ranges, total));
 
         // 文件被截短到只剩前 3 段：第 4 段声称写满，它的写入区间越过 EOF
-        assert!(!resume_is_consistent(
+        assert!(!ric(
             &good, "https://e.com/f.bin", total, &ranges, seg_len * 3
         ));
         // 前 3 段写满 + 第 4 段没写，盘长恰好 3 段：这是合法的中断续传
         let mut three = good.clone();
         three.segments_done[3] = 0;
-        assert!(resume_is_consistent(
+        assert!(ric(
             &three, "https://e.com/f.bin", total, &ranges, seg_len * 3
         ));
         // 同样 meta 但文件被砍到 2 段半：第 3 段的尾部字节没了 → 拒绝
-        assert!(!resume_is_consistent(
+        assert!(!ric(
             &three, "https://e.com/f.bin", total, &ranges, seg_len * 2 + seg_len / 2
         ));
 
         // url 换人 / 总长换人 / 段数对不上 / 分段边界漂移
-        assert!(!resume_is_consistent(&good, "https://evil.com/f.bin", total, &ranges, total));
-        assert!(!resume_is_consistent(&good, "https://e.com/f.bin", total + 1, &ranges, total));
+        assert!(!ric(&good, "https://evil.com/f.bin", total, &ranges, total));
+        assert!(!ric(&good, "https://e.com/f.bin", total + 1, &ranges, total));
         let shifted = split_ranges(total, 5); // 线程数变了，段长不同
-        assert!(!resume_is_consistent(&good, "https://e.com/f.bin", total, &shifted, total));
+        assert!(!ric(&good, "https://e.com/f.bin", total, &shifted, total));
         let fewer = split_ranges(total, 2);
-        assert!(!resume_is_consistent(&good, "https://e.com/f.bin", total, &fewer, total));
+        assert!(!ric(&good, "https://e.com/f.bin", total, &fewer, total));
 
         // 合法的中段续传：文件预分配成 total（长度够），每段各写了一半
         let mut half = good.clone();
         for d in half.segments_done.iter_mut() {
             *d = seg_len / 2;
         }
-        assert!(resume_is_consistent(&half, "https://e.com/f.bin", total, &ranges, total));
+        assert!(ric(&half, "https://e.com/f.bin", total, &ranges, total));
         // 但如果文件本身被截短到连「后段写到一半」的区间都容不下，必须拒绝
-        assert!(!resume_is_consistent(
+        assert!(!ric(
             &half, "https://e.com/f.bin", total, &ranges, seg_len * 2
         ));
+    }
+
+    /// 回归（服务器侧续传锚点）：断点记下的 ETag / Last-Modified 与本次探测
+    /// 不一致 = 服务器上的资源已更换，必须弃断点从头下——否则同长度换内容
+    /// 会拼出「长度正确、内容错乱」的静默损坏成品。
+    #[test]
+    fn resume_is_consistent_rejects_changed_server_anchor() {
+        let total = 10 * 1024 * 1024u64;
+        let ranges = split_ranges(total, 4);
+        let seg_len = ranges[0].1 - ranges[0].0 + 1;
+        let with_anchor = PartMeta {
+            url: "https://e.com/f.bin".into(),
+            total,
+            segments_total: ranges.iter().map(|(s, e)| e - s + 1).collect(),
+            segments_done: vec![seg_len; 4],
+            etag: Some("\"abc123\"".into()),
+            last_modified: Some("Wed, 21 Oct 2026 07:28:00 GMT".into()),
+        };
+        // 锚点一致 → 放行
+        assert!(resume_is_consistent(
+            &with_anchor,
+            "https://e.com/f.bin",
+            total,
+            &ranges,
+            total,
+            Some("\"abc123\""),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+        ));
+        // ETag 变了（资源已更换）→ 拒绝，哪怕长度、URL 全部吻合
+        assert!(!resume_is_consistent(
+            &with_anchor,
+            "https://e.com/f.bin",
+            total,
+            &ranges,
+            total,
+            Some("\"deadbeef\""),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+        ));
+        // Last-Modified 变了 → 同样拒绝
+        assert!(!resume_is_consistent(
+            &with_anchor,
+            "https://e.com/f.bin",
+            total,
+            &ranges,
+            total,
+            Some("\"abc123\""),
+            Some("Thu, 22 Oct 2026 07:28:00 GMT"),
+        ));
+        // 服务器这次没给 ETag（探不到 ≠ 变了）：不因缺席而弃断点
+        assert!(resume_is_consistent(
+            &with_anchor,
+            "https://e.com/f.bin",
+            total,
+            &ranges,
+            total,
+            None,
+            Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+        ));
+        // 旧版本断点（没记锚点）+ 现在有锚点：同样放行（无据可查 ≠ 不一致）
+        let legacy = PartMeta {
+            url: "https://e.com/f.bin".into(),
+            total,
+            segments_total: ranges.iter().map(|(s, e)| e - s + 1).collect(),
+            segments_done: vec![seg_len; 4],
+            etag: None,
+            last_modified: None,
+        };
+        assert!(resume_is_consistent(
+            &legacy,
+            "https://e.com/f.bin",
+            total,
+            &ranges,
+            total,
+            Some("\"abc123\""),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+        ));
+    }
+
+    /// Content-Range 首字节解析：标准形态、无空格、通配 total、畸形输入。
+    #[test]
+    fn parse_content_range_first_byte_covers_shapes() {
+        assert_eq!(parse_content_range_first_byte("bytes 500-999/1000"), Some(500));
+        assert_eq!(parse_content_range_first_byte("bytes 0-0/1"), Some(0));
+        assert_eq!(parse_content_range_first_byte("bytes=500-999/1000"), Some(500));
+        // 通配 total（未知总长）仍取得到起点
+        assert_eq!(parse_content_range_first_byte("bytes 100-*/1234"), Some(100));
+        // 通配起点 / 非 bytes 单位 / 垃圾 → None（调用方按不拦截处理）
+        assert_eq!(parse_content_range_first_byte("bytes */1234"), None);
+        assert_eq!(parse_content_range_first_byte("items 1-2/3"), None);
+        assert_eq!(parse_content_range_first_byte(""), None);
     }
 
     /// M-1：URL 字面量闸门的逐分支判定。
@@ -1945,6 +2138,10 @@ mod tests {
         assert!(url_target_guarded("http://0.0.0.0/x").is_err());
         assert!(url_target_guarded("http://[fe80::1]/x").is_err());
         assert!(url_target_guarded("http://[::]/x").is_err());
+        // IPv4-mapped IPv6 是同一批地址的等价拼写（OS/hyper 按 IPv4 直连）：
+        // 不拦的话 v4 字面量闸形同虚设
+        assert!(url_target_guarded("http://[::ffff:169.254.169.254]/latest/meta-data/").is_err());
+        assert!(url_target_guarded("http://[::ffff:0.0.0.0]/x").is_err());
         // 非 http(s) scheme：拦（file:// 是「复制本机文件」原语）
         assert!(url_target_guarded("file:///C:/Windows/win.ini").is_err());
         assert!(url_target_guarded("gopher://x/y").is_err());

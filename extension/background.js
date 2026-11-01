@@ -68,7 +68,7 @@ chrome.alarms.onAlarm.addListener((a) => {
 // 里加载过它——那正是「装上去了但浏览器里没有扩展」的成因。
 // SW 每次被唤醒（含浏览器启动、扩展刚加载）都会跑这一行，所以只要加载成功，
 // VeloxGrab 那边最多几十秒内就能知道。
-function ping() {
+async function ping() {
   // 必须用 POST + JSON 而不是裸 GET。
   //
   // 裸 GET 在 Chromium 里属于「简单请求」，**不带 Origin 头**；VeloxGrab 那边正是
@@ -76,14 +76,17 @@ function ping() {
   // 却没被记成「扩展已加载」——用户装好了扩展，程序还在提示没装。
   // POST 带 Content-Type: application/json 会触发 CORS 预检，浏览器必定附上
   // Origin: chrome-extension://<id>，门禁才认得出它。
-  fetch(`${BRIDGE}/ping`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ext: chrome.runtime.id }),
-    cache: "no-store",
-  })
-    .then((r) => console.log("[veloxgrab] ping", r.status))
-    .catch((e) => console.warn("[veloxgrab] ping failed:", String(e)));
+  try {
+    const res = await fetch(`${BRIDGE}/ping`, {
+      method: "POST",
+      headers: await bridgeHeaders(),
+      body: JSON.stringify({ ext: chrome.runtime.id }),
+      cache: "no-store",
+    });
+    console.log("[veloxgrab] ping", res.status);
+  } catch (e) {
+    console.warn("[veloxgrab] ping failed:", String(e));
+  }
 }
 ping();
 
@@ -168,7 +171,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
     const filename = pickFilename(item);
     const ok = await send({ url: item.url, filename, dir: cfg.dir, threads: cfg.threads });
 
-    if (!ok) {
+    if (ok === false) {
       // VeloxGrab 没接住：浏览器那条已经被取消并抹掉了，这里不还回去的话
       // 用户点一次下载会「什么都没发生」。重新交给浏览器下载。
       // 扩展发起的下载带 byExtensionId，上面的监听器会跳过它，不会成环。
@@ -180,12 +183,23 @@ chrome.downloads.onCreated.addListener(async (item) => {
         // 仍然失败就只能靠 send() 里的剪贴板兜底了
       }
     }
+    // ok === "unknown"（协议已尝试、结果不可知）时**不能**还回浏览器下载：
+    // 协议万一真成功了就是重复下载。让用户看提示自行判断。
 
     if (cfg.notify) {
-      notify(
-        ok ? "已转给 VeloxGrab" : "VeloxGrab 未响应，已交回浏览器下载",
-        ok ? filename || item.url : "请确认 VeloxGrab 正在运行（托盘图标可见）"
-      );
+      if (ok === true) {
+        notify("已转给 VeloxGrab", filename || item.url);
+      } else if (ok === "unknown") {
+        notify(
+          "已尝试唤起 VeloxGrab",
+          "Chrome 会拦掉部分协议唤起；若程序没弹出下载，请打开 VeloxGrab 重试一次"
+        );
+      } else {
+        notify(
+          "VeloxGrab 未响应，已交回浏览器下载",
+          "请确认 VeloxGrab 正在运行（托盘图标可见）"
+        );
+      }
     }
   } finally {
     // 转发结束才解账：发送期间若因重定向再触发一次 onCreated，仍会被拦下。
@@ -213,14 +227,47 @@ function getConfig() {
   });
 }
 
+// ---------- 桥 token ----------
+//
+// 桥要求请求携带共享 token（bridge-token.txt 随扩展打包，桌面端从安装目录
+// 读同一份文件）。Origin 门禁只认 scheme 前缀——**任何**已装扩展都能通过，
+// 包括被供应链投毒的零权限扩展；token 把门禁收紧到「持有本程序分发的扩展」。
+// 旧版扩展不带这个头：桌面端回 403 + 更新提示，此时只剩协议/剪贴板兜底。
+// SW 会被浏览器回收，所以每次 SW 生命周期内读一次即可，缓存到模块变量。
+let bridgeToken = null;
+
+async function getBridgeToken() {
+  if (bridgeToken !== null) return bridgeToken;
+  try {
+    const res = await fetch(chrome.runtime.getURL("bridge-token.txt"), { cache: "no-store" });
+    bridgeToken = (await res.text()).trim();
+  } catch {
+    bridgeToken = "";
+  }
+  return bridgeToken;
+}
+
+/** 桥请求的公共头：JSON + 共享 token。 */
+async function bridgeHeaders() {
+  const h = { "Content-Type": "application/json" };
+  const t = await getBridgeToken();
+  if (t) h["X-VeloxGrab-Token"] = t;
+  return h;
+}
+
 // ---------- 发送 ----------
 
 /**
  * 把一条下载请求交给 VeloxGrab。
  *
- * 顺序很重要：**先桥后协议**。桥是同步返回成败的，能明确告诉用户
- * 「发出去了」还是「VeloxGrab 没开」；协议导航永远是「成功」的假象
- * （Chrome 拦掉也不报错），只能当兜底。
+ * 返回值三态（不要当成布尔用）：
+ * - `true`     桥确认送达，可以放心告诉用户「发出去了」；
+ * - `"unknown"` 协议导航已尝试。Chrome 对扩展发起的自定义协议导航**静默拦截**
+ *   （文件头注释），成功与否无从得知——调用方必须按「不确定」措辞提示，
+ *   并且**不能**把浏览器下载还回去（协议万一真成功了就是重复下载）；
+ * - `false`    全部路径失败，调用方自行兜底（交回浏览器 / 提示剪贴板）。
+ *
+ * 顺序很重要：**先桥后协议**。桥是同步返回成败的；协议只是兜底。
  */
 async function send(target) {
   if (!target || !target.url) return false;
@@ -239,7 +286,7 @@ async function send(target) {
     const timer = setTimeout(() => ctrl.abort(), 2000);
     const res = await fetch(`${BRIDGE}/add`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: await bridgeHeaders(),
       body: JSON.stringify({
         url: target.url,
         name: target.filename || "",
@@ -252,18 +299,27 @@ async function send(target) {
     if (res.ok) {
       const j = await res.json().catch(() => ({}));
       if (j && j.ok) return true;
+      // 403 + token mismatch 说明桌面端比扩展新（要求共享 token），把原因
+      // 带给用户，别让「点了没反应」重演。
+      if (j && j.error && /token/i.test(String(j.error))) {
+        notify("VeloxGrab 已更新", "请到 chrome://extensions 刷新 VeloxGrab 扩展后再试");
+        return false;
+      }
     }
   } catch {
     // 桥不可用 → 走协议
   }
 
-  // 2. veloxgrab:// 协议导航（兜底）
+  // 2. veloxgrab:// 协议导航（兜底，结果不可知）
   const link = buildLink(target);
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && tab.id) {
       await chrome.tabs.update(tab.id, { url: link });
-      return true;
+      // 旧实现这里无条件 return true——正是文件头注释里「Chrome 静默拦截扩展
+      // 发起的自定义协议导航」的那个行为被当成了成功：通知说「已转给
+      // VeloxGrab」，实际什么都没发生。导航没有成功回调，结果只能标「不确定」。
+      return "unknown";
     }
   } catch {
     // 继续落到剪贴板
@@ -366,7 +422,14 @@ async function handleMenuClick(info, tab) {
     notify("发送失败", String(e).slice(0, 200));
     return;
   }
-  if (!ok) {
+  if (ok === true) {
+    // 桥已确认，不用打扰用户
+  } else if (ok === "unknown") {
+    notify(
+      "已尝试唤起 VeloxGrab",
+      "Chrome 会拦掉部分协议唤起；若程序没弹出下载，请打开 VeloxGrab 重试一次"
+    );
+  } else {
     notify("VeloxGrab 没有响应", "请确认 VeloxGrab 正在运行（托盘图标可见）");
   }
 }

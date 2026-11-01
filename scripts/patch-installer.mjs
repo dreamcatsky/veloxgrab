@@ -191,6 +191,35 @@ SectionEnd
   return true;
 }
 
+// 检测 setup.exe 是否已有 Authenticode 签名。
+//
+// 本脚本会用 makensis **重新编译**并覆盖 tauri 的产物——重编译产物必然没有
+// 签名。今天 tauri.conf 没配 signing，这里没有签名可破坏；但一旦构建链任何
+// 环节开始签名（tauri bundle > windows > signing 或流水线后置 signtool），
+// 本脚本就会无警告地产出未签名 exe 并顶替签名包，审计链断裂。
+// 返回 "signed" | "unsigned" | "unknown"（检测本身失败，不阻塞流程只告警）。
+function detectSignature(exePath) {
+  try {
+    const out = execFileSync(
+      "powershell",
+      [
+        "-NoProfile",
+        "-Command",
+        `(Get-AuthenticodeSignature -LiteralPath "${exePath.replace(/'/g, "''")}").Status.ToString()`,
+      ],
+      { encoding: "utf8", timeout: 30_000 },
+    );
+    const s = String(out).trim();
+    // Valid = 有效签名；HashMismatch 等也是「签过」——一律视为有签名，宁拦勿漏
+    if (s === "Valid" || s === "HashMismatch" || s === "NotTrusted") return "signed";
+    if (s === "NotSigned") return "unsigned";
+    return "unknown";
+  } catch (e) {
+    console.warn(`  [warn] 签名检测失败（忽略并继续）：${String(e).slice(0, 120)}`);
+    return "unknown";
+  }
+}
+
 // 用 patch 后的 nsi 重新跑 makensis。
 // 关键：nsi 自己写了 `!define OUTFILE "nsis-output.exe"` —— 这是 tauri 通过
 // 命令行注入的**占位默认值**。天真地传 `/DOUTFILE=<path>` 是没用的：nsi 里的
@@ -232,8 +261,27 @@ fs.mkdirSync(bundleDir, { recursive: true });
 const versionMatch = /^!define VERSION "([^"]+)"/m.exec(
   fs.readFileSync(path.join(dirs[0], "installer.nsi"), "utf8")
 );
-const version = versionMatch ? versionMatch[1] : "0.1.0";
+// 版本号失配必须立刻失败：静默回退到 "0.1.0" 会产出
+// VeloxGrab_0.1.0_x64-setup.exe 这种错误名字的包，还无人察觉。
+if (!versionMatch) {
+  throw new Error("installer.nsi 里找不到 !define VERSION（tauri 生成结构变了？）");
+}
+const version = versionMatch[1];
 const outputExe = path.join(bundleDir, `VeloxGrab_${version}_x64-setup.exe`);
+
+// 签名守卫：重编译产物必然无签名。若现有的安装包已带 Authenticode 签名
+// （未来构建链引入签名后就是常态），没有 --force 就停下来，而不是默默
+// 产出未签名 exe 顶替签名包、砍断审计链。今天没签名，此守卫恒不触发。
+if (fs.existsSync(outputExe) && detectSignature(outputExe) === "signed") {
+  if (process.argv.includes("--force")) {
+    console.warn("  [warn] 输入安装包已有签名，--force 已确认：将产出未签名的重打包");
+  } else {
+    throw new Error(
+      `${outputExe} 已有 Authenticode 签名，重编译会用未签名包顶替它。` +
+        "正确顺序是 patch → 重打 → 再签名；确要覆盖请加 --force。"
+    );
+  }
+}
 
 let patched = 0;
 for (const d of dirs) {

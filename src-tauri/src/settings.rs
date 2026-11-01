@@ -625,10 +625,23 @@ fn settings_path() -> PathBuf {
 }
 
 pub fn load_settings(state: &AppState) -> Settings {
-    if let Ok(guard) = state.settings.lock() {
-        return guard.clone();
+    load_settings_from_shared(&state.settings)
+}
+
+/// 从共享的内存权威副本读一份快照（不读盘、不做 DPAPI 解密）。
+///
+/// 泵与 worker 启动的热路径专用：旧实现每次续泵、每个任务启动都调
+/// `read_settings_from_disk`——整文件读 + JSON 解析 + 两次 CryptUnprotectData
+/// 全部同步跑在 tokio worker 上，还被 pump_lock 串行放大（杀软扫描
+/// settings.json 的延迟会拖住所有排队任务）。内存权威副本由
+/// `save_settings` / `set_theme` / `remember_trusted_dir` 在 RMW 闸内回写，
+/// 与盘上的差异只剩「写盘刚失败」这种极端场景。
+pub(crate) fn load_settings_from_shared(shared: &std::sync::Mutex<Settings>) -> Settings {
+    match shared.lock() {
+        Ok(g) => g.clone(),
+        // 中毒时退默认值：与 load_settings 的容错方向一致
+        Err(_) => Settings::default(),
     }
-    Settings::default()
 }
 
 pub fn read_settings_from_disk() -> Settings {
@@ -928,10 +941,33 @@ pub fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
     load_settings(&state)
 }
 
+/// 三个「整份读-改-写」写者（save_settings / set_theme / remember_trusted_dir）
+/// 的串行化闸。
+///
+/// 只靠 persist_settings 的磁盘互斥不够：那把闸只串行化「一次写盘」，不串行化
+/// 「读快照 → persist 整份 → 回写内存」整个周期。并发交错时：T1 save_settings
+/// 落盘新值 → T2 set_theme 在 T1 的 persist 与回写之间读到**旧**快照，把
+/// 「旧整份 + 新主题」写盘 → 用户刚保存的下载目录/代理在磁盘上被回滚（内存
+/// 却是新值，重启后以盘为准）。同理 T2 为 remember_trusted_dir 时，确认框
+/// 攒下的信任目录会被随后的 save_settings persist 抹掉。三个写者全程持这把
+/// 锁，周期间互斥，读到的快照永远是最新已提交值。
+///
+/// 用 std Mutex：三个写者都是同步命令，锁内只有本地磁盘 IO，不跨 await。
+/// 锁序永远是 RMW → state.settings，没有任何反向路径，不成环。
+static SETTINGS_RMW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn rmw_lock() -> std::sync::MutexGuard<'static, ()> {
+    // 中毒也要继续：上一个持有者 panic 不该让设置从此写不进去。
+    SETTINGS_RMW.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 把「用户刚在原生确认框里同意过」的目录写入内存与磁盘（闸门放行后调用）。
 ///
 /// 落盘失败只影响「下次启动要不要再问一遍」，不推翻本次放行，所以返回 ()。
 pub(crate) fn remember_trusted_dir(state: &AppState, dir: &str) {
+    // RMW 闸内完成「改内存 → 落盘」：与 save_settings / set_theme 的整份写
+    // 互斥，信任目录不会被并发保存用旧快照抹掉。
+    let _rmw = rmw_lock();
     let snapshot = {
         let Ok(mut guard) = state.settings.lock() else { return };
         guard.remember_trusted(dir);
@@ -972,22 +1008,29 @@ pub fn save_settings(
     // 若这里照收，受损 webview 只要往表单里塞一句 `"trusted_dirs":["C:\\win"]`
     // 就把整个高-1 闸门旁路掉了。以**后端现值**为基准合并：确认框攒下的信任
     // 不能被一次「保存设置」抹掉，否则用户改个主题都要重新被问一遍目录。
-    let (old_root, old_trusted) = match state.settings.lock() {
-        Ok(guard) => (guard.download_dir.clone(), guard.trusted_dirs.clone()),
-        // 中毒时按「没有旧值」处理：宁可重新问一遍，不凭空造信任
-        Err(_) => (String::new(), Vec::new()),
-    };
-    settings.trusted_dirs = old_trusted;
-    settings.absorb_replaced_root(&old_root);
+    //
+    // 以下整段（读旧值 → 合并 → persist → 回写内存）在 RMW 闸内完成：
+    // 与 set_theme / remember_trusted_dir 的整份写互斥，旧快照回滚问题见
+    // SETTINGS_RMW 的文档。
+    {
+        let _rmw = rmw_lock();
+        let vals = match state.settings.lock() {
+            Ok(guard) => (guard.download_dir.clone(), guard.trusted_dirs.clone()),
+            // 中毒时按「没有旧值」处理：宁可重新问一遍，不凭空造信任
+            Err(_) => (String::new(), Vec::new()),
+        };
+        settings.trusted_dirs = vals.1;
+        settings.absorb_replaced_root(&vals.0);
 
-    // 原子写统一走 persist_settings（进程内串行 + 独立临时文件名）：
-    // 与 set_theme / 迁移回写共用一把闸，杜绝同名 .tmp 互踩。
-    // 注意：absorb 只进内存，persist 失败时盘上仍是旧值——重启后以盘为准，
-    // 最坏结果是多弹一次确认框，不影响正确性。
-    persist_settings(&settings)?;
+        // 原子写统一走 persist_settings（进程内串行 + 独立临时文件名）：
+        // 与 set_theme / 迁移回写共用一把闸，杜绝同名 .tmp 互踩。
+        // 注意：absorb 只进内存，persist 失败时盘上仍是旧值——重启后以盘为准，
+        // 最坏结果是多弹一次确认框，不影响正确性。
+        persist_settings(&settings)?;
 
-    if let Ok(mut guard) = state.settings.lock() {
-        *guard = settings.clone();
+        if let Ok(mut guard) = state.settings.lock() {
+            *guard = settings.clone();
+        }
     }
     // 开机自启跟着保存走：失败不回滚设置（设置本身已落盘），只打日志。
     if let Err(e) = apply_autostart(settings.autostart) {
@@ -1038,15 +1081,21 @@ pub(crate) fn normalize_name_conflict(v: &str) -> &'static str {
 pub fn set_theme(state: tauri::State<'_, AppState>, theme: String) -> Result<String, String> {
     let normalized = normalize_theme(&theme).to_string();
 
-    let mut current = load_settings(&state);
-    current.theme = normalized.clone();
+    // RMW 闸内完成「读快照 → 改 → 落盘 → 回写内存」：快照在闸内读取，与
+    // save_settings / remember_trusted_dir 的整份写互斥——不会把并发保存刚
+    // 落盘的其它字段用旧快照顶回去（问题形态见 SETTINGS_RMW 的文档）。
+    {
+        let _rmw = rmw_lock();
+        let mut current = load_settings(&state);
+        current.theme = normalized.clone();
 
-    // 与 save_settings 同一把闸、同一套原子写：主题是高频改动项（用户会来回切着
-    // 看效果），截断的 settings.json 会让整份配置报废。
-    persist_settings(&current)?;
+        // 与 save_settings 同一把磁盘闸、同一套原子写：主题是高频改动项（用户会来回切着
+        // 看效果），截断的 settings.json 会让整份配置报废。
+        persist_settings(&current)?;
 
-    if let Ok(mut guard) = state.settings.lock() {
-        guard.theme = normalized.clone();
+        if let Ok(mut guard) = state.settings.lock() {
+            guard.theme = normalized.clone();
+        }
     }
     Ok(normalized)
 }
