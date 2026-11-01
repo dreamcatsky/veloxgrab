@@ -13,6 +13,12 @@
        用 HTML 自绘而不是 tauri::Menu：原生菜单画在 webview 之外的窗口客户区，
        既吃不到本程序的深色主题（Windows 上会是浅色一块），也没法在截图里验证。 -->
   <nav class="menubar" id="menubar">
+    <!-- 18px 品牌标记：应用名已在系统标题栏，这里只留识别标记 -->
+    <div class="brand" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 5l8 14 8-14" />
+      </svg>
+    </div>
     <div class="menu" data-menu="task">
       <button class="menu-btn" data-i18n="menuTask">任务(T)</button>
       <div class="menu-pop">
@@ -223,6 +229,7 @@
       <div id="settingsView" class="center-view">
         <div class="form">
 
+          <section class="set-card wide">
           <h3 class="sec-title" data-i18n="secDownload">下载</h3>
 
           <label class="fld">
@@ -294,7 +301,9 @@
               <option value="overwrite" data-i18n="nameOverwrite">覆盖旧文件</option>
             </select>
           </label>
+          </section>
 
+          <section class="set-card wide">
           <h3 class="sec-title" data-i18n="secHeaders">自定义请求头</h3>
 
           <div class="hdr-presets">
@@ -306,7 +315,9 @@
               </button>
             </div>
           </div>
+          </section>
 
+          <section class="set-card">
           <h3 class="sec-title" data-i18n="secBehavior">弹窗与行为</h3>
 
           <label class="fld checkbox">
@@ -357,7 +368,9 @@
               <option value="quit" data-i18n="closeQuit">退出程序</option>
             </select>
           </label>
+          </section>
 
+          <section class="set-card">
           <h3 class="sec-title" data-i18n="secVideo">视频与 Cookie</h3>
 
           <label class="fld">
@@ -379,7 +392,9 @@
               <button id="pickCookies" class="ghost"><span data-i18n="pickFileBtn">选择…</span></button>
             </div>
           </label>
+          </section>
 
+          <section class="set-card">
           <h3 class="sec-title" data-i18n="secProxy">代理</h3>
 
           <label class="fld checkbox">
@@ -413,7 +428,9 @@
             </label>
           </div>
           <small class="dim" data-i18n="proxyHint">SOCKS5 走 socks5h（远端解析 DNS），可对接 v2rayN 的 10808 端口</small>
+          </section>
 
+          <section class="set-card">
           <h3 class="sec-title" data-i18n="secMisc">集成与界面</h3>
 
           <div class="fld">
@@ -441,6 +458,7 @@
               <option value="light" data-i18n="themeLight">浅色</option>
             </select>
           </label>
+          </section>
 
           <div class="actions settings-actions">
             <button id="saveSettings" class="primary"><span data-i18n="save">保存设置</span></button>

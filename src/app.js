@@ -1176,6 +1176,19 @@
     return null;
   }
 
+  // 任务行左侧的类型图标：颜色由 .tr-icon.v/.m/.p/.a/.d 决定，
+  // 认不出扩展名时退回中性的下载箭头。
+  function fileIcon(t) {
+    const map = {
+      video: ["v", "▶"],
+      music: ["m", "♪"],
+      program: ["p", "⚙"],
+      archive: ["a", "▣"],
+      document: ["d", "▤"],
+    };
+    return map[fileCategory(t)] || ["", "⬇"];
+  }
+
   // 当前视图是否接受这条任务。分类项与状态项是两套维度，
   // 但都作用在同一张表上，所以用同一个 currentView 决定。
   function matchView(t) {
@@ -1219,25 +1232,33 @@
     };
     row.appendChild(check);
 
-    // 名称列：主行是文件名，副行是来源/清晰度等补充信息。
+    // 名称列：类型图标 + 两行文字（主行文件名，副行来源/清晰度/错误摘要）。
     // 单独一列放不下路径，用 title 兜住，悬停能看全。
     const nameCell = el("div", "tr-name");
+    const [iconCls, iconText] = fileIcon(t);
+    nameCell.appendChild(el("span", "tr-icon" + (iconCls ? " " + iconCls : ""), iconText));
+
+    const textCell = el("div", "tr-name-text");
     const title = el("div", "tr-title", t.title || t.url);
     title.title = t.output_path || t.url || t.title || "";
-    nameCell.appendChild(title);
+    textCell.appendChild(title);
     const subBits = [];
     // 直链任务的 quality_label 是后端填的「手动新建」，写出来等于没说；
     // 换成来源域名，用户一眼能看出这个文件是从哪儿下的。
     const host = hostOf(t.url);
     if (t.kind === "direct" && host) subBits.push(host);
     else if (t.quality_label) subBits.push(t.quality_label);
-    if (t.state === "failed" && t.error) subBits.push(t.error);
+    const failed = t.state === "failed" && t.error;
+    if (failed) subBits.push(t.error);
     else if (t.output_path && t.state === "done") subBits.push(t.output_path);
     if (subBits.length) {
       const sub = el("div", "tr-sub", subBits.join("  ·  "));
+      // 失败摘要用错误色；完整堆栈仍在详情/编辑弹窗里
+      if (failed) sub.classList.add("bad");
       sub.title = subBits.join("  ·  ");
-      nameCell.appendChild(sub);
+      textCell.appendChild(sub);
     }
+    nameCell.appendChild(textCell);
     row.appendChild(nameCell);
 
     // 大小：优先总量，没有总量（yt-dlp 解析前）时退回到已下载量
@@ -1548,6 +1569,14 @@
       .filter((p) => p.headers.length);
   }
 
+  // 滑块轨道填充：Chromium 没有 ::-moz-range-progress，只能用 --p 画渐变
+  function syncRangeFill(input) {
+    const min = Number(input.min) || 0;
+    const max = Number(input.max) || 100;
+    const pct = max > min ? ((Number(input.value) - min) / (max - min)) * 100 : 0;
+    input.style.setProperty("--p", pct + "%");
+  }
+
   function fillSettingsForm(s) {
     $("setDownloadDir").value = s.download_dir || "";
     // 手动新建的默认目录：用户没填时用全局默认目录填空，省得每次都要想
@@ -1558,6 +1587,9 @@
     $("setDefaultThreadsVal").textContent = s.default_threads ?? 8;
     $("setFragments").value = s.concurrent_fragments;
     $("setFragmentsVal").textContent = s.concurrent_fragments;
+    ["setConcurrent", "setDefaultThreads", "setFragments"].forEach((id) =>
+      syncRangeFill($(id))
+    );
     $("setHfCap").value = s.hf_thread_cap ?? 4;
     $("setHfToken").value = s.hf_token || "";
     $("setRateLimit").value = s.rate_limit_kb ?? 0;
@@ -2525,12 +2557,15 @@
 
   $("setConcurrent").addEventListener("input", (e) => {
     $("setConcurrentVal").textContent = e.target.value;
+    syncRangeFill(e.target);
   });
   $("setFragments").addEventListener("input", (e) => {
     $("setFragmentsVal").textContent = e.target.value;
+    syncRangeFill(e.target);
   });
   $("setDefaultThreads").addEventListener("input", (e) => {
     $("setDefaultThreadsVal").textContent = e.target.value;
+    syncRangeFill(e.target);
   });
 
   $("pickDir").onclick = async () => {
