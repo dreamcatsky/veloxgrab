@@ -188,9 +188,28 @@ pub fn run() {
                 });
             }
 
+            // 冷启动把**原生标题栏**对齐到应用主题：theme.js 只管得到 webview
+            // 里的 CSS，DWM 画的标题栏不设置就跟系统走——深色系统上的浅色
+            // 用户会看到一帧黑标题栏。跟随系统的语义交回 Windows（None）。
+            {
+                let saved = state
+                    .settings
+                    .lock()
+                    .map(|g| g.theme.clone())
+                    .unwrap_or_default();
+                let t = match saved.as_str() {
+                    "light" => Some(tauri::Theme::Light),
+                    "dark" => Some(tauri::Theme::Dark),
+                    _ => None,
+                };
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.set_theme(t);
+                }
+            }
+
             app.manage(state);
 
-            // 历史模块要能触达用户（损坏重置等事件），启动时把句柄给它
+            // 历史模块要能触达用户（损坏重置等事件经它 emit），启动时把句柄给它
             crate::history::set_app_handle(app.handle().clone());
 
             // 托盘图标：关窗口缩到托盘，后台继续下载。
@@ -316,6 +335,7 @@ pub fn run() {
             settings::get_settings,
             settings::save_settings,
             settings::set_theme,
+            settings::set_window_theme,
             settings::default_settings,
             update::check_update,
             update::update_now,

@@ -1089,6 +1089,31 @@ pub(crate) fn normalize_name_conflict(v: &str) -> &'static str {
     }
 }
 
+/// 把**原生窗口**的主题对齐到应用主题（Windows 标题栏颜色跟随 DWM）。
+///
+/// webview 内容的明暗由 CSS 变量画（theme.js 的 `data-theme`），但标题栏是
+/// DWM 画的：不显式设置时它跟随 Windows 系统主题——深色系统 + 浅色应用
+/// 会顶着一条黑标题栏（用户实测抓到）。Tauri 的 `set_theme` 底层写
+/// `DWMWA_USE_IMMERSIVE_DARK_MODE`，只影响原生边框/标题栏。
+///
+/// 入参是 theme.js 的**三态原值**：`system` 映射成 None 让窗口跟随系统——
+/// 不能在前端解析成两态再传过来，`set_theme(Some(..))` 会把 webview 的
+/// `prefers-color-scheme` 一并钉死，「跟随系统」从此失灵。
+#[tauri::command]
+pub fn set_window_theme(app: tauri::AppHandle, theme: String) {
+    use tauri::Manager;
+    let t = match theme.trim() {
+        "light" => Some(tauri::Theme::Light),
+        "dark" => Some(tauri::Theme::Dark),
+        _ => None,
+    };
+    for name in ["main", "progress"] {
+        if let Some(w) = app.get_webview_window(name) {
+            let _ = w.set_theme(t);
+        }
+    }
+}
+
 /// 只改主题一个字段。
 ///
 /// 为什么不复用 `save_settings`：那会把前端表单里**当前**的每一项都写一遍，

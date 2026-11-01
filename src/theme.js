@@ -36,6 +36,21 @@
   var mql = null;
   var follow = function () {};
 
+  // 原生标题栏对齐：webview 的 CSS 管不到 DWM 画的标题栏，不显式设置时
+  // 它跟随 Windows 系统主题——深色系统上的浅色应用会顶着一条黑标题栏。
+  // 必须传**三态原值**：system 原样传给 Rust（映射成 None = 窗口跟随系统）。
+  // 如果这里传解析后的两态，set_theme(Some(...)) 会把 webview 的
+  // prefers-color-scheme 一并钉死，「跟随系统」在系统明暗再切换时就失灵。
+  function syncNative(t) {
+    try {
+      var inv =
+        window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
+      if (inv) inv("set_window_theme", { theme: t }).catch(function () {});
+    } catch (e) {
+      // 对齐失败只影响标题栏颜色，不值得让它炸首帧
+    }
+  }
+
   function apply(theme) {
     var t = normalize(theme);
     document.documentElement.setAttribute("data-theme", resolve(t));
@@ -46,6 +61,7 @@
       // 隐私模式下 localStorage 可能直接抛。写不进去不影响本次渲染，
       // 只是下次启动要重新按系统猜一次。
     }
+    syncNative(t);
 
     // 只有「跟随系统」时才需要监听系统切换。
     // 切到显式 light/dark 时必须把旧监听摘掉：否则用户刚选了深色，
