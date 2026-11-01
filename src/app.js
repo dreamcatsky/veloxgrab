@@ -1615,9 +1615,6 @@
     const max = Number(input.max) || 100;
     const pct = max > min ? ((Number(input.value) - min) / (max - min)) * 100 : 0;
     input.style.setProperty("--p", pct + "%");
-    // 无单位比例（0..1），给数值气泡的 calc 定位用：
-    // left = 拇指半径 + (轨道宽 - 拇指直径) * --pn，窗口缩放自动跟随
-    input.style.setProperty("--pn", String(pct / 100));
   }
 
   function fillSettingsForm(s) {

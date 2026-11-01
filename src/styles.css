@@ -1256,31 +1256,31 @@ input[type="range"] {
   cursor: pointer;
 }
 
-/* ---------- 滑块数值气泡 ----------
-   数值悬在拇指上方跟随移动（原来是一行孤零零的 dim 数字，离滑块远、对不上）。
-   位置复用 syncRangeFill 写入的 --pn（0..1）：
-   left = 拇指半径 7px + (100% - 拇指直径 14px) * --pn，窗口缩放自动跟随。
-   .slider-wrap 上方预留 22px（气泡高 + 间距），气泡不遮标签文字。 */
-.slider-wrap {
-  position: relative;
-  margin-top: 22px;
+/* ---------- 滑块行：轨道占满整行 + 数值胶囊固定在右侧 ----------
+   原来轨道只有默认宽度（约 180px），数值又孤零零排在下一行，又短又对不上。
+   现在轨道 flex:1 吃满卡片宽度，数值是与数字输入框同款式的胶囊，
+   min-width 锁定，数字从 1 跳到 64 也不会抖动布局。 */
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
-.slider-bubble {
-  position: absolute;
-  bottom: calc(100% - 4px);
-  left: calc(7px + (100% - 14px) * var(--pn, 0));
-  transform: translateX(-50%);
-  background: var(--grad);
-  color: var(--on-accent);
+.slider-row input[type="range"] {
+  flex: 1;
+  min-width: 0;
+}
+.slider-val {
+  flex-shrink: 0;
+  min-width: 40px;
+  text-align: center;
+  padding: 5px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  color: var(--text);
   font-family: var(--mono);
-  font-size: 11px;
-  font-weight: 600;
+  font-size: 12.5px;
   line-height: 1;
-  padding: 4px 9px;
-  border-radius: 99px;
-  pointer-events: none;
-  white-space: nowrap;
-  box-shadow: 0 2px 10px rgba(63, 224, 240, .35);
 }
 input[type="range"]::-webkit-slider-runnable-track {
   height: 4px;
