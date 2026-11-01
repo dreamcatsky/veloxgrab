@@ -256,20 +256,26 @@
 
           <label class="fld">
             <span><span data-i18n="maxConcurrent">同时下载任务数</span> <em class="dim">(1-8)</em></span>
-            <input id="setConcurrent" type="range" min="1" max="8" step="1" />
-            <output id="setConcurrentVal" class="dim"></output>
+            <div class="slider-wrap">
+              <input id="setConcurrent" type="range" min="1" max="8" step="1" />
+              <output id="setConcurrentVal" class="slider-bubble"></output>
+            </div>
           </label>
 
           <label class="fld">
             <span><span data-i18n="defaultThreads">默认下载线程数</span> <em class="dim" data-i18n="defaultThreadsHint">(1-64，直链分块并发)</em></span>
-            <input id="setDefaultThreads" type="range" min="1" max="64" step="1" />
-            <output id="setDefaultThreadsVal" class="dim"></output>
+            <div class="slider-wrap">
+              <input id="setDefaultThreads" type="range" min="1" max="64" step="1" />
+              <output id="setDefaultThreadsVal" class="slider-bubble"></output>
+            </div>
           </label>
 
           <label class="fld">
             <span><span data-i18n="fragments">单视频并发分片数</span> <em class="dim" data-i18n="fragmentsHint">(1-64，yt-dlp 流分片)</em></span>
-            <input id="setFragments" type="range" min="1" max="64" step="1" />
-            <output id="setFragmentsVal" class="dim"></output>
+            <div class="slider-wrap">
+              <input id="setFragments" type="range" min="1" max="64" step="1" />
+              <output id="setFragmentsVal" class="slider-bubble"></output>
+            </div>
           </label>
 
           <div class="nd-grid">
