@@ -229,7 +229,10 @@ async fn rate_wait(rate_kb: u64, need: u64) {
     if rate_kb == 0 || need == 0 {
         return;
     }
-    let budget = rate_kb.saturating_mul(1024) * RATE_WINDOW_MS / 1000;
+    let budget = rate_kb
+        .saturating_mul(1024)
+        .saturating_mul(RATE_WINDOW_MS)
+        / 1000;
     let budget = budget.max(1);
     // 单批就超一个窗口的预算（比如限速 1KB/s 时攒了 256KiB）：
     // 按需要几个窗口来睡，而不是死循环等一个永远装不下的窗口。
@@ -275,9 +278,17 @@ fn chrono_stamp() -> String {
 }
 
 fn extract_disposition_filename(cd: &str) -> Option<String> {
+    // 参数名按 ASCII 大小写不敏感比较（RFC 6266 允许 FILENAME=/Filename*=）：
+    // 按字节匹配会漏掉大写形态，回退到 URL 推断拿错名字。
+    // 用 get 切前缀：直接 [..n] 切在多字节字符中间会 panic。
+    fn param<'a>(part: &'a str, name: &str) -> Option<&'a str> {
+        let t = part.trim();
+        let head = t.get(..name.len())?;
+        head.eq_ignore_ascii_case(name).then(|| &t[name.len()..])
+    }
     // 优先 RFC 5987 的 filename*=UTF-8''xxx
     for part in cd.split(';') {
-        if let Some(rest) = part.trim().strip_prefix("filename*=") {
+        if let Some(rest) = param(part, "filename*=") {
             let rest = rest.trim_matches('"');
             let encoded = rest.splitn(3, '\'').nth(2).unwrap_or(rest);
             if let Ok(decoded) = urlencoding::decode(encoded) {
@@ -286,7 +297,7 @@ fn extract_disposition_filename(cd: &str) -> Option<String> {
         }
     }
     for part in cd.split(';') {
-        if let Some(rest) = part.trim().strip_prefix("filename=") {
+        if let Some(rest) = param(part, "filename=") {
             let rest = rest.trim_matches('"').trim();
             if !rest.is_empty() {
                 return Some(rest.to_string());
@@ -738,12 +749,14 @@ async fn download_segment(
     // 作用域认证头在这里一并带上。之前只有探测和单流走 apply_net，分块请求
     // 裸奔——防盗链站点探测 206、分块 403，表现为「一开多线程就失败」。
     // apply_net 内部同样按 URL 判定 auth 作用域，语义与旧的独立 auth 参数一致。
+    // without_url：错误串会进任务表和历史，reqwest 的 Display 默认带完整 URL，
+    // 签名直链的 query 里有会话凭证，不往外带。
     let rb = apply_net(c.get(&url), &url, &net)
         .header(reqwest::header::RANGE, format!("bytes={from}-{end}"));
     let resp = rb
         .send()
         .await
-        .map_err(|e| format!("请求失败: {e}"))?;
+        .map_err(|e| format!("请求失败: {}", e.without_url()))?;
 
     let st = resp.status();
     if st != reqwest::StatusCode::PARTIAL_CONTENT && st != reqwest::StatusCode::OK {
@@ -797,7 +810,7 @@ async fn download_segment(
         if cancel.load(Ordering::SeqCst) {
             break;
         }
-        let chunk = chunk.map_err(|e| format!("读取数据流失败: {e}"))?;
+        let chunk = chunk.map_err(|e| format!("读取数据流失败: {}", e.without_url()))?;
 
         // 本段的上限是**声明过的** seg_len，一字节都不许多收：恶意/故障服务器
         // 可以在 Content-Range 里谎报 10 MB、实际流 500 GB——不设闸的话循环会
@@ -911,6 +924,10 @@ fn resume_is_consistent(
 ) -> bool {
     m.url == url
         && (total == 0 || m.total == total)
+        // 盘上文件不得比目标长：两条创建路径都 set_len(total)，正常流程
+        // file_len 恒等于 total。外部追加垃圾 + 合法 meta 能通过其余全部
+        // 校验，finish_download 原样改名——成品带尾垃圾。
+        && (total == 0 || file_len <= total)
         && m.segments_done.len() == ranges.len()
         && m.segments_total.len() == ranges.len()
         // 每条声明段长必须等于本轮实际切出来的段长（分段方案没变）
@@ -1078,10 +1095,11 @@ fn finish_download(
     // 仍然走递增改名。这样即使用户开了覆盖，也不会误删自己拷进来的文件。
     let allow_overwrite = overwrite && crate::history::is_known_output(url, target);
     let final_target = choose_final_target(target, allow_overwrite);
-    if allow_overwrite && target.exists() {
-        // 显式删除再 rename：不依赖平台 rename 的覆盖语义，失败时能给出明确原因
-        std::fs::remove_file(target).map_err(|e| format!("覆盖旧文件失败: {e}"))?;
-    }
+    // 直接 rename，不先显式 remove：Windows 上 std::fs::rename 本身就是
+    // MOVEFILE_REPLACE_EXISTING（POSIX 同样原子替换），而归属已经由
+    // is_known_output（URL + canonicalize 双重比对）确认。旧的「先 remove
+    // 再 rename」在 rename 失败（目标被占用、权限突变）时会把旧成品先删掉
+    // ——多出一个自毁窗口，唯一「收益」只是错误消息更短。
     std::fs::rename(temp, &final_target).map_err(|e| format!("重命名临时文件失败: {e}"))?;
     Ok(final_target)
 }
@@ -1181,6 +1199,10 @@ pub async fn download_direct(
     on_progress: impl Fn(DirectProgress) + Send + Sync + 'static,
     net: &NetCfg,
 ) -> Result<PathBuf, String> {
+    // 显式过一次 URL 闸：缓存命中路径此前完全依赖「LAST_PROBE 里的条目必然
+    // 来自 60 秒内一次已过闸的 probe_direct」这条跨函数不变量。在这里显式
+    // 判一次，将来新增缓存写入点也不会把闸绕掉。
+    url_target_guarded(url)?;
     // 前端解析时刚探过，60 秒内直接复用，省掉一整轮 HEAD + Range 往返
     let info = match cached_probe(&probe_cache_key(url, net)) {
         Some(p) => p,
@@ -1396,7 +1418,6 @@ pub async fn download_direct(
     for (i, (s, e)) in ranges.iter().enumerate() {
         let start = *s;
         let end = *e;
-        let done = counters.bytes[i].load(Ordering::Relaxed);
         let c2 = c.clone();
         let url2 = url.to_string();
         // 请求头跟着 net 走（自定义头 + host 作用域认证头，作用域判定按本段
@@ -1406,10 +1427,51 @@ pub async fn download_direct(
         let counters2 = counters.clone();
         let cancel2 = cancel.clone();
         handles.push(tauri::async_runtime::spawn(async move {
-            download_segment(
-                c2, url2, net2, start, end, total, path2, done, counters2, i, cancel2,
-            )
-            .await
+            // 段级重试：长任务撞上一次连接抖动/瞬断就整任务失败（有断点，但
+            // 要用户手动点继续），64 连接下概率不低。重试从该段**最新已落盘**
+            // 字节数续传；已取消就立即退出不重试。
+            let mut attempt_err: Option<String> = None;
+            for attempt in 0..3u32 {
+                if cancel2.load(Ordering::SeqCst) {
+                    break;
+                }
+                let done_now = counters2.bytes[i].load(Ordering::Relaxed);
+                match download_segment(
+                    c2.clone(),
+                    url2.clone(),
+                    net2.clone(),
+                    start,
+                    end,
+                    total,
+                    path2.clone(),
+                    done_now,
+                    counters2.clone(),
+                    i,
+                    cancel2.clone(),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        attempt_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        if cancel2.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        attempt_err = Some(e);
+                        // 退避间隔递增，避免撞上还没恢复的对端
+                        tokio::time::sleep(Duration::from_millis(500 * (u64::from(attempt) + 1)))
+                            .await;
+                    }
+                }
+            }
+            match attempt_err {
+                Some(e) => Err(e),
+                // 取消中断时也按 Ok 返回已写字节：外层按 cancel 标志统一落断点，
+                // 与旧的单轮语义一致。
+                None => Ok(counters2.bytes[i].load(Ordering::Relaxed)),
+            }
         }));
     }
 
@@ -1513,7 +1575,7 @@ async fn download_single(
     let resp = apply_net(c.get(url), url, net)
         .send()
         .await
-        .map_err(|e| format!("请求失败: {e}"))?;
+        .map_err(|e| format!("请求失败: {}", e.without_url()))?;
     if !resp.status().is_success() {
         return Err(format!("服务器返回 HTTP {}", resp.status()));
     }
@@ -1534,7 +1596,7 @@ async fn download_single(
             let _ = file.flush().await;
             return Err("已取消".into());
         }
-        let chunk = chunk.map_err(|e| format!("读取数据流失败: {e}"))?;
+        let chunk = chunk.map_err(|e| format!("读取数据流失败: {}", e.without_url()))?;
 
         // 与分块路径同一道闸：服务器声明了总长（Content-Length）却不守它，
         // 多发的一律算对端违规，立即中断——不给谎报大小的远端写穿磁盘的机会。
@@ -2022,6 +2084,8 @@ mod tests {
         assert!(!ric(&good, "https://e.com/f.bin", total, &shifted, total));
         let fewer = split_ranges(total, 2);
         assert!(!ric(&good, "https://e.com/f.bin", total, &fewer, total));
+        // 盘上文件被外部追加过（比目标长）：带尾垃圾的成品不能混过校验
+        assert!(!ric(&good, "https://e.com/f.bin", total, &ranges, total + 4096));
 
         // 合法的中段续传：文件预分配成 total（长度够），每段各写了一半
         let mut half = good.clone();

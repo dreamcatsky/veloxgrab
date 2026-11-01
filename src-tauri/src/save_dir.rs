@@ -195,7 +195,20 @@ pub(crate) fn admit(raw: Option<&str>, root: &Path, trusted: &[String]) -> Admit
         return Admit::NoDir;
     };
     let p = PathBuf::from(raw);
-    let cand = if p.is_absolute() { p } else { root.join(p) };
+    // 带盘符前缀的**相对**路径（`C:evil`，有 prefix 无 root）：join 的 std
+    // 语义是「带前缀即整体替换」，join 结果按进程 CWD 漂移（经协议拉起时
+    // CWD 不受控）——不能按「相对按根解析」处理。不 join、不折算，直接按
+    // 陌生目录送 OS 确认框（fail-closed，框里展示 canonicalize 后的真实落点）。
+    let cand = if p.is_absolute()
+        || p.components()
+            .next()
+            .map(|c| matches!(c, std::path::Component::Prefix(_)))
+            .unwrap_or(false)
+    {
+        p
+    } else {
+        root.join(p)
+    };
     if is_inside(root, &cand) {
         return Admit::Inside(cand);
     }

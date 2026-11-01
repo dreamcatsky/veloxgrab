@@ -248,6 +248,14 @@ fn prepare_for_write(list: &mut Vec<HistoryEntry>) {
     list.truncate(MAX_ENTRIES);
 }
 
+/// AppHandle 登记处：损坏重置等需要触达用户的事件经它 emit。
+/// lib.rs 启动时注入；没注入（测试环境）时事件静默跳过。
+static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+pub fn set_app_handle(h: tauri::AppHandle) {
+    let _ = APP.set(h);
+}
+
 /// 读取全部历史（新的在前）。文件不存在或损坏时返回空列表。
 ///
 /// 读者有三处：进程启动时 AppState::new 回灌任务表、写线程首次启动取初值、
@@ -271,6 +279,12 @@ pub fn load_history() -> Vec<HistoryEntry> {
                 "history.json 解析失败（{e}），已备份到 {}，本次历史为空",
                 bad.display()
             );
+            // 「历史被重置」对用户必须可见：旧实现只有 stderr 一行，GUI 进程里
+            // 没人看得见，用户只会发现记录凭空消失。前端收到事件弹一次提示。
+            if let Some(app) = APP.get() {
+                use tauri::Emitter;
+                let _ = app.emit("history-reset", ());
+            }
             Vec::new()
         }
     }
@@ -457,7 +471,11 @@ fn writer_loop(rx: mpsc::Receiver<Op>) {
                     deadline = None;
                 }
             }
-            // 所有发送端 drop = 进程正在结束：做最后一次落盘再退。
+            // 如实标注：这个分支**实际不可达**——WRITER 是 static OnceLock，
+            // Sender 永不 drop，recv_timeout 不会返回 Disconnected。真正的
+            // 退出保护是 lib.rs 的 ExitRequested → shutdown_history_writer →
+            // flush_blocking（带 1 秒上限）。保留此分支只是廉价纵深（将来若把
+            // static 改成可 drop 的 Option 它就活了），但**不要**把它当退出保证。
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let ops = std::mem::take(&mut pending);
                 let had_ops = !ops.is_empty();

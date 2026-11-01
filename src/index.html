@@ -484,7 +484,7 @@
   <!-- 添加 URL（原来的「下载页」整块搬进来当弹窗）。
        TDM Fast 里添加链接是弹窗，主界面留给列表；VeloxGrab 原来把它当一整个页签，
        和新的「侧边栏 + 中框列表」结构冲突，所以改成弹窗。 -->
-  <div id="addOverlay" class="overlay hidden">
+  <div id="addOverlay" class="overlay hidden" role="dialog" aria-modal="true">
     <div class="dialog dialog-wide">
       <div class="dialog-head">
         <h3 data-i18n="addUrlTitle">添加 URL</h3>
@@ -601,7 +601,7 @@
   </div>
 
   <!-- 关于 / 使用说明（同一个弹窗，换内容） -->
-  <div id="infoOverlay" class="overlay hidden">
+  <div id="infoOverlay" class="overlay hidden" role="dialog" aria-modal="true">
     <div class="dialog">
       <div class="dialog-head">
         <h3 id="infoTitle">关于 VeloxGrab</h3>
@@ -677,7 +677,7 @@
         </label>
         <label class="fld" id="editThreadsRow">
           <span data-i18n="threadsLabel">下载线程数</span>
-          <select id="editThreads"></select>
+          <select id="editThreads" title="修改线程数会使已有的分块断点失效，恢复将从已下部分重新分段"></select>
         </label>
         <small class="dim" data-i18n="editHint">只能编辑排队、暂停或失败的任务；修改文件名、保存目录或线程数后，已有断点不会迁移。</small>
       </div>
@@ -689,7 +689,7 @@
   </div>
 
   <!-- 更新对话框：发现新版本 / 下载进度共用一个壳，正文随状态切换 -->
-  <div id="updateOverlay" class="overlay hidden">
+  <div id="updateOverlay" class="overlay hidden" role="dialog" aria-modal="true">
     <div class="dialog">
       <div class="dialog-head">
         <h3 id="upTitle">发现新版本</h3>
@@ -770,7 +770,7 @@
     </div>
   </div>
 
-  <div id="toast" class="toast hidden"></div>
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
   <!-- 关机/重启倒计时。独立于 toast：普通提示随时会顶掉上一条，
        如果倒计时提示也被顶掉，用户就失去了「取消关机」的入口。 -->
@@ -783,7 +783,7 @@
        原生 confirm() 只有「确定/取消」两态，而删文件这件事必须三选一：
        只删记录、连文件一起删、什么都不做。用一个独立弹窗而不是塞进
        infoOverlay，是因为那个弹窗的结构只支持「一个主动按钮 + 关闭」。 -->
-  <div id="delOverlay" class="overlay hidden">
+  <div id="delOverlay" class="overlay hidden" role="dialog" aria-modal="true">
     <div class="dialog">
       <div class="dialog-head">
         <h3 id="delTitle">删除任务</h3>

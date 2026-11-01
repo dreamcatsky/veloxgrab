@@ -132,8 +132,22 @@ function setupMenus() {
  *
  * `chrome.downloads.cancel()` 是异步的，取消过程中 `onCreated` 可能因为
  * 重定向再触发一次；不记账就会把同一条下载转给 VeloxGrab 两遍。
+ *
+ * 账本存 storage.session 而不是内存 Set：MV3 SW 可能在「取消 + 转发」的
+ * 长 await 期间被回收，重启后内存集合清空，重定向触发的第二次 onCreated
+ * 会把同一条下载再转发一遍。storage.session 的生命周期 = 浏览器会话，
+ * 恰好覆盖「拦截 → 转发」窗口。
  */
-const canceling = new Set();
+async function isCanceling(id) {
+  const { canceling = [] } = await chrome.storage.session.get("canceling");
+  return canceling.includes(id);
+}
+
+async function setCanceling(id, on) {
+  const { canceling = [] } = await chrome.storage.session.get("canceling");
+  const next = on ? [...new Set([...canceling, id])] : canceling.filter((x) => x !== id);
+  await chrome.storage.session.set({ canceling: next });
+}
 
 chrome.downloads.onCreated.addListener(async (item) => {
   if (!item || !item.id) return;
@@ -147,14 +161,14 @@ chrome.downloads.onCreated.addListener(async (item) => {
   const cfg = await getConfig();
   if (!cfg.intercept) return;
 
-  if (canceling.has(item.id)) return;
-  canceling.add(item.id);
+  if (await isCanceling(item.id)) return;
+  await setCanceling(item.id, true);
 
   try {
     await chrome.downloads.cancel(item.id);
   } catch {
     // 取消失败（下载已经结束）就别再转发了，否则用户会看到两条。
-    canceling.delete(item.id);
+    await setCanceling(item.id, false);
     return;
   }
 
@@ -203,8 +217,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
     }
   } finally {
     // 转发结束才解账：发送期间若因重定向再触发一次 onCreated，仍会被拦下。
-    // 不删的话这个集合会在后台页生命周期内无限增长。
-    canceling.delete(item.id);
+    await setCanceling(item.id, false);
   }
 });
 
@@ -220,11 +233,12 @@ function pickFilename(item) {
 // ---------- 配置 ----------
 
 function getConfig() {
-  return new Promise((resolve) => {
-    chrome.storage.sync.get(Object.keys(DEFAULTS), (s) => {
-      resolve({ ...DEFAULTS, ...s });
-    });
-  });
+  // threads/intercept/notify 跟账号走 storage.sync；dir 是本机路径，
+  // 放 storage.local——同步到别的设备毫无意义，还把本机目录结构外泄上云。
+  return Promise.all([
+    new Promise((resolve) => chrome.storage.sync.get(["threads", "intercept", "notify"], resolve)),
+    new Promise((resolve) => chrome.storage.local.get(["dir"], resolve)),
+  ]).then(([s, l]) => ({ ...DEFAULTS, ...s, dir: l.dir || "" }));
 }
 
 // ---------- 桥 token ----------
@@ -311,16 +325,15 @@ async function send(target) {
   }
 
   // 2. veloxgrab:// 协议导航（兜底，结果不可知）
+  // 开后台标签页而不是劫持当前标签页：tabs.update 会把用户正在看的页面
+  // 顶掉（即使协议成功，外部协议弹窗也会打断浏览）。
   const link = buildLink(target);
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab && tab.id) {
-      await chrome.tabs.update(tab.id, { url: link });
-      // 旧实现这里无条件 return true——正是文件头注释里「Chrome 静默拦截扩展
-      // 发起的自定义协议导航」的那个行为被当成了成功：通知说「已转给
-      // VeloxGrab」，实际什么都没发生。导航没有成功回调，结果只能标「不确定」。
-      return "unknown";
-    }
+    await chrome.tabs.create({ url: link, active: false });
+    // 旧实现这里无条件 return true——正是文件头注释里「Chrome 静默拦截扩展
+    // 发起的自定义协议导航」的那个行为被当成了成功：通知说「已转给
+    // VeloxGrab」，实际什么都没发生。导航没有成功回调，结果只能标「不确定」。
+    return "unknown";
   } catch {
     // 继续落到剪贴板
   }
@@ -442,8 +455,12 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 
 // ---------- popup 消息 ----------
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.type !== "veloxgrab-send") return;
+  // 只认自家 popup 的消息。当前 manifest 没有 externally_connectable /
+  // content_scripts，网页与第三方扩展本就触不到这里；这行是纵深——
+  // 日后放开任何一条通道时，这个「URL → 本地下载器」的投递口不该裸奔。
+  if (sender.id !== chrome.runtime.id) return;
 
   (async () => {
     const cfg = await getConfig();

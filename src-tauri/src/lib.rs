@@ -129,11 +129,20 @@ pub fn run() {
             // 失败不阻塞启动——只是网页点击会退化成「无法识别的链接」。
             // 放独立线程：reg.exe 是外部进程，同步跑会拖慢窗口显示。
             if let Some(exe) = deeplink::installed_exe() {
-                std::thread::spawn(move || {
-                    if let Err(e) = deeplink::ensure_protocol_registered(&exe) {
-                        eprintln!("[deeplink] 注册协议失败: {e}");
-                    }
-                });
+                // dev 构建不注册：`tauri dev` 会把 HKCU 协议指向 target\debug
+                // 下的 exe 且每次启动刷新，正式安装版从此静默失效——与模块头
+                // 批评 tauri_plugin_deep_link「把自身目标写成 dev 期路径」的是
+                // 同一个坑，不能再从自己这边踩回去。
+                let exe_lower = exe.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+                if exe_lower.contains(r"\target\debug\") {
+                    eprintln!("[deeplink] dev 构建，跳过协议注册（避免覆盖正式安装版的关联）");
+                } else {
+                    std::thread::spawn(move || {
+                        if let Err(e) = deeplink::ensure_protocol_registered(&exe) {
+                            eprintln!("[deeplink] 注册协议失败: {e}");
+                        }
+                    });
+                }
             }
 
             // 冷启动：用户直接点链接进来的，argv 里就带着 URL。
@@ -180,6 +189,9 @@ pub fn run() {
             }
 
             app.manage(state);
+
+            // 历史模块要能触达用户（损坏重置等事件），启动时把句柄给它
+            crate::history::set_app_handle(app.handle().clone());
 
             // 托盘图标：关窗口缩到托盘，后台继续下载。
             tray::setup(app.handle());
@@ -233,6 +245,13 @@ pub fn run() {
                             // 用前端弹窗而不是原生 MessageBox：这里要三个选项，
                             // 原生消息框只有两个按钮。
                             "ask" => {
+                                api.prevent_close();
+                                let _ = app2.emit("close-requested", ());
+                            }
+                            // 托盘不可用（建立失败且重试未成功）时「最小化」没有
+                            // 落点：窗口 hide 之后永久消失而进程还在跑。降级成
+                            // 「询问」，把决定权交还用户。
+                            "background" if !tray::is_available() => {
                                 api.prevent_close();
                                 let _ = app2.emit("close-requested", ());
                             }

@@ -385,7 +385,10 @@
   let i18nPhOriginal = null;
 
   function applyLanguage(lang) {
-    const nodes = document.querySelectorAll("[data-i18n],[data-i18n-attr]");
+    // 注意：progress.html 里在用 data-i18n-title，但本窗口的实现只支持
+    // data-i18n（内容）与 data-i18n-ph（placeholder）；曾经的
+    // data-i18n-attr 分支语义写错且无任何元素使用，已删除。
+    const nodes = document.querySelectorAll("[data-i18n]");
     const phNodes = document.querySelectorAll("[data-i18n-ph]");
     if (!i18nOriginal) {
       i18nOriginal = new Map();
@@ -394,7 +397,7 @@
       phNodes.forEach((n) => i18nPhOriginal.set(n, n.placeholder));
     }
     nodes.forEach((n) => {
-      const key = n.dataset.i18n || n.dataset.i18nAttr;
+      const key = n.dataset.i18n;
       if (lang === "en" && I18N_EN[key]) n.innerHTML = I18N_EN[key];
       else n.innerHTML = i18nOriginal.get(n);
     });
@@ -506,8 +509,10 @@
     closeAddUrl();
     // 自动切到「所有下载」而不是当前视图：用户刚加完任务，
     // 若当前停在「已完成」或某个分类下，新任务根本不会出现在列表里。
+    // showView 内部会刷新列表；只有不切视图时才需要补一次刷新。
+    // 旧写法两个都发，每次入队两趟 list_tasks。
     if (appSettings && appSettings.auto_progress_popup) showView("all");
-    refreshTasks();
+    else refreshTasks();
   }
 
   const THREAD_OPTIONS = [1, 2, 4, 8, 16, 32, 64];
@@ -553,6 +558,8 @@
 
   // ---------- 解析（自动分流：媒体站 → yt-dlp，其他 → 直链） ----------
   async function doParse() {
+    // in-flight 守卫：解析进行中（按钮已禁用）时直接忽略重复触发
+    if ($("parseBtn").disabled) return;
     const url = $("urlInput").value.trim();
     if (!url) {
       toast("请先粘贴链接", true);
@@ -723,7 +730,9 @@
 
     const thumb = $("mediaThumb");
     if (info.thumbnail) {
-      thumb.src = info.thumbnail;
+      // CSP 的 img-src 不含 http:：http 封面会静默裂图。升级到 https 尝试
+      // 一次（主流站点都有 https）；仍失败的站点宁可裂图也不放松 CSP。
+      thumb.src = info.thumbnail.replace(/^http:\/\//i, "https://");
       thumb.style.display = "";
     } else {
       thumb.removeAttribute("src");
@@ -1423,6 +1432,7 @@
   let refreshGen = 0;
   let refreshInFlight = false;
   let refreshDirty = false;
+  let refreshFailures = 0;
 
   async function refreshTasks() {
     const gen = ++refreshGen;
@@ -1453,11 +1463,16 @@
         updateSummary();
       }
     } catch (e) {
-      // 静默
+      // 静默重试，但连续失败（后端崩溃/重启中）要让用户知道列表已停更
+      refreshFailures++;
+      if (refreshFailures === 3) {
+        toast("任务列表刷新失败，正在重试——若持续失败请重启程序", true);
+      }
     } finally {
       // 只有仍是「最新一轮」才清在途标记：旧快照晚到时，在途的是新一轮。
       if (gen === refreshGen) {
         refreshInFlight = false;
+        refreshFailures = 0;
         if (refreshDirty) {
           refreshDirty = false;
           scheduleRefresh();
@@ -2279,6 +2294,10 @@
       const port = evt && evt.payload;
       toast(`浏览器扩展桥启动失败（端口 ${port || 58943} 被占用），扩展暂时无法连接 VeloxGrab`, true);
     });
+    // history.json 损坏被重置：旧实现只有 stderr 一行，用户只会发现记录消失
+    listen("history-reset", () => {
+      toast("下载记录文件损坏，已自动备份并重置（原文件保留为 history.json.bad-*）", true);
+    });
 
     // 托盘菜单的常用动作：Rust 侧只负责把窗口拉到前台 + 发命令名，
     // 具体执行与提示全部复用 runMenuCommand —— 托盘、菜单栏、快捷键
@@ -2449,12 +2468,20 @@
     return ids;
   }
 
-  // 全选
+  // 全选：就地切换行选中态，不走 refreshTasks()——全量 IPC + 整表重建
+  // 只为更新勾选框，几千任务时每次 Ctrl+A 都卡一下。
   $("selectAll").addEventListener("change", (e) => {
     const on = e.target.checked;
     if (on) visibleIds().forEach((id) => selectedIds.add(id));
     else selectedIds.clear();
-    refreshTasks();
+    document.querySelectorAll(".task-row").forEach((row) => {
+      const id = row.dataset.id;
+      const selected = selectedIds.has(id);
+      row.classList.toggle("selected", selected);
+      const box = row.querySelector("input[type=checkbox]");
+      if (box) box.checked = selected;
+    });
+    updateSelHint();
   });
 
   // 快捷键。全部走菜单命令，保证键盘与菜单是同一条代码路径。
@@ -2503,6 +2530,12 @@
       if (!$("updateOverlay").classList.contains("hidden")) hideUpdateDialog();
       if (!$("saveAsOverlay").classList.contains("hidden")) closeSaveAs();
       closeEditDialog();
+      // 删除确认弹窗此前不在 Esc 处理内：它的 Promise 只能靠点击解除，
+      // 键盘用户会被困住。
+      if (!$("delOverlay").classList.contains("hidden")) {
+        $("delOverlay").classList.add("hidden");
+        $("delOverlay").onclick = null;
+      }
     }
   });
 
@@ -2535,7 +2568,9 @@
   // ---------- 事件绑定 ----------
   $("parseBtn").onclick = doParse;
   $("urlInput").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") doParse();
+    // Enter 走与按钮同一个 disabled 守卫：IPC 往返窗口内连按 Enter
+    // 不会再触发第二轮解析。
+    if (e.key === "Enter" && !$("parseBtn").disabled) doParse();
   });
   $("downloadBtn").onclick = doDownload;
   $("dDownloadBtn").onclick = doDirectDownload;
@@ -2669,7 +2704,7 @@
       taskMap.set(p.id, merged);
 
       // 用 .task-row 而不是 .task：历史页条目也带 .task，两者会同时命中
-      const card = document.querySelector(`.task-row[data-id="${p.id}"]`);
+      const card = document.querySelector(`.task-row[data-id="${CSS.escape(p.id)}"]`);
       if (card) {
         if (stateChanged) {
           // 状态变了先过一遍视图过滤：任务在「正在下载」视图里下完、或在

@@ -639,8 +639,10 @@ pub fn load_settings(state: &AppState) -> Settings {
 pub(crate) fn load_settings_from_shared(shared: &std::sync::Mutex<Settings>) -> Settings {
     match shared.lock() {
         Ok(g) => g.clone(),
-        // 中毒时退默认值：与 load_settings 的容错方向一致
-        Err(_) => Settings::default(),
+        // 锁中毒 = 有持有者 panic 过，内存副本不可信。回退读一次盘（只在
+        // panic 之后才会走到的冷路径），而不是静默降级成默认值——默认值的
+        // trusted_dirs 是空的，随后的 persist 会把用户批准过的信任集抹掉。
+        Err(_) => read_settings_from_disk(),
     }
 }
 
@@ -843,14 +845,19 @@ pub fn apply_autostart(enable: bool) -> Result<(), String> {
         use std::process::Command;
         let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        // 绝对路径，与 plan.rs 的 shutdown.exe、engine.rs 的 taskkill 同一纪律：
+        // PATH 被污染时不能让「写注册表」变成执行别的程序。
+        let reg = std::env::var("SystemRoot")
+            .map(|root| format!("{root}\\System32\\reg.exe"))
+            .unwrap_or_else(|_| "reg.exe".to_string());
         let status = if enable {
             let cmd = format!("\"{}\"", exe.display());
-            Command::new("reg")
+            Command::new(&reg)
                 .args(["add", key, "/v", "VeloxGrab", "/d", &cmd, "/f"])
                 .creation_flags(0x0800_0000)
                 .status()
         } else {
-            Command::new("reg")
+            Command::new(&reg)
                 .args(["delete", key, "/v", "VeloxGrab", "/f"])
                 .creation_flags(0x0800_0000)
                 .status()
@@ -927,9 +934,17 @@ fn persist_settings(s: &Settings) -> Result<(), String> {
         // 必须用**可写**句柄：Windows 的 FlushFileBuffers 对只读句柄直接失败，
         // 旧写法 `File::open`（只读）+ sync_data 等于什么都没做。
         if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
-            let _ = f.sync_all();
+            // fsync 失败会让「崩溃不留半截」的承诺打折：打一行让失败可见，
+            // 不再静默吞掉（旧实现 `let _ =` 无声跳过）。
+            if f.sync_all().is_err() {
+                eprintln!("[settings] 设置 fsync 失败，崩溃抗性降级，继续替换");
+            }
         }
-        std::fs::rename(&tmp, &path).map_err(|e| format!("保存设置失败: {e}"))?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            // rename 失败会留下孤儿 .tmp：清掉，避免配置目录里垃圾累积
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("保存设置失败: {e}"));
+        }
     } else {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -988,6 +1003,10 @@ pub fn save_settings(
     settings.concurrent_fragments = settings.concurrent_fragments.clamp(1, 64);
     settings.default_threads = settings.default_threads.clamp(1, 64);
     settings.hf_thread_cap = settings.hf_thread_cap.min(64);
+    // 限速是唯一此前未钳制的数值设置：u64 上限的病态值（只能来自手改
+    // settings.json）会让限速预算的乘法在 debug 构建 panic、release 构建回绕。
+    // 4_000_000 KB/s = 4 GiB/s，远超任何真实链路。
+    settings.rate_limit_kb = settings.rate_limit_kb.min(4_000_000);
     if settings.proxy_type != "socks5" {
         settings.proxy_type = "http".into();
     }

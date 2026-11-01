@@ -17,12 +17,16 @@ function msg(text, isErr) {
 }
 
 async function init() {
-  // 恢复上次的目录/线程/接管开关
-  const cfg = await chrome.storage.sync.get(["threads", "dir", "intercept"]);
-  if (cfg.dir) $("dir").value = cfg.dir;
-  if (cfg.threads) $("threads").value = String(cfg.threads);
+  // 恢复上次的目录/线程/接管开关。dir 存 storage.local（本机路径不上云），
+  // threads/intercept 存 storage.sync。
+  const [cfgSync, cfgLocal] = await Promise.all([
+    chrome.storage.sync.get(["threads", "intercept"]),
+    chrome.storage.local.get(["dir"]),
+  ]);
+  if (cfgLocal.dir) $("dir").value = cfgLocal.dir;
+  if (cfgSync.threads) $("threads").value = String(cfgSync.threads);
   // 默认接管：这是用户装扩展最想要的行为，未设置过就当开启。
-  $("intercept").checked = cfg.intercept !== false;
+  $("intercept").checked = cfgSync.intercept !== false;
   $("intercept").onchange = () => {
     chrome.storage.sync.set({ intercept: $("intercept").checked });
     msg($("intercept").checked ? "已开启：网页下载将转给 VeloxGrab" : "已关闭：网页下载走浏览器");
@@ -78,7 +82,11 @@ async function send(url) {
   const dir = $("dir").value.trim();
   const threads = Number($("threads").value) || 4;
 
-  await chrome.storage.sync.set({ dir, threads });
+  // dir 本机存 local，threads 同步存 sync（与 background.getConfig 对应）
+  await Promise.all([
+    chrome.storage.local.set({ dir }),
+    chrome.storage.sync.set({ threads }),
+  ]);
 
   const btn = $("send");
   btn.disabled = true;

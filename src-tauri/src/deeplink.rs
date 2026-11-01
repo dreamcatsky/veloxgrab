@@ -121,7 +121,12 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
             Some(kv) => kv,
             None => (pair, ""),
         };
-        let v = urlencoding::decode(v).unwrap_or_default().to_string();
+        let v = match urlencoding::decode(v) {
+            Ok(s) => s.into_owned(),
+            // 非法 % 序列（截断的 `%E4%B8%` 之类）按原样保留：吞成空串会让
+            // 后面报「链接里缺少 url 参数」——用户明明给了，错误信息完全误导。
+            Err(_) => v.to_string(),
+        };
         match k.to_ascii_lowercase().as_str() {
             "url" | "u" => url = Some(v),
             "name" | "filename" | "f" => filename = Some(v),
@@ -137,7 +142,10 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
         .ok_or_else(|| "链接里缺少 url 参数".to_string())?;
     // 与 IPC 入口保持同一套校验：只放行 http/https。
     // 不在这里做「像不像媒体站」的判断——那是 probe_auto 的职责。
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    // scheme 按 ASCII 大小写不敏感判（bare 形态已经如此）：网页里大写的
+    // HTTPS://A.COM/x 是合法 URL，按原样判会被误拒，错误文案还自相矛盾。
+    let url_lower = url.to_ascii_lowercase();
+    if !(url_lower.starts_with("http://") || url_lower.starts_with("https://")) {
         return Err(format!("下载地址必须以 http:// 或 https:// 开头：{url}"));
     }
 
@@ -171,8 +179,14 @@ pub fn ensure_protocol_registered(exe: &std::path::Path) -> Result<(), String> {
     let current = reg_query(&key, "").ok().flatten();
 
     if let Some(cmd) = current {
-        // 规范化后再比：注册表里的路径可能带不同的大小写或反斜杠转义
-        if normalize_path(&cmd).contains(&normalize_path(&exe.to_string_lossy())) {
+        // **全等**比较而不是子串 contains：规范化后与「本程序会写出的命令」
+        // 完全一致才跳过重写。旧实现用 contains——恶意软件抢注协议后把命令
+        // 改成 `"<我们的exe>" "%1" & powershell -enc <payload>`，子串恰好命中，
+        // 本程序的启动自检从此成为劫持的**庇护伞**（每次启动都跳过修复）。
+        // 全等判据下：一致 → 不重写（杀软不弹窗）；任何篡改 → 重写为干净值
+        // （自愈，这正是启动自检存在的意义）。
+        let expected = format!("\"{}\" \"%1\"", exe.display());
+        if normalize_path(&cmd) == normalize_path(&expected) {
             return Ok(());
         }
     }
@@ -181,7 +195,12 @@ pub fn ensure_protocol_registered(exe: &std::path::Path) -> Result<(), String> {
     let command = format!("\"{}\" \"%1\"", exe.display());
     reg_add(&key, "", "URL:VeloxGrab Download Link")?;
     reg_add(&key, "URL Protocol", "")?;
-    reg_add(&format!(r"{key}\DefaultIcon"), "", &exe.display().to_string())?;
+    // DefaultIcon 同样加引号：裸路径含空格时，逗号资源索引语法可能解析错位
+    reg_add(
+        &format!(r"{key}\DefaultIcon"),
+        "",
+        &format!("\"{}\"", exe.display()),
+    )?;
     reg_add(
         &format!(r"{key}\shell\open\command"),
         "",

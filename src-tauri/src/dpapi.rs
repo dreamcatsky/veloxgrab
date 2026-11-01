@@ -42,14 +42,22 @@ fn to_hex(bytes: &[u8]) -> String {
 
 /// 把明文字符串封装成落盘格式（`dpapi1:<hex>`）。
 ///
-/// 三种原样返回（不加密、也不报错）的情形：
-/// - 空串：没有机密可保护，写 `dpapi1:` 反而多一份噪音；
-/// - 已经是本函数产出的格式（幂等：防止把密文再封一层）；
-/// - 加密失败：宁可退回明文存储也不能让「保存设置」整个失败——保存失败会把
-///   用户刚填的下载目录、代理配置一起丢掉，比机密没加密损失更大（模块头有述）。
+/// 空串原样返回（没有机密可保护，写 `dpapi1:` 反而多一份噪音）。
+/// 明文本身以 `dpapi1:` 开头时走 `dpapi1:00` 字面量转义（见下）。
+/// 加密失败退回明文：宁可机密不加密也不能让「保存设置」整个失败——保存失败
+/// 会把用户刚填的下载目录、代理配置一起丢掉，比机密没加密损失更大（模块头有述）。
 pub fn seal(plain: &str) -> String {
-    if plain.is_empty() || plain.starts_with(ENC_PREFIX) {
+    if plain.is_empty() {
         return plain.to_string();
+    }
+    if plain.starts_with(ENC_PREFIX) {
+        // 前缀冲突：用户的真实机密（比如自选的代理密码）恰好以 `dpapi1:`
+        // 开头。旧实现原样落盘——unseal 会把它当密文解析、失败后**静默清空**，
+        // 下次 persist 再把空串写回文件：真实密码无声丢失且不可恢复。
+        // 转义存储：`dpapi1:00` + 明文 hex，unseal 识别 `00` 子前缀直接解码。
+        // 真实 DPAPI 密文的 hex 恒以版本魔数 `01000000d08c9ddf…` 开头，
+        // `00` 起头不会与真密文撞车。
+        return format!("{ENC_PREFIX}00{}", to_hex(plain.as_bytes()));
     }
     match protect(plain.as_bytes()) {
         Ok(c) => format!("{ENC_PREFIX}{}", to_hex(&c)),
@@ -70,6 +78,17 @@ pub fn unseal(stored: &str) -> String {
     let Some(hex) = stored.strip_prefix(ENC_PREFIX) else {
         return stored.to_string();
     };
+    // `00` 子前缀 = seal 的字面量转义（机密本身以 dpapi1: 开头），直接解码，
+    // 绝不送进 DPAPI
+    if let Some(literal) = hex.strip_prefix("00") {
+        return match from_hex(literal).and_then(|b| String::from_utf8(b).ok()) {
+            Some(s) => s,
+            None => {
+                eprintln!("[dpapi] dpapi1:00 转义数据损坏，按未配置处理");
+                String::new()
+            }
+        };
+    }
     match from_hex(hex).and_then(|c| unprotect(&c).ok()) {
         Some(plain) => String::from_utf8_lossy(&plain).into_owned(),
         None => {
@@ -241,5 +260,20 @@ mod tests {
     #[test]
     fn unprotect_rejects_garbage() {
         assert!(unprotect(&[1, 2, 3, 4, 5]).is_err(), "随机字节不是合法 DPAPI blob");
+    }
+
+    /// 回归：明文本身以 `dpapi1:` 开头时必须走字面量转义——旧实现原样落盘，
+    /// unseal 解析失败后静默清空，真实密码无声丢失。
+    #[test]
+    fn seal_escapes_plaintext_that_looks_sealed() {
+        let tricky = "dpapi1:not-a-real-ciphertext";
+        let sealed = seal(tricky);
+        assert!(sealed.starts_with("dpapi1:00"), "前缀冲突必须转义存储: {sealed}");
+        assert_eq!(unseal(&sealed), tricky, "转义必须无损往返");
+        // 普通 DPAPI 密文的 hex 以版本魔数 01 开头，不会与 00 转义撞车
+        // （protect_unprotect_roundtrip 已锁真实密文路径）。
+        // 空串与无前缀明文的原样语义不变
+        assert_eq!(seal(""), "");
+        assert_eq!(unseal("plain-pass"), "plain-pass");
     }
 }

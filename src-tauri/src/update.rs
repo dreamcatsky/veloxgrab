@@ -211,7 +211,11 @@ fn failed(current: &str, msg: String) -> UpdateInfo {
 /// 带代理与 UA 的客户端构造。检查用总超时（小 JSON），下载用空闲超时（大文件）。
 fn build_client(proxy: Option<&str>, total_timeout: Option<Duration>) -> Result<reqwest::Client, String> {
     let mut b = reqwest::Client::builder()
-        .user_agent(concat!("VeloxGrab/", env!("CARGO_PKG_VERSION")));
+        .user_agent(concat!("VeloxGrab/", env!("CARGO_PKG_VERSION")))
+        // 空闲读超时：对端建连后停滞（不发数据）时，reqwest 默认会永久挂起，
+        // 进度事件停发、前端无取消入口。60 秒收不到任何字节按死链处理。
+        // 对 15s 总超时的检查路径无影响（更紧的那条先到）。
+        .read_timeout(Duration::from_secs(60));
     if let Some(t) = total_timeout {
         b = b.timeout(t);
     }
@@ -394,6 +398,21 @@ struct Prog {
 /// 没传则兜底拉一次，仍拿不到时：Content-Length 严格核对通过才放行，且
 /// emit `update-unverified` 明示用户「本次未做摘要校验」——长度缺失直接
 /// 拒绝安装。零校验静默安装可执行文件，旧实现里这条降级是静默的。
+/// 更新是否正在下载/安装：防并发重入。
+///
+/// 两次并发 update_now 共用 `temp_dir/veloxgrab-update/VeloxGrab-setup.exe`
+/// 固定路径：交错 File::create（truncate）会互相踩踏写入，最坏情况对混合
+/// 字节算哈希——防重入把这类时序问题整个关掉。
+static UPDATE_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct UpdateGuard;
+
+impl Drop for UpdateGuard {
+    fn drop(&mut self) {
+        UPDATE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[tauri::command]
 pub async fn update_now(
     app: tauri::AppHandle,
@@ -401,6 +420,16 @@ pub async fn update_now(
     url: String,
     digest: Option<String>,
 ) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    if UPDATE_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("一次更新正在进行中，请等它完成".into());
+    }
+    // 任何退出路径（含 ?）都复位标志
+    let _guard = UpdateGuard;
+
     if !is_trusted_download(&url) {
         return Err("下载地址不在信任清单内".into());
     }

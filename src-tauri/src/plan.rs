@@ -141,7 +141,7 @@ pub async fn check_and_fire(
         return;
     };
 
-    match execute(app, action, last_path.as_deref()) {
+    match execute(app, action, last_path.as_deref()).await {
         Ok(()) => {
             use tauri::Emitter;
             let _ = app.emit(
@@ -169,11 +169,20 @@ pub async fn check_and_fire(
     }
 }
 
-fn execute(app: &tauri::AppHandle, action: PlanAction, path: Option<&str>) -> Result<(), String> {
+async fn execute(
+    app: &tauri::AppHandle,
+    action: PlanAction,
+    path: Option<&str>,
+) -> Result<(), String> {
     match action {
         PlanAction::Shutdown => schedule_shutdown("/s"),
         PlanAction::Restart => schedule_shutdown("/r"),
-        PlanAction::Sleep => sleep_now(),
+        // SetSuspendState 是阻塞 Win32 调用（进入睡眠期间不返回，可能数小时）：
+        // 直接跑会占死一个 runtime worker 线程。与 admit_save_dir 对原生模态框
+        // 的处理同一纪律，挪进 spawn_blocking。
+        PlanAction::Sleep => tokio::task::spawn_blocking(sleep_now)
+            .await
+            .map_err(|e| format!("睡眠任务异常: {e}"))?,
         PlanAction::OpenFile => open_finished(app, path),
     }
 }
@@ -245,6 +254,10 @@ fn open_finished(app: &tauri::AppHandle, path: Option<&str>) -> Result<(), Strin
     const RISKY: &[&str] = &[
         "exe", "msi", "bat", "cmd", "ps1", "vbs", "js", "scr", "com", // 可直接执行
         "lnk", "url", "hta", "reg", "inf", "jar", "wsf", "wsh", "cpl", "msc", // 可间接拉起程序
+        // 双击即由系统组件执行/安装的形态：chm 由 hh.exe 加载并可运行内嵌
+        // 脚本；application/msp/mst 是 ClickOnce 与 Windows Installer 补丁/
+        // 变换——「自动打开最后完成的文件」是挂机场景，攻击面成立。
+        "chm", "application", "msp", "mst",
     ];
     if RISKY.contains(&ext.as_str()) {
         return app

@@ -28,6 +28,7 @@ import os from "node:os";
 const EXT_FILES = [
   "README.md",
   "background.js",
+  "bridge-token.txt",
   "icon128.png",
   "icon16.png",
   "icon48.png",
@@ -72,13 +73,22 @@ function patchOne(nsiPath) {
 
   // ---- 1. 搬 extension 的 File 行进可选 Section -------------------------------
   // 形如：  File /a "/oname=extension\popup.js" "D:\...\extension\popup.js"
+  //
+  // 按 `/oname=extension\` 前缀**动态收集**，不用文件名白名单匹配：tauri.conf
+  // 的资源 glob（`../extension/*`）会把扩展目录里的所有文件打进 nsi，白名单
+  // 漏掉新文件时它仍留在主 Section——用户取消勾选「浏览器扩展」照样装上
+  // （fail-open）。动态收集让「哪些文件属于扩展」只剩 tauri 一份事实源；
+  // EXT_FILES 降级为断言：预期文件缺席立刻报错，新增文件不再静默漏搬。
   const lines = nsi.split(/\r?\n/);
   const extFileLines = [];
   const keptLines = [];
+  const seenExtFiles = new Set();
   for (const line of lines) {
     // 只要 /oname=extension\xxx 的 File 行；卸载段里的 Delete 行以 Delete 开头，不会被误搬。
-    if (EXT_FILES.some((f) => line.includes(`extension\\${f}"`)) && /^\s*File\s/.test(line)) {
+    const m = /^\s*File\s.*\/oname=extension\\([^"]+)"/.exec(line);
+    if (m) {
       extFileLines.push(line);
+      seenExtFiles.add(m[1]);
     } else {
       keptLines.push(line);
     }
@@ -86,6 +96,15 @@ function patchOne(nsiPath) {
   if (!extFileLines.length) {
     throw new Error("没在 Section Install 里找到 extension 的 File 行，bundle.resources 变了吗？");
   }
+  for (const f of EXT_FILES) {
+    if (!seenExtFiles.has(f)) {
+      throw new Error(
+        `预期会打包的扩展文件 "${f}" 没出现在 nsi 里——确认它还在 extension/ 目录，` +
+          "且 tauri.conf.json 的 resources glob 覆盖它；若是有意移除，请同步更新本脚本的 EXT_FILES"
+      );
+    }
+  }
+  console.log(`  [ok] extension 文件共 ${seenExtFiles.size} 个（动态收集）`);
   const movedBlock = extFileLines.map(l => `  ${l.trim()}`).join("\n");
   nsi = keptLines.join("\n");
 
@@ -284,7 +303,15 @@ if (fs.existsSync(outputExe) && detectSignature(outputExe) === "signed") {
 }
 
 let patched = 0;
+let rebuilt = 0;
 for (const d of dirs) {
+  // /DARCH=x64 是硬编码的：非 x86_64 目录若也走重打包，会用 x64 的 nsi 产出
+  // 错架构包还写同一个输出文件名（后者静默覆盖前者）。跳过并明说。
+  const arch = path.basename(d);
+  if (!arch.includes("x86_64")) {
+    console.warn(`  [skip] ${arch}：本脚本按 x64 处理（/DARCH=x64），跳过非 x86_64 目录`);
+    continue;
+  }
   console.log(`patch ${d}`);
   const injected = patchOne(path.join(d, "installer.nsi"));
   if (injected) {
@@ -295,7 +322,8 @@ for (const d of dirs) {
   // 所以「nsi 已 patch」不代表「setup.exe 是最新 patch 版」。
   // （踩过坑：一开始只在注入后重建，结果装的一直是 tauri 产出的未 patch 包。）
   rebuild(d, makensis, outputExe);
+  rebuilt++;
   console.log(`  [ok] setup.exe → ${outputExe}`);
 }
-console.log(`完成：注入 ${patched}/${dirs.length} 个 installer.nsi，重建 ${dirs.length} 个 setup.exe`);
+console.log(`完成：注入 ${patched}/${rebuilt} 个 installer.nsi，重建 ${rebuilt} 个 setup.exe`);
 process.exit(0);

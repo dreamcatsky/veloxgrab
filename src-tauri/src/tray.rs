@@ -15,6 +15,7 @@
 //! 前端没开（窗口未创建）时这几项会静默无效果——这可以接受，因为窗口是
 //! 常驻的（关闭只是隐藏），不存在「前端不可用」的稳定状态。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -38,13 +39,45 @@ pub const TRAY_ID: &str = "veloxgrab_tray";
 /// 三条入口共用同一个执行器，不会出现「托盘里的暂停全部和菜单里的行为不一样」。
 pub const TRAY_CMD_EVENT: &str = "tray-command";
 
-/// 建托盘图标。失败只打日志：托盘不是核心功能，不能因为它让程序起不来。
+/// 托盘是否成功建立。lib.rs 的关窗处理据此降级：「最小化到托盘」的前提是
+/// 托盘真的在——托盘失败 × close_mode=background 的组合会让窗口永久消失
+/// 而进程还在跑，用户只能靠「再启动一个实例」救回。
+static TRAY_OK: AtomicBool = AtomicBool::new(false);
+
+/// 托盘当前是否可用（含后台重试成功的情况）。
+pub fn is_available() -> bool {
+    TRAY_OK.load(Ordering::SeqCst)
+}
+
+/// 建托盘图标。首次失败不放弃（开机自启时 Explorer/任务栏可能尚未就绪，
+/// Shell_NotifyIcon 会瞬时失败），后台线程重试三次。
 pub fn setup(app: &tauri::AppHandle) {
+    if try_setup(app) {
+        TRAY_OK.store(true, Ordering::SeqCst);
+        return;
+    }
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if try_setup(&app2) {
+                TRAY_OK.store(true, Ordering::SeqCst);
+                eprintln!("[tray] 重试后托盘建立成功");
+                return;
+            }
+        }
+        eprintln!("[tray] 重试后仍失败：本次会话「最小化到托盘」不可用，关窗将走「询问」");
+    });
+}
+
+/// 单次建立尝试。任一步失败返回 false（托盘不是核心功能，不能让它把程序
+/// 拖垮；降级策略见 is_available 的注释）。
+fn try_setup(app: &tauri::AppHandle) -> bool {
     let show = match MenuItemBuilder::with_id(SHOW_ID, "显示窗口").build(app) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("[tray] 建菜单项失败: {e}");
-            return;
+            return false;
         }
     };
     // 常用动作：不需要看见任务表就能做的事
@@ -52,35 +85,35 @@ pub fn setup(app: &tauri::AppHandle) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("[tray] 建菜单项失败: {e}");
-            return;
+            return false;
         }
     };
     let paste = match MenuItemBuilder::with_id(PASTE_ID, "从剪贴板添加链接").build(app) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("[tray] 建菜单项失败: {e}");
-            return;
+            return false;
         }
     };
     let pause_all = match MenuItemBuilder::with_id(PAUSE_ALL_ID, "全部暂停").build(app) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("[tray] 建菜单项失败: {e}");
-            return;
+            return false;
         }
     };
     let resume_all = match MenuItemBuilder::with_id(RESUME_ALL_ID, "全部开始").build(app) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("[tray] 建菜单项失败: {e}");
-            return;
+            return false;
         }
     };
     let quit = match MenuItemBuilder::with_id(QUIT_ID, "退出").build(app) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("[tray] 建菜单项失败: {e}");
-            return;
+            return false;
         }
     };
 
@@ -99,7 +132,7 @@ pub fn setup(app: &tauri::AppHandle) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("[tray] 建菜单失败: {e}");
-            return;
+            return false;
         }
     };
 
@@ -158,8 +191,5 @@ pub fn setup(app: &tauri::AppHandle) {
         builder = builder.icon(icon.clone());
     }
 
-    match builder.build(app) {
-        Ok(_) => {}
-        Err(e) => eprintln!("[tray] 建托盘图标失败: {e}"),
-    }
+    builder.build(app).is_ok()
 }

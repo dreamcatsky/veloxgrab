@@ -237,11 +237,16 @@ impl Drop for ConnGuard {
 
 fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
     // 读超时：防止连上就不发数据的连接把线程永久占住。
-    // 注意它约束的是「单次 read 的间隔」，滴字慢连由并发上限兜底。
+    // 注意它约束的是「单次 read 的间隔」；滴字慢连（每 4.9 秒 1 字节）能让
+    // read 永不超时，所以还要一个连接级总时限（见 read_request 的 deadline）。
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
-    let req = match read_request(&mut stream) {
+    // 连接总时限：正常扩展请求（预检 + 真实请求两次往返）远用不了 30 秒；
+    // 超时按协议错误处理，线程回收。
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    let req = match read_request(&mut stream, deadline) {
         Ok(v) => v,
         Err(e) => {
             let _ = respond(&mut stream, 400, &format!("{{\"ok\":false,\"error\":{}}}", json_str(&e)));
@@ -254,14 +259,6 @@ fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
     // 放在所有分支之前——rebinding 的探测也不该得到任何响应。
     if !host_is_bridge(req.host.as_deref()) {
         let _ = respond(&mut stream, 403, "{\"ok\":false,\"error\":\"bad host\"}");
-        return;
-    }
-
-    // 预检：扩展用 GET 就够（没有自定义头），但别的地方可能发 OPTIONS。
-    // 注意预检请求**不可能**携带自定义头（浏览器会剥掉），所以 token 校验
-    // 只对真实请求做，这里只回允许的头清单。
-    if method == "OPTIONS" {
-        let _ = respond(&mut stream, 204, "");
         return;
     }
 
@@ -280,6 +277,17 @@ fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
         );
         return;
     }
+
+    // 预检：浏览器对非简单请求先发 OPTIONS。放在 Origin 门禁**之后**——
+    // 扩展的预检必然带 chrome-extension:// Origin，正常路径不受影响；
+    // 旧实现把预检放在门禁前，任何网页都能借 OPTIONS 探测「本机 58943
+    // 有一个说 JSON 的服务」。注意预检请求**不可能**携带自定义头（浏览器
+    // 会剥掉），所以 token 校验只对真实请求做，这里只回允许的头清单。
+    if method == "OPTIONS" {
+        let _ = respond(&mut stream, 204, "");
+        return;
+    }
+
     // 走到这里说明扩展真的在跑，记下来（见 EXT_SEEN 的注释）。
     // 只在首次翻转时落盘，避免每次 ping 都写文件。
     // 放在 token 校验之前：扩展加载了但版本旧（还不带 token）也是「已安装」
@@ -351,12 +359,19 @@ struct BridgeReq {
 }
 
 /// 解析请求行 + 头，必要时读 body。
-fn read_request(stream: &mut TcpStream) -> Result<BridgeReq, String> {
+fn read_request(stream: &mut TcpStream, deadline: Instant) -> Result<BridgeReq, String> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
 
     // 一直读到出现空行（\r\n\r\n）为止。
     loop {
+        // 连接级总时限：set_read_timeout 只管「单次 read 的间隔」，滴字慢连
+        // （每 4.9 秒发 1 字节）能让下面的循环永不超时，8 KiB 头上限意味着
+        // 单连接最长可挂数小时——每连接一线程的模型下就是数百线程被长期
+        // 占用。deadline 是硬上限。
+        if Instant::now() >= deadline {
+            return Err("请求超时（连接总时限 30 秒）".into());
+        }
         let n = stream.read(&mut chunk).map_err(|e| format!("读取请求失败: {e}"))?;
         if n == 0 {
             return Err("连接在请求头结束前关闭".into());
@@ -412,6 +427,9 @@ fn read_request(stream: &mut TcpStream) -> Result<BridgeReq, String> {
 
     // 头读完之后 body 可能已经在 rest 里了，补读剩下的。
     while rest.len() < content_len {
+        if Instant::now() >= deadline {
+            return Err("请求超时（连接总时限 30 秒）".into());
+        }
         let n = stream.read(&mut chunk).map_err(|e| format!("读取请求体失败: {e}"))?;
         if n == 0 {
             break;

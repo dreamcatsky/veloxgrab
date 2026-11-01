@@ -44,8 +44,15 @@ pub fn host_of(url: &str) -> Option<&str> {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = rest.split(['/', '?', '#']).next()?;
     let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
-    // IPv6 字面量（[::1]:8080）不会出现在媒体站名单里，按端口截断即可
-    let host = host_port.split(':').next().unwrap_or(host_port);
+    // IPv6 字面量（[::1]:8080）带方括号：先剥括号再取端口，否则会返回 "["
+    let host = if host_port.starts_with('[') {
+        host_port
+            .split_once(']')
+            .map(|(h, _)| &h[1..])
+            .unwrap_or(host_port)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
     if host.is_empty() {
         None
     } else {
@@ -98,9 +105,13 @@ pub fn sanitize_filename(s: &str) -> String {
     truncate_keep_ext(&out, MAX_NAME_CHARS)
 }
 
-/// 按字符数截断，尽量保留扩展名（否则播放器/后续处理认不出格式）
+/// 按 UTF-16 码元数截断，尽量保留扩展名（否则播放器/后续处理认不出格式）。
+///
+/// Windows 单分量上限是 255 **UTF-16 码元**（NTFS），不是 Unicode 标量数：
+/// 150 个星面字符（emoji）按 chars() 数是 150，按 UTF-16 是 300，
+/// `File::create` 直接失败。max 因此按「UTF-16 码元预算」解释。
 fn truncate_keep_ext(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if s.encode_utf16().count() <= max {
         return s.to_string();
     }
 
@@ -109,15 +120,25 @@ fn truncate_keep_ext(s: &str, max: usize) -> String {
         .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
     // 扩展名本身离谱地长（比如标题里的点被当成扩展名）就不保留它
-    let (ext, ext_len) = if ext.chars().count() <= 20 {
-        let n = ext.chars().count();
-        (ext, n)
+    let ext_len = ext.encode_utf16().count();
+    let (ext, ext_len) = if ext_len <= 20 {
+        (ext, ext_len)
     } else {
         (String::new(), 0)
     };
 
     let keep = max.saturating_sub(ext_len).max(1);
-    let base: String = s.chars().take(keep).collect();
+    // 逐标量累计 UTF-16 宽度，预算用完即截停——不按 chars() 计数的原因同上
+    let mut used = 0usize;
+    let mut base = String::new();
+    for ch in s.chars() {
+        let w = ch.len_utf16();
+        if used + w > keep {
+            break;
+        }
+        used += w;
+        base.push(ch);
+    }
     let base = base
         .trim_end_matches([' ', '.'])
         .to_string();
@@ -282,6 +303,8 @@ mod tests {
     fn host_of_ignores_scheme_userinfo_and_port() {
         assert_eq!(host_of("https://user:pw@a.b.com:8443/x?y#z"), Some("a.b.com"));
         assert_eq!(host_of("http://127.0.0.1:8000/f"), Some("127.0.0.1"));
+        assert_eq!(host_of("http://[::1]:8080/f"), Some("::1"));
+        assert_eq!(host_of("http://[::1]/f"), Some("::1"));
         assert_eq!(host_of("https:///x"), None);
         assert_eq!(host_of(""), None);
     }

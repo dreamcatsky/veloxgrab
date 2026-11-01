@@ -31,6 +31,14 @@
 ///
 /// 不返回 `Result`：调用点在读管道，任何"解码失败"都不能变成 I/O 错误，
 /// 否则会中断对流的管理（见上面模块注释最后一段）。
+///
+/// # 调用方契约
+///
+/// 传入的必须是**完整的行或完整的段**。GBK 双字节字符跨调用边界被截开时，
+/// 两半各自走「UTF-8 失败 → CP_ACP 失败 → lossy」，边界处每个字符都损成
+/// 替换符——函数自身无法缓冲半个字符。当前所有调用点（engine 按行
+/// `read_until`、进程收尾后的整段 stdout/stderr）都满足；未来若改成固定
+/// 大小块的流式解码，必须先在调用方攒齐边界。
 pub fn decode_output(bytes: &[u8]) -> String {
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();

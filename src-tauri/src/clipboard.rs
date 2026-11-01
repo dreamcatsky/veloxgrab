@@ -114,10 +114,25 @@ pub fn spawn_watcher(app: tauri::AppHandle) {
 }
 
 /// 读剪贴板文本。读不到返回空字符串（前端据此提示，而不是弹一个错误框）。
+/// CloseClipboard 的 RAII 守卫：剪贴板不关会让**整个系统**的复制粘贴卡死。
+/// 手工「保证调用」在 panic 路径上不是语言级保证，读/写两条路径统一用它。
+#[cfg(windows)]
+struct CloseOnDrop;
+
+#[cfg(windows)]
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::DataExchange::CloseClipboard;
+        unsafe {
+            let _ = CloseClipboard();
+        }
+    }
+}
+
 #[cfg(windows)]
 pub fn read_clipboard_text() -> String {
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     };
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 
@@ -140,8 +155,10 @@ pub fn read_clipboard_text() -> String {
         return String::new();
     }
 
-    // 从这里开始必须保证 CloseClipboard 一定被调用：剪贴板不关会让
+    // 从这里开始由 CloseOnDrop 保证关闭（含 panic 路径）：剪贴板不关会让
     // 整个系统的复制粘贴都卡住，用户会以为是系统坏了。
+    let _close_guard = CloseOnDrop;
+
     let text = unsafe {
         if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
             String::new()
@@ -174,10 +191,7 @@ pub fn read_clipboard_text() -> String {
         }
     };
 
-    unsafe {
-        let _ = CloseClipboard();
-    }
-
+    // _close_guard 在此 drop：CloseClipboard 由 RAII 保证（含 panic 路径）
     text
 }
 
@@ -190,15 +204,18 @@ pub fn read_clipboard_text() -> String {
 /// 把文本写进剪贴板。
 ///
 /// 这是本程序**唯一**会修改系统共享状态的操作，所以收得很窄：只写
-/// CF_UNICODETEXT，清空后只放一份，不碰其它格式（用户复制过一张图片再来点
-/// 「复制链接」，不该顺手把他的图片剪贴内容丢掉）。
+/// CF_UNICODETEXT。如实声明语义：`EmptyClipboard` 清掉的是**所有**格式的
+/// 旧内容（图片、文件 DROP list 都在内），随后只放回我们的文本——
+/// 「写文本 = 覆盖剪贴板」。想保住其它格式需要枚举+暂存+回写全部格式，
+/// 复杂度与出错面都配不上这里的收益；模块注释曾声称「不碰其它格式」，
+/// 与实现不符，已改正。
 ///
 /// 内存所有权是这里最容易写错的地方：`SetClipboardData` 成功后句柄**归系统
 /// 所有**，再 GlobalFree 就是让系统拿着已释放内存；只有 Set 失败时句柄还归
 /// 我们，才必须自己释放。
 #[cfg(windows)]
 pub fn write_clipboard_text(text: &str) -> Result<(), String> {
-    use windows_sys::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+    use windows_sys::Win32::System::DataExchange::OpenClipboard;
 
     // CF_UNICODETEXT = 13（同读路径的注记：常量在 OLE 模块，为一个数字不值得引）。
     const CF_UNICODETEXT: u32 = 13;
@@ -216,11 +233,9 @@ pub fn write_clipboard_text(text: &str) -> Result<(), String> {
         return Err("剪贴板正被其它程序占用，稍后再试".into());
     }
 
-    let result = unsafe { write_locked(text, CF_UNICODETEXT) };
-    unsafe {
-        let _ = CloseClipboard();
-    }
-    result
+    // 关闭由 RAII 保证（含 panic 路径）
+    let _close_guard = CloseOnDrop;
+    unsafe { write_locked(text, CF_UNICODETEXT) }
 }
 
 /// 剪贴板已打开时的写入。调用方保证随后的 CloseClipboard。

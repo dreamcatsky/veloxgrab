@@ -2,8 +2,9 @@
 //
 // 与主窗口的 app.js 完全独立：它不共享 JS 全局，只共享 Rust 侧的 task 列表和
 // 同一个 "task-progress" 事件。因此这里用最省的做法——定期拉一次 list_tasks
-// 拿到进行中的任务，再靠事件即时刷新。窗口只在用户主动打开时才存在，
-// 所以轮询的代价可以接受（1s 一次，且只在有活动任务时才开着）。
+// 拿到进行中的任务，再靠事件即时刷新。窗口只在用户主动打开时才存在；
+// 轮询自适应频率：有活动任务时 1s，空闲时降到 3s（旧实现无条件 1s，
+// 与这里的注释承诺不符，已改为言行一致）。
 (function () {
   "use strict";
 
@@ -145,7 +146,13 @@
       const p = evt.payload;
       const i = tasks.findIndex((t) => t.id === p.id);
       if (i < 0) {
-        refresh();
+        // 本地还没有这一行：补一次全量同步。事件最密 10Hz/任务，窗口刚
+        // 打开、tasks 还是空数组时会被连发 10 次/秒 IPC——套 250ms 节流。
+        const now = Date.now();
+        if (now - lastEventRefresh >= 250) {
+          lastEventRefresh = now;
+          refresh();
+        }
         return;
       }
       // 与主窗口同样的合并规则：null 表示「本轮没有这一项」，不能覆盖
@@ -158,8 +165,17 @@
     });
   }
 
+  let lastEventRefresh = 0;
+
   refresh();
-  // 事件只在有进度变化时才来；任务刚入队/结束的瞬间可能没有事件，
-  // 用低频轮询兜住状态跃迁，避免窗口停在过期的画面上。
-  setInterval(refresh, 1000);
+  // 轮询兜底状态跃迁（任务刚入队/结束的瞬间可能没有事件）。自适应频率：
+  // 有活动任务 1s，空闲 3s——窗口常驻但空闲时不必每秒白跑一趟 IPC。
+  function schedulePoll() {
+    const hasActive = tasks.some((t) => ACTIVE.has(t.state));
+    setTimeout(async () => {
+      await refresh();
+      schedulePoll();
+    }, hasActive ? 1000 : 3000);
+  }
+  schedulePoll();
 })();

@@ -775,6 +775,16 @@ async fn run_download_inner(
         task.best_audio_format.as_deref(),
         settings.merge_to_mp4,
     );
+    // 合并场景提前验 ffmpeg：缺 ffmpeg 时 yt-dlp 会把整条下载跑完才在合并
+    // 阶段报错——几十 GB 白下。expr 带 '+' = 选中格式不含音轨、需要拼接。
+    // （启动时的 health_check 也会标 ffmpeg 状态，这里是下载路径上的保险。）
+    if expr.contains('+') && crate::ytdlp::resolve_ffmpeg().is_none() {
+        return Err(
+            "该清晰度需要 ffmpeg 合并音视频，但系统里找不到 ffmpeg。\
+             请安装 ffmpeg（见 README「依赖」）或改选自带音轨的清晰度"
+                .into(),
+        );
+    }
 
     let mut cmd = Command::new(&ytdlp);
     // 每行都是完整进度快照
@@ -882,6 +892,10 @@ async fn run_download_inner(
         let mut last_path: Option<String> = None;
         let mut last_err_line: Option<String> = None;
         let mut read_err: Option<String> = None;
+        // 合并前进度单调不减的钳制基准。yt-dlp 下 `f137+f140` 这类视频+音频
+        // 组合时，第二段（音频）的 [download] 行会把百分比从 90%+ 打回个位数，
+        // 界面上进度反复横跳。重试是新 worker、reader 每轮新建，不受影响。
+        let mut last_progress: f64 = 0.0;
         loop {
             let line = match next_line_lossy(&mut reader, &mut buf).await {
                 Ok(Some(l)) => l,
@@ -909,6 +923,12 @@ async fn run_download_inner(
             }
             if line.starts_with("[download]") {
                 if let Some(p) = parse_progress_line(&line) {
+                    // 回跳的进度行直接丢弃（见上方 last_progress 注释）；
+                    // 字节数随下一行合法进度一起更新，界面只少看一帧。
+                    if p.progress < last_progress {
+                        continue;
+                    }
+                    last_progress = p.progress;
                     let ev = ProgressEvent {
                         id: id2.clone(),
                         state: TaskState::Downloading,
@@ -1012,9 +1032,22 @@ async fn run_download_inner(
         // wait 出错时进程状态未知（可能仍活着），保留 pid 让用户取消时还能补刀
         Err(e) => return Err(format!("等待进程失败: {e}")),
     };
-    let (final_path, stdout_err, stdout_read_err) =
-        stdout_handle.await.unwrap_or((None, None, None));
-    let (stderr_lines, stderr_read_err) = stderr_handle.await.unwrap_or_default();
+    let (final_path, stdout_err, stdout_read_err) = match stdout_handle.await {
+        Ok(v) => v,
+        Err(e) => {
+            // reader 任务 panic 时不能把「结果丢了」当「成功且无输出」：
+            // 注入一条 read_err，成功退出码下的兜底判定会因它走失败分支，
+            // 而不是去下载目录里碰运气找文件记成 Done。
+            (None, None, Some(format!("读取 yt-dlp 输出的任务异常: {e}")))
+        }
+    };
+    let (stderr_lines, stderr_read_err) = match stderr_handle.await {
+        Ok(v) => v,
+        Err(e) => (
+            Vec::new(),
+            Some(format!("读取 yt-dlp 错误输出的任务异常: {e}")),
+        ),
+    };
 
     // 被取消 / 被暂停
     if token.is_canceled() {
@@ -1441,7 +1474,12 @@ pub fn kill_process_tree(pid: u32) {
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        // 绝对路径，与 plan.rs 调 shutdown.exe 的纪律一致：PATH 上出现同名
+        // 恶意 exe 时不能让它借「杀进程」被执行。
+        let taskkill = std::env::var("SystemRoot")
+            .map(|root| format!("{root}\\System32\\taskkill.exe"))
+            .unwrap_or_else(|_| "taskkill.exe".to_string());
+        let _ = std::process::Command::new(taskkill)
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .creation_flags(0x0800_0000)
             .stdout(Stdio::null())

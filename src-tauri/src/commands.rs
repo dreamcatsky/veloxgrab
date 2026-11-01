@@ -143,7 +143,7 @@ async fn admit_save_dir(
     if needs_prompt {
         let question = format!(
             "网页/扩展请求把文件下载到默认下载目录之外：\n\n{display}\n\n\
-             确定要下载到这个位置吗？拒绝后将使用默认下载目录。"
+             确定要下载到这个位置吗？拒绝将取消本次下载。"
         );
         let app2 = app.clone();
         // 原生模态框只在这里弹一次；确认结果决定放行还是拒绝，没有第三条路。
@@ -1800,6 +1800,11 @@ async fn pause_one(state: &AppState, id: &str) -> Result<(), String> {
 async fn resume_one(state: &AppState, id: &str) -> Result<(), String> {
     {
         let mut q = state.queue.lock().await;
+        // 已经在队列里的 Queued 任务点「继续」是空操作：走下面的「先删再加」
+        // 会把它的启动顺位悄悄压到队尾——用户点一下反而更靠后。
+        if q.iter().any(|x| x == id) {
+            return Ok(());
+        }
         q.retain(|x| x != id);
     }
     // 「查令牌 + 置 Queued」合并进一个 tasks 临界区（锁序 tasks→tokens 与泵一致）。
@@ -2248,9 +2253,10 @@ pub fn get_plan(state: tauri::State<'_, AppState>) -> Option<String> {
 /// 取消已经排队的关机/重启（`shutdown /a`）。
 ///
 /// 只对「系统已经排上队」的情况有意义；睡眠没有取消一说，所以这里不处理。
+/// async 命令：sync 命令默认跑主线程，`.status()` 同步等待子进程会短暂冻结 UI。
 #[cfg(windows)]
 #[tauri::command]
-pub fn cancel_shutdown() -> Result<(), String> {
+pub async fn cancel_shutdown() -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     let status = std::process::Command::new(r"C:\Windows\System32\shutdown.exe")
         .arg("/a")
@@ -2266,7 +2272,7 @@ pub fn cancel_shutdown() -> Result<(), String> {
 
 #[cfg(not(windows))]
 #[tauri::command]
-pub fn cancel_shutdown() -> Result<(), String> {
+pub async fn cancel_shutdown() -> Result<(), String> {
     Err("本平台未实现".into())
 }
 

@@ -90,9 +90,11 @@ pub fn ensure_room(dir: &Path, need: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// 人类可读的字节数（1.5 GB / 820 MB）。只用于错误提示，精度到 0.1 即可。
+/// 人类可读的字节数（1.5 GiB / 820 MiB）。只用于错误提示，精度到 0.1 即可。
+/// 口径对齐 direct.rs::human_speed：1024 进制用 IEC 记法，不再自称 KB/MB
+/// （同一界面两处数字差 2.4% 还都写 MB，是自相矛盾）。
 fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0usize;
     while value >= 1024.0 && unit + 1 < UNITS.len() {
@@ -126,7 +128,7 @@ mod tests {
     fn human_units() {
         assert_eq!(human(0), "0 B");
         assert_eq!(human(512), "512 B");
-        assert_eq!(human(1536), "1.5 KB");
-        assert_eq!(human(3 * 1024 * 1024 * 1024), "3.0 GB");
+        assert_eq!(human(1536), "1.5 KiB");
+        assert_eq!(human(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
 }

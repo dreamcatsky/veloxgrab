@@ -283,21 +283,83 @@ pub struct MediaInfo {
     pub has_video_stream: bool,
 }
 
+/// 宽松 u64 反序列化。
+///
+/// 部分 extractor 的 `filesize`/`filesize_approx` 是浮点、个别字段是字符串
+/// 数字。强类型 `Option<u64>` 遇到类型偏差会把**整条 -J JSON** 一票否决——
+/// 明明能下载的视频报「解析 JSON 失败」。这里按「数字/字符串都尽量收，
+/// 收不了当缺失」处理：这些都是展示元数据，宁缺勿炸。
+fn de_flexible_u64<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v: Option<serde_json::Value> = Option::deserialize(d)?;
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => {
+            Ok(n.as_u64().or_else(|| n.as_f64().map(|f| f as u64)))
+        }
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(None);
+            }
+            t.parse::<u64>()
+                .ok()
+                .or_else(|| t.parse::<f64>().ok().map(|f| f as u64))
+                .map(Some)
+                .ok_or_else(|| D::Error::custom("无法解析为整数"))
+        }
+        // 其它类型（bool/数组…）按缺失处理，不炸整条 JSON
+        _ => Ok(None),
+    }
+}
+
+/// 宽松 f64 反序列化，语义同 `de_flexible_u64`。
+fn de_flexible_f64<'de, D>(d: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v: Option<serde_json::Value> = Option::deserialize(d)?;
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => Ok(n.as_f64()),
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(None);
+            }
+            t.parse::<f64>()
+                .map(Some)
+                .map_err(|_| D::Error::custom("无法解析为数字"))
+        }
+        _ => Ok(None),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawFormat {
     format_id: Option<String>,
     ext: Option<String>,
     resolution: Option<String>,
-    height: Option<u32>,
+    #[serde(default, deserialize_with = "de_flexible_u64")]
+    height: Option<u64>,
     vcodec: Option<String>,
     acodec: Option<String>,
+    #[serde(default, deserialize_with = "de_flexible_u64")]
     filesize: Option<u64>,
+    #[serde(default, deserialize_with = "de_flexible_u64")]
     filesize_approx: Option<u64>,
+    #[serde(default, deserialize_with = "de_flexible_f64")]
     fps: Option<f64>,
     format_note: Option<String>,
     /// 音频平均码率（kbps）
+    #[serde(default, deserialize_with = "de_flexible_f64")]
     abr: Option<f64>,
     /// 总码率（kbps），abr 缺失时的兜底
+    #[serde(default, deserialize_with = "de_flexible_f64")]
     tbr: Option<f64>,
 }
 
@@ -307,6 +369,7 @@ struct RawInfo {
     title: Option<String>,
     uploader: Option<String>,
     thumbnail: Option<String>,
+    #[serde(default, deserialize_with = "de_flexible_f64")]
     duration: Option<f64>,
     webpage_url: Option<String>,
     extractor: Option<String>,
@@ -379,6 +442,7 @@ async fn run_probe(
     url: &str,
     settings: &Settings,
     with_cookies: bool,
+    budget: Duration,
 ) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new(ytdlp);
     cmd.arg("-J");
@@ -397,12 +461,12 @@ async fn run_probe(
     // 超时丢弃 future 时把子进程一起带走，别留下孤儿 yt-dlp
     cmd.kill_on_drop(true);
 
-    let output = tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
+    let output = tokio::time::timeout(budget, cmd.output())
         .await
         .map_err(|_| {
             format!(
                 "解析超时（{} 秒）：站点无响应或需要人机验证",
-                PROBE_TIMEOUT.as_secs()
+                budget.as_secs()
             )
         })?
         .map_err(|e| format!("启动 yt-dlp 失败: {e}"))?;
@@ -429,12 +493,17 @@ async fn run_probe(
 pub async fn probe(url: &str, settings: &Settings) -> Result<MediaInfo, String> {
     let ytdlp = resolve_ytdlp()?;
 
-    let first = run_probe(&ytdlp, url, settings, false).await;
+    // 两轮（不带/带 Cookie）共享一个总预算：旧实现各 90 秒，前端「解析」
+    // 按钮最坏禁死 3 分钟且没有取消入口。第二轮保底 30 秒、上限吃剩余预算。
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    let first = run_probe(&ytdlp, url, settings, false, PROBE_TIMEOUT).await;
     let output = match first {
         Ok(o) => o,
         Err(plain_err) => {
             if has_cookie_source(settings) {
-                match run_probe(&ytdlp, url, settings, true).await {
+                let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                let second_budget = remain.max(Duration::from_secs(30));
+                match run_probe(&ytdlp, url, settings, true, second_budget).await {
                     Ok(o) => o,
                     // 带上 Cookie 还是不行：把两轮的错误都给出来，
                     // 否则用户只看到 Cookie 的错误，会误以为是 Cookie 的问题
@@ -485,8 +554,10 @@ pub async fn probe(url: &str, settings: &Settings) -> Result<MediaInfo, String> 
                     .or_else(|| f.height.map(|h| format!("{h}p")))
                     .unwrap_or_default(),
                 // 优先用 yt-dlp 直接给的 height，缺失时才从字符串兜底解析
+                // （宽松反序列化按 u64 收，此处收窄到界面用的 u32）
                 height: f
                     .height
+                    .map(|h| u32::try_from(h).unwrap_or(0))
                     .unwrap_or_else(|| parse_height(f.resolution.as_deref().unwrap_or(""))),
                 filesize: size,
                 has_video: true,
