@@ -608,7 +608,7 @@ body.is-max #winMax .ic-restore { display: block; }
 .list-head,
 .task-row {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) 78px 80px 140px 80px 64px 52px;
+  grid-template-columns: 24px minmax(0, 1fr) 78px 80px 140px 80px 64px;
   align-items: center;
   gap: 8px;
   padding: 0 12px;
@@ -658,7 +658,7 @@ body.is-max #winMax .ic-restore { display: block; }
 @media (max-width: 1020px) {
   .list-head,
   .task-row {
-    grid-template-columns: 24px minmax(0, 1fr) 78px 80px 120px 52px;
+    grid-template-columns: 24px minmax(0, 1fr) 78px 80px 120px;
   }
   .list-head > :nth-child(6),
   .list-head > :nth-child(7),
@@ -787,12 +787,6 @@ body.is-max #winMax .ic-restore { display: block; }
   flex-shrink: 0;
 }
 
-/* 行内动作：hover 才显示，避免整列都是按钮 */
-.tr-act { display: flex; justify-content: flex-end; opacity: 0; transition: opacity .12s; }
-.task-row:hover .tr-act,
-.task-row.selected .tr-act,
-.tr-act:focus-within { opacity: 1; }
-.tr-act .icon-btn { padding: 2px 5px; font-size: 11px; }
 
 /* 空列表提示：占满剩余高度并垂直居中，否则一行字贴在表头下面很难看 */
 .list-empty {

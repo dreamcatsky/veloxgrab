@@ -1311,69 +1311,6 @@
     row.appendChild(el("div", "tr-speed", live && t.speed ? t.speed : "—"));
     row.appendChild(el("div", "tr-eta", live && t.eta ? t.eta : "—"));
 
-    // 行内动作：只留最常用的一个，其余走菜单/工具栏的批量命令，
-    // 否则七列宽的表里每行三个按钮会把名称列挤没。
-    const actCell = el("div", "tr-act");
-    const acting = t.state === "queued" || t.state === "downloading" || t.state === "merging";
-    if (acting) {
-      const p = el("button", "icon-btn", "暂停");
-      p.title = "暂停（保留断点）";
-      p.onclick = async () => {
-        try {
-          await invoke("pause_task", { id: t.id });
-          refreshTasks();
-        } catch (e) {
-          toast(String(e), true);
-        }
-      };
-      actCell.appendChild(p);
-    } else if (t.state === "paused" || t.state === "failed") {
-      const r = el("button", "icon-btn", "继续");
-      r.title = "从断点继续";
-      r.onclick = async () => {
-        try {
-          await invoke("resume_task", { id: t.id });
-          refreshTasks();
-        } catch (e) {
-          toast(String(e), true);
-        }
-      };
-      actCell.appendChild(r);
-    } else if (t.state === "canceled") {
-      // 取消是终态：断点作废，所以这里给「重下」而不是「继续」——
-      // 后端会先清掉 .veloxgrab-part / .part 再从头入队。
-      const r = el("button", "icon-btn", "重下");
-      r.title = "重新下载（清除旧断点，从头开始）";
-      r.onclick = async () => {
-        try {
-          await invoke("redo_task", { id: t.id });
-          refreshTasks();
-        } catch (e) {
-          toast(String(e), true);
-        }
-      };
-      actCell.appendChild(r);
-    } else if (done && gone) {
-      // 记录还在、实物没了：给「重下」补救入口（后端对成品已删的 done
-      // 放行 redo_task）。「打开」点了只会弹「文件不存在」。
-      const r = el("button", "icon-btn", "重下");
-      r.title = "成品文件已被删除，点击重新下载";
-      r.onclick = async () => {
-        try {
-          await invoke("redo_task", { id: t.id });
-          refreshTasks();
-        } catch (e) {
-          toast(String(e), true);
-        }
-      };
-      actCell.appendChild(r);
-    } else if (done && t.output_path) {
-      const o = el("button", "icon-btn", "打开");
-      o.title = "打开所在文件夹";
-      o.onclick = () => revealItem(t.output_path);
-      actCell.appendChild(o);
-    }
-    row.appendChild(actCell);
 
     return row;
   }
