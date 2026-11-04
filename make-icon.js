@@ -1,4 +1,15 @@
-// 生成 VeloxGrab 应用图标：1024x1024 PNG，纯手写，无外部依赖
+// 生成 VeloxGrab 应用图标：1024x1024 PNG，纯手写，无外部依赖。
+//
+// 设计（与应用内「深色磨砂 + 青紫双强调」同一套视觉语言）：
+//   · squircle（超椭圆 n≈4.4）底板，比普通圆角矩形更接近 iOS 的连续曲率，
+//     观感立刻「贵」一档；深靛底色压得住，不留饱和色块的那种廉价感
+//   · 两团极光辉光（紫 左上 / 青 右下）低透明度叠在底色里，模拟磨砂玻璃
+//     后透光的效果，与主界面顶栏/侧栏的发光一致
+//   · 主体是品牌 V 形笔画（顶栏 brand 同一个 V）：上粗下收的锥形笔画
+//     传达「速度」，白→冰蓝渐变 + 顶点处青色光晕拉出层次
+//   · V 下方一条青→紫渐变的「着陆条」承接下载语义（箭头落进槽位），
+//     同时把构图重心拉回画面中轴
+//   · 顶缘一道随高度衰减的内描边高光，是玻璃质感的点睛笔
 const fs = require("fs");
 const path = require("path");
 const zlib = require("zlib");
@@ -7,7 +18,11 @@ const W = 1024;
 const H = 1024;
 
 // 累积缓冲区（float，用于 alpha 混合）
-const acc = new Float32Array(W * H * 4); // r,g,b 端 Premultiplied + a
+// 注意：blend() 做的是 **straight-alpha** 合成（颜色通道存的是未预乘的
+// 「本色」），编码时必须乘回 alpha 转成 PNG 要求的预乘格式——否则低 alpha
+// 的边缘像素会以「本色 255 + 微量 alpha」落盘，解码端反预乘成刺眼的
+// 白色光晕（旧图标的边界弧线光晕就是它）。
+const acc = new Float32Array(W * H * 4); // r,g,b 端 Straight alpha + a
 
 function blend(x, y, r, g, b, a) {
   if (x < 0 || y < 0 || x >= W || y >= H || a <= 0) return;
@@ -22,178 +37,182 @@ function blend(x, y, r, g, b, a) {
   acc[i + 3] = outA;
 }
 
-// 圆角矩形的覆盖率（0..1），超采样 2x2
-function roundRectCov(x, y, x0, y0, x1, y1, rad) {
+const clamp01 = (v) => Math.max(0, Math.min(1, v));
+
+// ---------- squircle（超椭圆）几何 ----------
+const PAD = 44;
+const CX = W / 2;
+const CY = H / 2;
+const AX = (W - 2 * PAD) / 2; // 半宽 468
+const AY = (H - 2 * PAD) / 2; // 半高 468
+const NEXP = 4.4;             // 越大越接近圆角矩形，4~5 之间是 iOS 手感
+
+// 归一化超椭圆场：0 = 边界内，正值在外的近似有符号距离（按半宽缩放）
+function squircleSDF(px, py) {
+  const nx = Math.abs((px - CX) / AX);
+  const ny = Math.abs((py - CY) / AY);
+  const f = Math.pow(Math.pow(nx, NEXP) + Math.pow(ny, NEXP), 1 / NEXP);
+  return (f - 1) * AX;
+}
+
+// 3x3 超采样的覆盖率的
+function squircleCov(x, y) {
   let hits = 0;
-  for (let sy = 0; sy < 2; sy++) {
-    for (let sx = 0; sx < 2; sx++) {
-      const px = x + (sx + 0.5) / 2;
-      const py = y + (sy + 0.5) / 2;
-      const cx = Math.min(Math.max(px, x0 + rad), x1 - rad);
-      const cy = Math.min(Math.max(py, y0 + rad), y1 - rad);
-      const dx = px - cx;
-      const dy = py - cy;
-      if (dx * dx + dy * dy <= rad * rad) hits++;
+  for (let sy = 0; sy < 3; sy++) {
+    for (let sx = 0; sx < 3; sx++) {
+      if (squircleSDF(x + (sx + 0.5) / 3, y + (sy + 0.5) / 3) < 0) hits++;
     }
   }
-  return hits / 4;
+  return hits / 9;
 }
 
-function fillRoundRect(x0, y0, x1, y1, rad, colorFn) {
-  const rx0 = Math.floor(x0),
-    ry0 = Math.floor(y0);
-  const rx1 = Math.ceil(x1),
-    ry1 = Math.ceil(y1);
-  for (let y = ry0; y <= ry1; y++) {
-    for (let x = rx0; x <= rx1; x++) {
-      const cov = roundRectCov(x, y, x0, y0, x1, y1, rad);
-      if (cov <= 0) continue;
-      const c = colorFn(x, y);
-      if (c) blend(x, y, c[0], c[1], c[2], cov * c[3]);
-    }
-  }
-}
-
-// 圆角矩形描边：外圈减内圈
-function strokeRoundRect(x0, y0, x1, y1, rad, thick, color) {
-  const rx0 = Math.floor(x0 - thick),
-    ry0 = Math.floor(y0 - thick);
-  const rx1 = Math.ceil(x1 + thick),
-    ry1 = Math.ceil(y1 + thick);
-  for (let y = ry0; y <= ry1; y++) {
-    for (let x = rx0; x <= rx1; x++) {
-      const outer = roundRectCov(x, y, x0, y0, x1, y1, rad);
-      const inner = roundRectCov(
-        x,
-        y,
-        x0 + thick,
-        y0 + thick,
-        x1 - thick,
-        y1 - thick,
-        Math.max(1, rad - thick)
-      );
-      const cov = Math.max(0, outer - inner);
-      if (cov > 0) blend(x, y, color[0], color[1], color[2], cov * color[3]);
-    }
-  }
-}
-
-// ========== 1. 深色圆角底板 ==========
-const pad = 60;
-const x0 = pad,
-  y0 = pad,
-  x1 = W - pad,
-  y1 = H - pad;
-const rad = 200;
-
-fillRoundRect(x0, y0, x1, y1, rad, (x, y) => {
-  // 垂直渐变：顶部 #2A3550 → 底部 #171A21
-  const t = (y - y0) / (y1 - y0);
-  const r = Math.round(42 + (23 - 42) * t);
-  const g = Math.round(53 + (26 - 53) * t);
-  const b = Math.round(80 + (33 - 80) * t);
-  return [r, g, b, 1];
-});
-
-// ========== 2. 顶部蓝色光晕 ==========
-for (let y = y0; y < H; y++) {
-  const t = Math.max(0, (y - y0) / (H * 0.62));
-  const a = Math.pow(1 - t, 2.2) * 0.38;
-  if (a <= 0.002) continue;
-  for (let x = x0; x < x1; x++) {
-    const cov = roundRectCov(x, y, x0, y0, x1, y1, rad);
+// ---------- 1. 深靛底板 + 顶部微提亮 ----------
+for (let y = 0; y < H; y++) {
+  for (let x = 0; x < W; x++) {
+    const cov = squircleCov(x, y);
     if (cov <= 0) continue;
-    // 中心偏上的径向光斑
-    const dx = (x - W / 2) / (W * 0.55);
-    const dy = (y - H * 0.28) / (H * 0.45);
-    const radial = Math.max(0, 1 - Math.sqrt(dx * dx + dy * dy));
-    const aa = a * radial;
-    if (aa > 0.002) blend(x, y, 75, 139, 245, cov * aa);
+    const t = clamp01((y - PAD) / (H - 2 * PAD));
+    // 顶 #2B2B4E → 底 #131320，略微偏靛而不是纯灰黑
+    const r = Math.round(43 + (19 - 43) * t);
+    const g = Math.round(43 + (19 - 43) * t);
+    const b = Math.round(78 + (32 - 78) * t);
+    blend(x, y, r, g, b, cov);
   }
 }
 
-// ========== 3. 内描边高光 ==========
-strokeRoundRect(x0, y0, x1, y1, rad, 3, [255, 255, 255, 0.16]);
-
-// ========== 4. 下载箭头 ==========
-// 竖杆
-const shaftW = 92;
-const shaftTop = 250;
-const shaftBot = 580;
-const cx = W / 2;
-
-fillRoundRect(
-  cx - shaftW / 2,
-  shaftTop,
-  cx + shaftW / 2,
-  shaftBot + 10,
-  12,
-  () => [255, 255, 255, 1]
-);
-
-// 箭头三角（用逐行扫描填充）
-const headTop = shaftBot - 10;
-const headBot = 700;
-const headHalf = 175;
-for (let y = headTop; y <= headBot; y++) {
-  const t = (y - headTop) / (headBot - headTop); // 0..1
-  const half = headHalf * (1 - t);
-  if (half <= 0.4) continue;
-  const lx = cx - half;
-  const rx = cx + half;
-  for (let x = Math.floor(lx); x <= Math.ceil(rx); x++) {
-    // 水平方向抗锯齿
-    const covL = Math.max(0, Math.min(1, x + 1 - lx));
-    const covR = Math.max(0, Math.min(1, rx - x));
-    const cov = Math.min(covL, covR);
-    // 底部边缘抗锯齿
-    const edgeA = Math.min(1, (headBot - y) / 1.5);
-    if (cov > 0 && edgeA > 0) blend(x, y, 255, 255, 255, cov * edgeA);
-  }
-}
-
-// ========== 5. 底部托盘 (U 形) ==========
-// 用「粗描边的下半圆弧 + 两条竖线」构造，逐像素按有符号距离填充
-const trayW = 400;        // 外宽
-const trayThick = 50;     // 线宽
-const trayTop = 706;      // 竖线顶端（贴近箭头下方）
-const trayBotY = 868;     // 圆弧最低点的外沿
-const trayL = cx - trayW / 2;
-const trayR = cx + trayW / 2;
-const arcR = trayW / 2 - trayThick / 2; // 中心线半径
-const arcCy = trayBotY - trayW / 2;     // 圆心 y（半圆）
-
-function coverTray(px, py) {
-  // 左竖线
-  if (py <= arcCy) {
-    const dl = Math.abs(px - (trayL + trayThick / 2));
-    const dr = Math.abs(px - (trayR - trayThick / 2));
-    if (py >= trayTop) {
-      if (dl <= trayThick / 2) return true;
-      if (dr <= trayThick / 2) return true;
+// ---------- 2. 极光双辉（紫 左上 / 青 右下），受 squircle 裁剪 ----------
+function glow(gx, gy, gr, cr, cg, cb, alpha, falloff) {
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const cov = squircleCov(x, y);
+      if (cov <= 0) continue;
+      const dx = (x - gx) / gr;
+      const dy = (y - gy) / gr;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      const a = Math.pow(Math.max(0, 1 - d), falloff) * alpha;
+      if (a > 0.003) blend(x, y, cr, cg, cb, cov * a);
     }
-    return false;
   }
-  // 下半圆弧：到圆心的距离落在 [arcR - thick/2, arcR + thick/2]
-  const dx = px - cx;
-  const dy = py - arcCy;
-  if (dy < 0) return false;
-  const d = Math.sqrt(dx * dx + dy * dy);
-  return Math.abs(d - arcR) <= trayThick / 2;
+}
+glow(CX - AX * 0.42, CY - AY * 0.46, AX * 0.92, 124, 92, 255, 0.40, 2.2); // 紫
+glow(CX + AX * 0.46, CY + AY * 0.50, AX * 0.90, 63, 224, 240, 0.36, 2.2); // 青
+
+// ---------- 3. 顶缘内描边高光（玻璃质感，向下衰减） ----------
+(function () {
+  const inset = 3;
+  const thick = 3.2;
+  // 循环变量必须是整数：blend 直写 acc[(y*W+x)*4]，浮点坐标的非整数索引
+  // 会静默失效，而小数部分恰好相消时又会**写错位置**——旧版的边界白色
+  // 光晕就是这里的浮点 y/x 落错格子造成的。
+  for (let y = Math.ceil(PAD - thick); y < H / 2; y++) {
+    for (let x = Math.ceil(PAD - thick); x < W - PAD + thick; x++) {
+      const sd = squircleSDF(x, y);
+      if (sd > -0.5) continue; // 高光只画在形状**内部**
+      const band = clamp01(1 - Math.abs(-sd - inset) / thick);
+      if (band <= 0.01) continue;
+      const t = clamp01((y - PAD) / (H - 2 * PAD));
+      // 水平钟形：中段亮、到两角淡出——整条环都亮会像「箍了一圈铁丝」
+      const bell = Math.pow(Math.max(0, 1 - Math.abs(x - CX) / (AX * 0.96)), 0.9);
+      const a = band * 0.18 * Math.pow(1 - t, 1.6) * bell;
+      if (a > 0.01) blend(x, y, 255, 255, 255, a);
+    }
+  }
+})();
+
+// ---------- 4. 品牌 V 形笔画（锥形描边 + 圆头 + 渐变） ----------
+const VT = 296;      // 两个上端点的 y
+const VB = 644;      // 底部顶点的 y
+const VSPAN = 206;   // 上端点距中轴的半距
+const VW_TOP = 112;  // 顶部笔画宽
+const VW_BOT = 74;   // 顶点处笔画宽（收窄 = 速度感）
+
+// 到线段的距离 + 沿程参数（用于锥形宽度与渐变着色）
+function segHit(px, py, x0, y0, x1, y1) {
+  const vx = x1 - x0;
+  const vy = y1 - y0;
+  const len2 = vx * vx + vy * vy;
+  let u = ((px - x0) * vx + (py - y0) * vy) / len2;
+  u = Math.max(0, Math.min(1, u));
+  const qx = x0 + u * vx;
+  const qy = y0 + u * vy;
+  const dx = px - qx;
+  const dy = py - qy;
+  return { d: Math.sqrt(dx * dx + dy * dy), u };
 }
 
-for (let y = trayTop - 3; y <= trayBotY + 3; y++) {
-  for (let x = trayL - 3; x <= trayR + 3; x++) {
-    // 4x4 超采样抗锯齿
-    let hits = 0;
-    for (let sy = 0; sy < 4; sy++) {
-      for (let sx = 0; sx < 4; sx++) {
-        if (coverTray(x + (sx + 0.5) / 4, y + (sy + 0.5) / 4)) hits++;
+// V 底点先铺一团青色光晕，把白色笔画从底色里「托」出来
+glow(CX, VB + 20, AX * 0.55, 63, 224, 240, 0.30, 1.9);
+
+// 两笔：左上→中底，右上→中底。3x3 超采样保边缘干净
+(function () {
+  const L0 = [CX - VSPAN, VT];
+  const L1 = [CX, VB];
+  const R0 = [CX + VSPAN, VT];
+  const R1 = [CX, VB];
+  const yMin = VT - VW_TOP;
+  const yMax = VB + VW_TOP;
+  for (let y = Math.floor(yMin); y <= Math.ceil(yMax); y++) {
+    for (let x = Math.floor(CX - VSPAN - VW_TOP); x <= Math.ceil(CX + VSPAN + VW_TOP); x++) {
+      let covSum = 0;
+      let gy = 0; // 渐变参数（沿笔画从上到下）
+      for (let sy = 0; sy < 3; sy++) {
+        for (let sx = 0; sx < 3; sx++) {
+          const px = x + (sx + 0.5) / 3;
+          const py = y + (sy + 0.5) / 3;
+          // 取两笔里更近的那条
+          const hl = segHit(px, py, L0[0], L0[1], L1[0], L1[1]);
+          const hr = segHit(px, py, R0[0], R0[1], R1[0], R1[1]);
+          const h = hl.d <= hr.d ? hl : hr;
+          const w = VW_TOP + (VW_BOT - VW_TOP) * h.u; // 锥形
+          const a = clamp01(w / 2 + 0.5 - h.d);
+          if (a > 0) {
+            covSum += a;
+            gy = Math.max(gy, h.u);
+          }
+        }
+      }
+      const cov = covSum / 9;
+      if (cov > 0) {
+        // 白 → 冰蓝，沿笔画向下过渡
+        const r = Math.round(255 + (176 - 255) * gy);
+        const g = Math.round(255 + (234 - 255) * gy);
+        const b = Math.round(255 + (255 - 255) * gy);
+        blend(x, y, r, g, b, cov);
       }
     }
-    if (hits > 0) blend(x, y, 255, 255, 255, hits / 16);
   }
-}
+})();
+
+// ---------- 5. 着陆条（青→紫渐变的圆角胶囊） ----------
+(function () {
+  const bw = 372;
+  const bh = 54;
+  const bx0 = CX - bw / 2;
+  const bx1 = CX + bw / 2;
+  const by0 = 742;
+  const by1 = by0 + bh;
+  const rad = bh / 2;
+  for (let y = by0 - 2; y <= by1 + 2; y++) {
+    for (let x = bx0 - 2; x <= bx1 + 2; x++) {
+      // 圆角矩形 SDF
+      const qx = Math.max(bx0 + rad, Math.min(x, bx1 - rad)) ;
+      const qy = Math.max(by0 + rad, Math.min(y, by1 - rad));
+      const d = Math.sqrt((x - qx) ** 2 + (y - qy) ** 2) - rad;
+      // 胶囊本身
+      const a = clamp01(0.5 - d);
+      if (a <= 0) continue;
+      const u = clamp01((x - bx0) / bw);
+      // 青 → 紫 横向渐变
+      const r = Math.round(63 + (124 - 63) * u);
+      const g = Math.round(224 + (92 - 224) * u);
+      const b = Math.round(240 + (255 - 240) * u);
+      blend(x, y, r, g, b, a * 0.96);
+      // 下缘一点同色光晕，承接 V 的「落入」感
+      const ga = Math.pow(Math.max(0, 1 - Math.abs(d) / 46), 2.2) * 0.22;
+      if (ga > 0.01) blend(x, y, r, g, b, a * ga);
+    }
+  }
+})();
 
 // ========== 编码 PNG ==========
 function crc32(data) {
@@ -224,9 +243,10 @@ for (let i = 0; i < W * H; i++) {
     pixels[i * 4 + 2] = 0;
     pixels[i * 4 + 3] = 0;
   } else {
-    pixels[i * 4] = Math.round(Math.min(255, acc[i * 4]));
-    pixels[i * 4 + 1] = Math.round(Math.min(255, acc[i * 4 + 1]));
-    pixels[i * 4 + 2] = Math.round(Math.min(255, acc[i * 4 + 2]));
+    // straight → premultiplied：颜色通道乘回 alpha
+    pixels[i * 4] = Math.round(Math.min(255, acc[i * 4] * a));
+    pixels[i * 4 + 1] = Math.round(Math.min(255, acc[i * 4 + 1] * a));
+    pixels[i * 4 + 2] = Math.round(Math.min(255, acc[i * 4 + 2] * a));
     pixels[i * 4 + 3] = Math.round(Math.min(1, a) * 255);
   }
 }
