@@ -967,19 +967,22 @@
     // 菜单项可用性：按**主目标**（右键那一行）的状态决定，因为批量操作里
     // 「打开文件/复制路径」只对已完成任务有意义，而主目标最能代表用户意图。
     const done = task.state === "done" && !!task.output_path;
+    // 实物被删的 done：打开/定位没意义（点了报错），重下反而成立；
+    // 复制路径仍有用（用户可能想看看它原来的位置）。
+    const gone = task.state === "done" && !!task.file_missing;
     const acting = ACTIVE_STATES.has(task.state);
     const paused = task.state === "paused" || task.state === "failed";
     const setEnabled = (name, on) => {
       const b = ctxMenu.querySelector(`[data-ctx="${name}"]`);
       if (b) b.disabled = !on;
     };
-    setEnabled("open", done);
-    setEnabled("reveal", done);
+    setEnabled("open", done && !gone);
+    setEnabled("reveal", done && !gone);
     setEnabled("copyPath", done);
     setEnabled("copyUrl", !!task.url);
     setEnabled("pause", acting);
     setEnabled("resume", paused);
-    setEnabled("redo", !acting && task.state !== "done");
+    setEnabled("redo", !acting && (task.state !== "done" || gone));
     // 编辑只对排队/暂停/失败开放；运行中先暂停，终态请重建
     setEnabled(
       "edit",
@@ -1275,7 +1278,16 @@
     row.appendChild(el("div", "tr-size", size ? fmtBytes(size) : "—"));
 
     const stateCell = el("div", "tr-state");
-    stateCell.appendChild(el("span", "task-state " + t.state, STATE_TEXT[t.state] || t.state));
+    // 实物被删的已完成任务：状态区别显示（徽标换文案换色），行内按钮
+    // 也从「打开」换成「重下」，右键菜单同步（见 showCtxMenu 的 gone）。
+    const gone = t.state === "done" && !!t.file_missing;
+    stateCell.appendChild(
+      el(
+        "span",
+        "task-state " + (gone ? "gone" : t.state),
+        gone ? "文件已删除" : STATE_TEXT[t.state] || t.state
+      )
+    );
     row.appendChild(stateCell);
 
     // 进度列：进度条 + 百分比同格，表格里比卡片更需要「一眼看到数字」
@@ -1332,6 +1344,20 @@
       // 后端会先清掉 .veloxgrab-part / .part 再从头入队。
       const r = el("button", "icon-btn", "重下");
       r.title = "重新下载（清除旧断点，从头开始）";
+      r.onclick = async () => {
+        try {
+          await invoke("redo_task", { id: t.id });
+          refreshTasks();
+        } catch (e) {
+          toast(String(e), true);
+        }
+      };
+      actCell.appendChild(r);
+    } else if (done && gone) {
+      // 记录还在、实物没了：给「重下」补救入口（后端对成品已删的 done
+      // 放行 redo_task）。「打开」点了只会弹「文件不存在」。
+      const r = el("button", "icon-btn", "重下");
+      r.title = "成品文件已被删除，点击重新下载";
       r.onclick = async () => {
         try {
           await invoke("redo_task", { id: t.id });
@@ -2012,7 +2038,7 @@
             report("已恢复", n, "正在下载、已结束或正在收尾");
           } else if (cmd === "redoSelected") {
             const n = await invoke("redo_tasks", { args: { ids } });
-            report("已重新下载", n, "正在下载或已完成");
+            report("已重新下载", n, "正在下载或成品还在");
           } else if (cmd === "pauseSelected") {
             const n = await invoke("pause_tasks", { args: { ids } });
             report("已暂停", n, "已结束或正在收尾");

@@ -486,6 +486,7 @@ pub async fn enqueue_download(
         eta: None,
         output_path: None,
         error: None,
+        file_missing: false,
         created_at: now_ms(),
         kind: kind.clone(),
         // 0 表示交给设置里的默认值；非 0 也夹到 64（与 direct::MAX_THREADS 一致），
@@ -865,6 +866,16 @@ pub async fn list_tasks(state: tauri::State<'_, AppState>) -> Result<Vec<Task>, 
     let guard = state.tasks.lock().await;
     let mut v: Vec<Task> = Vec::with_capacity(guard.len());
     v.extend(guard.values().cloned());
+    // 「实物还在吗」只有磁盘知道，且随时会变（用户手动删文件），所以现查
+    // 而不是存进任务表：对 done 且有 output_path 的任务一次 stat。
+    // 前端据此显示「文件已删除」、把行内「打开」换成「重下」。
+    for t in v.iter_mut() {
+        if t.state == TaskState::Done {
+            if let Some(p) = &t.output_path {
+                t.file_missing = !std::path::Path::new(p).is_file();
+            }
+        }
+    }
     // 按创建时间倒序。配合前端的增量更新，这个函数不再被进度事件高频调用。
     v.sort_by_key(|t| std::cmp::Reverse(t.created_at));
     Ok(v)
@@ -1336,6 +1347,7 @@ pub(crate) async fn create_direct_task(
         eta: None,
         output_path: None,
         error: None,
+        file_missing: false,
         created_at: now_ms(),
         kind: "direct".into(),
         threads: threads.unwrap_or(0).min(64),

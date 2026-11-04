@@ -105,6 +105,11 @@ pub struct Task {
     pub eta: Option<String>,
     pub output_path: Option<String>,
     pub error: Option<String>,
+    /// 成品文件是否已不在磁盘上。**不存表**：实物随时会被用户手动删掉，
+    /// 只有磁盘知道现状——list_tasks 返回时对 done 任务现查（一次 stat）。
+    /// 前端据此把「已完成」显示成「文件已删除」，行内「打开」换成「重下」。
+    #[serde(default)]
+    pub file_missing: bool,
     pub created_at: i64,
     /// "video" = yt-dlp 解析下载；"direct" = HTTP Range 多线程直链
     #[serde(default = "default_kind")]
@@ -1615,6 +1620,7 @@ mod tests {
             eta: None,
             output_path: None,
             error: None,
+            file_missing: false,
             created_at: crate::commands::now_ms(),
             kind: "direct".into(),
             threads: 4,

@@ -768,6 +768,9 @@ body.is-max #winMax .ic-restore { display: block; }
 .task-state.merging::before { box-shadow: 0 0 8px rgba(124, 92, 255, .8); }
 .task-state.paused { color: var(--warn); }
 .task-state.done { color: var(--ok); }
+/* 实物被删的已完成：警示橙区别于正常完成的绿，文案是「文件已删除」 */
+.task-state.gone { color: var(--warn); }
+.task-state.gone::before { box-shadow: 0 0 8px rgba(255, 176, 32, .55); }
 .task-state.failed { color: var(--err); }
 .task-state.failed::before { box-shadow: 0 0 8px rgba(255, 107, 116, .7); }
 

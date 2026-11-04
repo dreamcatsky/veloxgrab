@@ -177,6 +177,8 @@ impl HistoryEntry {
             eta: None,
             output_path: self.output_path.clone(),
             error: self.error.clone(),
+            // file_missing 不落历史：回灌后由 list_tasks 现查
+            file_missing: false,
             created_at: self.created_at,
             kind: if self.kind.is_empty() {
                 "direct".into()
@@ -550,6 +552,7 @@ mod tests {
             eta: None,
             output_path: Some("C:\\dl\\a.bin".into()),
             error: None,
+            file_missing: false,
             created_at: 1,
             kind: "direct".into(),
             threads: 4,
