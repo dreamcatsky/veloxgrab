@@ -428,7 +428,8 @@ body.is-max #winMax .ic-restore { display: block; }
 
 .tb svg { width: 17px; height: 17px; flex-shrink: 0; }
 
-/* 唯一的主操作：添加 URL。其余动作只用图标色区分，不给整排按钮上色。 */
+/* 唯一的主操作：添加 URL。其余动作一律单色（继承按钮文字色，hover 随之
+   提亮）——一排灰度比一排彩色更克制耐看，这是工具栏「高级感」的主要来源。 */
 .tb-add {
   background: var(--grad);
   color: var(--on-accent);
@@ -437,11 +438,7 @@ body.is-max #winMax .ic-restore { display: block; }
 .tb-add svg { color: var(--on-accent); }
 .tb-add:hover:not(:disabled) { color: var(--on-accent); filter: brightness(1.06); }
 
-.tb-resume svg { color: var(--accent); }
-.tb-pause svg, .tb-pause-all svg { color: var(--warn); }
-.tb-delete svg { color: var(--err); }
-.tb-open svg, .tb-folder svg { color: var(--folder); }
-.tb-options svg { color: var(--dim); }
+.tb svg { color: inherit; }
 
 .tb-sep {
   width: 1px;
