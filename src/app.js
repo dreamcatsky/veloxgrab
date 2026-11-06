@@ -982,7 +982,7 @@
     setEnabled("copyUrl", !!task.url);
     setEnabled("pause", acting);
     setEnabled("resume", paused);
-    setEnabled("redo", !acting && (task.state !== "done" || gone));
+    setEnabled("redo", !acting);
     // 编辑只对排队/暂停/失败开放；运行中先暂停，终态请重建
     setEnabled(
       "edit",
@@ -1002,6 +1002,19 @@
     ctxMenu.style.left = Math.max(pad, Math.min(x, maxX)) + "px";
     ctxMenu.style.top = Math.max(pad, Math.min(y, maxY)) + "px";
   }
+
+  // 双击行 = 打开文件（IDM 习惯）。只对已完成且有实物（未被删）的任务生效；
+  // 其余状态双击不做任何事，避免误触发。
+  $("taskList").addEventListener("dblclick", (e) => {
+    if (e.target.closest(".task-check")) return;
+    const row = e.target.closest(".task-row");
+    if (!row) return;
+    const task = taskMap.get(row.dataset.id);
+    if (!task || task.state !== "done" || !task.output_path || task.file_missing) return;
+    invoke("open_task_file", { path: task.output_path }).catch((err) =>
+      toast(`打开失败：${String(err)}`, true)
+    );
+  });
 
   // 事件委托：行是动态重建的，逐行挂 contextmenu 会随 refreshTasks 反复增删监听。
   $("taskList").addEventListener("contextmenu", (e) => {
@@ -1988,7 +2001,7 @@
             report("已恢复", n, "正在下载、已结束或正在收尾");
           } else if (cmd === "redoSelected") {
             const n = await invoke("redo_tasks", { args: { ids } });
-            report("已重新下载", n, "正在下载或成品还在");
+            report("已重新下载", n, "正在下载或正在收尾");
           } else if (cmd === "pauseSelected") {
             const n = await invoke("pause_tasks", { args: { ids } });
             report("已暂停", n, "已结束或正在收尾");

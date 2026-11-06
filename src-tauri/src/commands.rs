@@ -1042,11 +1042,10 @@ async fn redo_one(state: &AppState, id: &str) -> Result<(), String> {
         return Err("任务正在下载或排队中，请先取消再重新下载".into());
     }
     match task.state {
-        // Done 拒绝的理由已经消失一半：finish_download 现在撞名递增避让，
-        // 不再静默覆盖成品。但重下同一个成品仍然会白跑一遍网络再原地多出一份
-        // 重复文件——对用户还是意外，维持拒绝。
-        TaskState::Done => return Err("任务已完成，如需再下请先移除后新建".into()),
-        TaskState::Canceled => {
+        // Done 一律放行（IDM 语义：重新下载永远可用）。成品已被删的是补救
+        // 入口；成品还在的重下会经 finish_download 的撞名避让落到
+        // 「名字 (1).后缀」，不覆盖旧文件。两种情况都按从头下载处理。
+        TaskState::Canceled | TaskState::Done => {
             // 清掉作废断点，让本轮真正从头开始。放在锁外做（磁盘 IO 不进临界区）：
             // 此刻没有 worker 持有这个任务（上面刚验过），且泵要接手必须先在
             // 锁内看到 Queued——本函数置 Queued 在清断点之后，顺序是安全的。
@@ -1070,10 +1069,10 @@ async fn redo_one(state: &AppState, id: &str) -> Result<(), String> {
                 {
                     return Err("任务状态刚发生了变化，请重新操作".into());
                 }
-                let was_canceled = t.state == TaskState::Canceled;
+                let from_scratch = t.state == TaskState::Canceled || t.state == TaskState::Done;
                 t.state = TaskState::Queued;
                 t.error = None;
-                if was_canceled {
+                if from_scratch {
                     // 断点已清，进度必须同步归零，否则界面上还挂着旧进度。
                     t.progress = 0.0;
                     t.downloaded_bytes = 0;
