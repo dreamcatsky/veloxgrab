@@ -101,10 +101,6 @@ async function send(url) {
     if (res && res.ok === true) {
       msg("已发送给 VeloxGrab");
       setTimeout(() => window.close(), 700);
-    } else if (res && res.ok === "unknown") {
-      // 协议兜底的结果不可知（Chrome 会静默拦截部分协议唤起），按「不确定」
-      // 措辞提示，不自动关窗——用户还需要看这条信息。
-      msg("已尝试唤起 VeloxGrab；若程序没反应，请打开它后重试", true);
     } else {
       msg("VeloxGrab 没有响应，请确认它正在运行（托盘图标可见）", true);
     }

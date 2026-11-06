@@ -5,8 +5,9 @@
 // 1. **拦截网页下载**：`chrome.downloads.onCreated` 一响就取消浏览器自己的
 //    下载，转给 VeloxGrab。这是「网页点下载就调用下载软件」的实现——没有它，
 //    扩展就只是个右键菜单，用户点链接仍然走浏览器下载器。
-// 2. **可靠地把链接送出去**：优先走本地回环 HTTP 桥
-//    （`http://127.0.0.1:58943/add`），失败才退回 `veloxgrab://` 协议导航。
+// 2. **可靠地把链接送出去**：走本地回环 HTTP 桥
+//    （`http://127.0.0.1:58943/add`）。桥不通时**不做任何页面导航**——
+//    拦截到的下载原样交回浏览器，右键/弹窗路径如实提示。
 //
 // ## 为什么不再只靠 veloxgrab://
 //
@@ -17,8 +18,6 @@
 //
 // 回环 HTTP 桥由 VeloxGrab 自己监听（`src-tauri/src/bridge.rs`），扩展
 // `fetch` 一下就行，不需要固定扩展 ID、不需要注册表、不需要额外二进制。
-
-const SCHEME = "veloxgrab";
 
 /** VeloxGrab 的本地桥端口，与 `src-tauri/src/bridge.rs` 的 `PORT` 必须一致。 */
 const BRIDGE = "http://127.0.0.1:58943";
@@ -197,17 +196,9 @@ chrome.downloads.onCreated.addListener(async (item) => {
         // 仍然失败就只能靠 send() 里的剪贴板兜底了
       }
     }
-    // ok === "unknown"（协议已尝试、结果不可知）时**不能**还回浏览器下载：
-    // 协议万一真成功了就是重复下载。让用户看提示自行判断。
-
     if (cfg.notify) {
       if (ok === true) {
         notify("已转给 VeloxGrab", filename || item.url);
-      } else if (ok === "unknown") {
-        notify(
-          "已尝试唤起 VeloxGrab",
-          "Chrome 会拦掉部分协议唤起；若程序没弹出下载，请打开 VeloxGrab 重试一次"
-        );
       } else {
         notify(
           "VeloxGrab 未响应，已交回浏览器下载",
@@ -274,12 +265,10 @@ async function bridgeHeaders() {
 /**
  * 把一条下载请求交给 VeloxGrab。
  *
- * 返回值三态（不要当成布尔用）：
- * - `true`     桥确认送达，可以放心告诉用户「发出去了」；
- * - `"unknown"` 协议导航已尝试。Chrome 对扩展发起的自定义协议导航**静默拦截**
- *   （文件头注释），成功与否无从得知——调用方必须按「不确定」措辞提示，
- *   并且**不能**把浏览器下载还回去（协议万一真成功了就是重复下载）；
- * - `false`    全部路径失败，调用方自行兜底（交回浏览器 / 提示剪贴板）。
+ * 返回值：
+ * - `true`  桥确认送达，可以放心告诉用户「发出去了」；
+ * - `false` VeloxGrab 没在运行（或桥不可用）。拦截路径会把下载交回浏览器，
+ *   右键/弹窗路径如实提示——**绝不**开新标签页、不改当前页。
  *
  * 顺序很重要：**先桥后协议**。桥是同步返回成败的；协议只是兜底。
  */
@@ -324,40 +313,13 @@ async function send(target) {
     // 桥不可用 → 走协议
   }
 
-  // 2. veloxgrab:// 协议导航（兜底，结果不可知）
-  // 开后台标签页而不是劫持当前标签页：tabs.update 会把用户正在看的页面
-  // 顶掉（即使协议成功，外部协议弹窗也会打断浏览）。
-  const link = buildLink(target);
-  try {
-    await chrome.tabs.create({ url: link, active: false });
-    // 旧实现这里无条件 return true——正是文件头注释里「Chrome 静默拦截扩展
-    // 发起的自定义协议导航」的那个行为被当成了成功：通知说「已转给
-    // VeloxGrab」，实际什么都没发生。导航没有成功回调，结果只能标「不确定」。
-    return "unknown";
-  } catch {
-    // 继续落到剪贴板
-  }
-
-  return fallback(link);
-}
-
-/** 拼 `veloxgrab://add?url=...&name=...`。 */
-function buildLink(target) {
-  const parts = ["url=" + encodeURIComponent(target.url)];
-  if (target.filename) parts.push("name=" + encodeURIComponent(target.filename));
-  if (target.dir) parts.push("dir=" + encodeURIComponent(target.dir));
-  if (target.threads) parts.push("threads=" + encodeURIComponent(String(target.threads)));
-  return `${SCHEME}://add?${parts.join("&")}`;
-}
-
-/** 最后一道退路：至少让用户能把链接粘进 VeloxGrab。 */
-async function fallback(link) {
-  try {
-    await navigator.clipboard.writeText(link);
-    notify("VeloxGrab 没有响应", "下载链接已复制到剪贴板，可粘贴到 VeloxGrab 的「添加URL」");
-  } catch {
-    notify("发送失败", link);
-  }
+  // 2. 桥不通：到此为止，**不开任何标签页**。
+  //
+  // 曾经的 veloxgrab:// 协议兜底已删除：Chrome 会静默拦截扩展发起的自定义
+  // 协议导航（文件头注释），「劫持当前标签页」和「开后台标签页」两种写法
+  // 的实际产出都只是一个多余的空标签页 + 一条假动作通知，用户点一次下载
+  // 凭空多出一个标签页（实测反馈）。桥不通时调用方各有一条诚实的失败路径：
+  // 拦截下载交回浏览器继续、右键/弹窗提示启动 VeloxGrab。
   return false;
 }
 
@@ -437,11 +399,6 @@ async function handleMenuClick(info, tab) {
   }
   if (ok === true) {
     // 桥已确认，不用打扰用户
-  } else if (ok === "unknown") {
-    notify(
-      "已尝试唤起 VeloxGrab",
-      "Chrome 会拦掉部分协议唤起；若程序没弹出下载，请打开 VeloxGrab 重试一次"
-    );
   } else {
     notify("VeloxGrab 没有响应", "请确认 VeloxGrab 正在运行（托盘图标可见）");
   }
