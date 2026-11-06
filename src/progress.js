@@ -1,10 +1,5 @@
-// 独立进度窗口的前端逻辑
-//
-// 与主窗口的 app.js 完全独立：它不共享 JS 全局，只共享 Rust 侧的 task 列表和
-// 同一个 "task-progress" 事件。因此这里用最省的做法——定期拉一次 list_tasks
-// 拿到进行中的任务，再靠事件即时刷新。窗口只在用户主动打开时才存在；
-// 轮询自适应频率：有活动任务时 1s，空闲时降到 3s（旧实现无条件 1s，
-// 与这里的注释承诺不符，已改为言行一致）。
+// 下载监视框：小方窗，速度 / 总进度每 2.5 秒轮流显示。
+// 与主窗口只共享 Rust 侧任务表与 task-progress 事件；聚合所有活跃任务。
 (function () {
   "use strict";
 
@@ -12,170 +7,128 @@
   const listen = window.__TAURI__?.event?.listen;
 
   if (!invoke) {
-    document.body.innerHTML =
-      '<div style="padding:24px;font-family:sans-serif;color:var(--err)">' +
-      "无法连接 Tauri 运行时。</div>";
+    document.body.textContent = "无法连接 Tauri 运行时。";
     return;
   }
 
-  // 主题跟着主窗口走：用户在主窗口改成浅色后，进度窗口下次打开就是浅色的。
-  // 首帧的缓存值由 theme.js 上好色，这里拿到 Rust 侧真值后纠正一次。
-  // 用 .then 而不是 await：外层是普通 IIFE，不是 async 函数。
+  // 主题跟随主窗口
   invoke("get_settings")
-    .then((s) => {
-      if (window.VeloxGrabTheme) window.VeloxGrabTheme.apply(s.theme || "system");
-    })
-    .catch(() => {
-      // 拿不到就保持 theme.js 的缓存值，不值得为配色让窗口打不开
-    });
+    .then((s) => window.VeloxGrabTheme?.apply(s.theme || "system"))
+    .catch(() => {});
 
   const $ = (id) => document.getElementById(id);
-  const el = (tag, cls, text) => {
-    const n = document.createElement(tag);
-    if (cls) n.className = cls;
-    if (text !== undefined) n.textContent = text;
-    return n;
-  };
+  const ACTIVE = new Set(["downloading", "merging"]);
 
   function fmtBytes(b) {
-    if (!b || b <= 0) return "";
-    const u = ["B", "KB", "MB", "GB"];
-    let i = 0,
-      v = b;
-    while (v >= 1024 && i < u.length - 1) {
-      v /= 1024;
-      i++;
-    }
+    if (!b || b <= 0) return "0 B";
+    const u = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0, v = b;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
     return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + u[i];
   }
 
-  const STATE_TEXT = {
-    queued: "排队中",
-    downloading: "下载中",
-    paused: "已暂停",
-    merging: "合并中",
-  };
-
-  // 与主窗口一致：这些都算「还在进行中」，要出现在进度窗口里
-  const ACTIVE = new Set(["queued", "downloading", "paused", "merging"]);
-
   let tasks = [];
+  let mode = 0;              // 0 = 速度, 1 = 进度
+  let aggSpeed = 0;          // 字节/秒（自采样，带平滑）
+  let lastBytes = -1;
+  let lastT = 0;
+
+  // 聚合所有活跃任务
+  function agg() {
+    const act = tasks.filter((t) => ACTIVE.has(t.state));
+    let done = 0, total = 0, known = true, pctSum = 0;
+    for (const t of act) {
+      done += t.downloaded_bytes || 0;
+      if (t.total_bytes) total += t.total_bytes;
+      else known = false;
+      pctSum += t.state === "merging" ? 100 : t.progress || 0;
+    }
+    const pct = known && total > 0 ? (done / total) * 100 : pctSum / (act.length || 1);
+    return { act, done, total, known, pct: Math.max(0, Math.min(100, pct)) };
+  }
+
+  // 自采样速度：对 downloading 任务的已下字节差分。不解析速度字符串——
+  // 各任务速度单位不一，求和容易错；字节差分对单任务/多任务都对。
+  function sampleSpeed() {
+    const bytes = tasks
+      .filter((t) => t.state === "downloading")
+      .reduce((a, t) => a + (t.downloaded_bytes || 0), 0);
+    const now = Date.now();
+    if (lastBytes >= 0 && now > lastT) {
+      const inst = Math.max(0, (bytes - lastBytes) / ((now - lastT) / 1000));
+      aggSpeed = aggSpeed > 0 ? aggSpeed * 0.55 + inst * 0.45 : inst;
+    }
+    lastBytes = bytes;
+    lastT = now;
+  }
 
   function render() {
-    const list = $("pwList");
-    const active = tasks.filter((t) => ACTIVE.has(t.state));
+    const { act, done, total, known, pct } = agg();
+    const queued = tasks.filter((t) => t.state === "queued").length;
 
-    list.innerHTML = "";
-    if (!active.length) {
-      list.appendChild(el("div", "pw-empty", "当前没有正在下载的任务"));
-    } else {
-      for (const t of active) {
-        const row = el("div", "pw-row");
-
-        const top = el("div", "pw-row-top");
-        top.appendChild(el("span", "pw-name", t.title || t.url || "未命名"));
-        top.appendChild(el("span", "pw-state pw-" + t.state, STATE_TEXT[t.state] || t.state));
-        row.appendChild(top);
-
-        const bar = el("div", "bar");
-        const fill = el("div", "bar-fill");
-        const pct = t.state === "queued" ? 0 : Math.max(0, Math.min(100, t.progress || 0));
-        fill.style.width = pct.toFixed(1) + "%";
-        if (t.state === "paused") fill.classList.add("paused");
-        bar.appendChild(fill);
-        row.appendChild(bar);
-
-        const bits = [];
-        if (t.state === "queued") {
-          bits.push("等待空闲槽位");
-        } else {
-          if (pct) bits.push(pct.toFixed(1) + "%");
-          if (t.downloaded_bytes) {
-            bits.push(
-              t.total_bytes
-                ? fmtBytes(t.downloaded_bytes) + " / " + fmtBytes(t.total_bytes)
-                : fmtBytes(t.downloaded_bytes)
-            );
-          }
-          // speed / eta 在 Rust 侧已经是格式化好的字符串（"1.2 MiB/s"、"00:42"），
-          // 这里不能再套一遍 fmtBytes，否则会输出 "1.2 MiB/s/s"。
-          // 只在真正跑着的时候显示：暂停后速度字段会停在「0 B/s」这个残值上，
-          // 摆一行「已暂停 · 0 B/s」比不写更让人困惑。
-          if (t.state === "downloading") {
-            if (t.speed) bits.push(t.speed);
-            if (t.eta) bits.push("剩余 " + t.eta);
-          }
-        }
-        row.appendChild(el("div", "pw-detail", bits.join("  ·  ")));
-
-        list.appendChild(row);
-      }
+    if (!act.length) {
+      $("mName").textContent = queued > 0 ? `${queued} 个任务排队中` : "待机";
+      $("mValue").textContent = "—";
+      $("mSub").textContent = "";
+      $("mFill").style.width = "0%";
+      return;
     }
 
-    const running = active.filter((t) => t.state === "downloading").length;
-    const paused = active.filter((t) => t.state === "paused").length;
-    const queued = active.filter((t) => t.state === "queued").length;
-    const parts = [];
-    if (running) parts.push(running + " 个下载中");
-    if (queued) parts.push(queued + " 个排队");
-    if (paused) parts.push(paused + " 个已暂停");
-    $("pwSummary").textContent = parts.length ? parts.join("，") : "暂无进行中的任务";
+    const merging = act.some((t) => t.state === "merging");
+    const name =
+      act.length === 1
+        ? act[0].title || act[0].url || "下载中"
+        : `${act.length} 个下载中`;
+    $("mName").textContent = name + (queued > 0 ? ` · ${queued} 排队` : "");
+
+    if (merging && mode === 0) {
+      // 合并阶段没有速度可言，显示固定文案避免 0 B/s 的困惑
+      $("mValue").textContent = "合并中…";
+      $("mSub").textContent = "音视频正在合成";
+    } else if (mode === 0) {
+      $("mValue").textContent = fmtBytes(aggSpeed) + "/s";
+      $("mSub").textContent = "下载速度";
+    } else {
+      $("mValue").textContent = pct.toFixed(1) + "%";
+      $("mSub").textContent = known ? `${fmtBytes(done)} / ${fmtBytes(total)}` : "";
+    }
+    $("mFill").style.width = pct.toFixed(1) + "%";
   }
 
   async function refresh() {
     try {
       const list = await invoke("list_tasks");
       tasks = list || [];
+      sampleSpeed();
       render();
-    } catch (e) {
-      // 窗口关闭过程中调用会失败，静默即可
+    } catch {
+      // 窗口关闭过程中会失败，静默
     }
   }
 
   $("pwClose").addEventListener("click", async () => {
     try {
-      const win = window.__TAURI__.window.getCurrentWindow();
-      await win.close();
-    } catch (e) {
-      // 关不掉也不能崩
-    }
+      await window.__TAURI__.window.getCurrentWindow().close();
+    } catch {}
   });
 
   if (listen) {
     listen("task-progress", (evt) => {
       const p = evt.payload;
       const i = tasks.findIndex((t) => t.id === p.id);
-      if (i < 0) {
-        // 本地还没有这一行：补一次全量同步。事件最密 10Hz/任务，窗口刚
-        // 打开、tasks 还是空数组时会被连发 10 次/秒 IPC——套 250ms 节流。
-        const now = Date.now();
-        if (now - lastEventRefresh >= 250) {
-          lastEventRefresh = now;
-          refresh();
-        }
-        return;
-      }
-      // 与主窗口同样的合并规则：null 表示「本轮没有这一项」，不能覆盖
+      if (i < 0) { refresh(); return; }
       const merged = { ...tasks[i] };
       for (const [k, v] of Object.entries(p)) {
         if (v !== null && v !== undefined) merged[k] = v;
       }
       tasks[i] = merged;
+      sampleSpeed();
       render();
     });
   }
 
-  let lastEventRefresh = 0;
-
   refresh();
-  // 轮询兜底状态跃迁（任务刚入队/结束的瞬间可能没有事件）。自适应频率：
-  // 有活动任务 1s，空闲 3s——窗口常驻但空闲时不必每秒白跑一趟 IPC。
-  function schedulePoll() {
-    const hasActive = tasks.some((t) => ACTIVE.has(t.state));
-    setTimeout(async () => {
-      await refresh();
-      schedulePoll();
-    }, hasActive ? 1000 : 3000);
-  }
-  schedulePoll();
+  // 采样/重绘 500ms；视角轮流 2.5s
+  setInterval(() => { sampleSpeed(); render(); }, 500);
+  setInterval(() => { mode = (mode + 1) % 2; render(); }, 2500);
 })();

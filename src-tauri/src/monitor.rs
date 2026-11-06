@@ -61,10 +61,12 @@ pub async fn ensure(app: &tauri::AppHandle, focus: bool) -> Result<(), String> {
 
     let win = WebviewWindowBuilder::new(app, "progress", WebviewUrl::App("progress.html".into()))
         .title("VeloxGrab 下载监视")
-        .inner_size(420.0, 320.0)
-        .min_inner_size(360.0, 240.0)
-        .resizable(true)
+        .inner_size(236.0, 128.0)
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
         .always_on_top(true)
+        .skip_taskbar(true)
         .build()
         .map_err(|e| format!("打开监视窗口失败: {e}"))?;
     // 用户手动关闭 = 本批次不再自动浮出（自动隐藏走 hide()，不触发这里）。
