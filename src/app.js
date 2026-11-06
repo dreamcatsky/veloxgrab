@@ -1930,7 +1930,20 @@
           toast("选中的任务还没有可打开的文件", true);
           break;
         }
-        for (const t of targets) revealItem(t.output_path);
+        // 「打开」= 调系统关联程序：exe 直接运行、zip 交给解压软件、视频交给
+        // 播放器。之前误用了 reveal（只定位到文件夹），用户点「打开」却什么
+        // 都不发生——定位该交给「打开文件夹」按钮。逐个容错：一个打不开
+        // （被占用/被删）不应中断其余文件。
+        let opened = 0;
+        for (const t of targets) {
+          try {
+            await invoke("open_task_file", { path: t.output_path });
+            opened++;
+          } catch (e) {
+            toast(`打开「${t.title || t.output_path}」失败：${String(e)}`, true);
+          }
+        }
+        if (opened) toast(`已打开 ${opened} 个文件`);
         break;
       }
 
