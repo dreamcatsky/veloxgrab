@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod clipboard;
+pub mod monitor;
 pub mod commands;
 pub mod decode;
 pub mod deeplink;
@@ -103,6 +104,7 @@ pub(crate) fn dispatch_external_link(app: &tauri::AppHandle, link: String) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {

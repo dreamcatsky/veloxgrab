@@ -846,7 +846,7 @@ pub fn pump_queue(
                         .map(|t| t.state == TaskState::Done)
                         .unwrap_or(false)
                 };
-                crate::notify::after_worker(&app_c, &ctx_c.tasks, done).await;
+                crate::notify::after_worker(&app_c, &ctx_c.tasks, done, &task_c.title).await;
 
                 // 关键：真正把后续排队任务泵起来。
                 // 少了这一步，超过并发数的任务会永远停在「排队中」。
@@ -856,7 +856,13 @@ pub fn pump_queue(
                 // 排队任务占走，「没有活跃任务」会被误判成「全下完了」。
                 crate::plan::check_and_fire(&app_c, &ctx_c.tasks, &ctx_c.queue, &ctx_c.running)
                     .await;
+
+                // 监视框跟随活跃下载：worker 收尾时同步（全部结束 → 自动隐藏）。
+                crate::monitor::sync(&app_c, &ctx_c.tasks).await;
             });
+
+            // 监视框跟随活跃下载：泵刚启动了新任务时同步（自动浮出，不抢焦点）。
+            crate::monitor::sync(&app, &ctx.tasks).await;
         }
     })
 }
@@ -2368,25 +2374,7 @@ pub async fn app_version(app: tauri::AppHandle) -> Result<String, String> {
 /// 提到前台——重复创建会让同一份下载显示成两个窗口，且事件监听翻倍。
 #[tauri::command]
 pub async fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
-
-    if let Some(win) = app.get_webview_window("progress") {
-        let _ = win.show();
-        let _ = win.unminimize();
-        let _ = win.set_focus();
-        return Ok(());
-    }
-
-    WebviewWindowBuilder::new(&app, "progress", WebviewUrl::App("progress.html".into()))
-        .title("VeloxGrab 进度")
-        .inner_size(560.0, 420.0)
-        .min_inner_size(420.0, 260.0)
-        .resizable(true)
-        .always_on_top(false)
-        .build()
-        .map_err(|e| format!("打开进度窗口失败: {e}"))?;
-
-    Ok(())
+    crate::monitor::ensure(&app, true).await
 }
 
 #[cfg(test)]
