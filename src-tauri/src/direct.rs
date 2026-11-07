@@ -2098,6 +2098,33 @@ mod tests {
         }
     }
 
+    /// 回归（P3-2）：PartMeta 临时文件名用 with_extension 追加 .tmp 时，只替换
+    /// 最后一段扩展名——任务 id 标记（`.t1_0`）必须保留在名字里。若将来有人把
+    /// 实现换成字符串拼接/整名替换，丢掉 id 标记会让 cleanup_artifacts 按
+    /// marker 匹配不到自己的断点临时文件。
+    #[test]
+    fn part_meta_tmp_keeps_task_tag() {
+        let target = Path::new("movie.mp4.veloxgrab-downloading.t1_0.veloxgrab-part");
+        let tmp = target.with_extension("veloxgrab-part.tmp");
+        let name = tmp.file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            name, "movie.mp4.veloxgrab-downloading.t1_0.veloxgrab-part.tmp",
+            "任务 id 标记不得被 with_extension 抹掉"
+        );
+        // 旧命名（无 id）同样只追加 .tmp
+        let legacy = Path::new("movie.mp4.veloxgrab-downloading.veloxgrab-part")
+            .with_extension("veloxgrab-part.tmp");
+        assert_eq!(
+            legacy.file_name().unwrap().to_string_lossy(),
+            "movie.mp4.veloxgrab-downloading.veloxgrab-part.tmp"
+        );
+        // 两种形态都能被 is_temp_artifact 认出（启动清理依赖）
+        assert!(is_temp_artifact(&name));
+        assert!(is_temp_artifact(
+            legacy.file_name().unwrap().to_string_lossy().as_ref()
+        ));
+    }
+
     /// 测试便捷封装：服务器锚点两侧都缺席（旧版本行为）的判定路径。
     fn ric(m: &PartMeta, url: &str, total: u64, ranges: &[(u64, u64)], file_len: u64) -> bool {
         resume_is_consistent(m, url, total, ranges, file_len, None, None)

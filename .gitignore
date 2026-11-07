@@ -28,4 +28,5 @@ npm-debug.log*
 CODE_REVIEW*.md
 G*.png
 .e2e-server.js
-exe-icon.png\ninstalled-exe-icon.png
+exe-icon.png
+installed-exe-icon.png

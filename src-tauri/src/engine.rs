@@ -280,6 +280,29 @@ fn stop_snapshot(t: &Task, state: TaskState) -> (f64, u64, Option<u64>) {
     }
 }
 
+/// 锁内把任务落成停止态：写状态/错误/历史，并按状态语义同步瞬时字段。
+///
+/// 取消时必须把 progress/downloaded_bytes/total_bytes/speed/eta 一起清掉——
+/// 只清事件不清表的话，下一次前端全量刷新会把这些残值画回界面：事件里
+/// 「已取消、进度 0」与快照里「已取消、进度 42%」互相矛盾（P3-1）。
+/// 暂停保留全部字段：断点还在盘上，这些值就是「下到哪」的事实。
+/// 返回值与 stop_snapshot 相同，供事件载荷使用；字段清理只发生在表内。
+fn apply_stopped_state(t: &mut Task, token: &CancelToken) -> (TaskState, String, (f64, u64, Option<u64>)) {
+    let (state, msg) = stopped_state(token);
+    t.state = state;
+    t.error = Some(msg.clone());
+    if state == TaskState::Canceled {
+        t.progress = 0.0;
+        t.downloaded_bytes = 0;
+        t.total_bytes = None;
+        t.speed = None;
+        t.eta = None;
+    }
+    let snap = stop_snapshot(t, state);
+    crate::history::upsert_entry(t);
+    (state, msg, snap)
+}
+
 /// 解析 yt-dlp 的进度行。
 /// 我们让 yt-dlp 使用 `--newline --progress` 使每行都是一个进度快照。
 fn parse_progress_line(line: &str) -> Option<ProgressLine> {
@@ -860,19 +883,15 @@ async fn run_download_inner(
         // 系统复用），立刻失效化——余下的 kill 路径按 pid 杀，复用号会误杀
         // 无关进程树。见 CancelToken::clear_pid。
         token.clear_pid();
-        let (state, msg) = stopped_state(&token);
-        let (prog, bytes, total) = {
+        let (state, msg, (prog, bytes, total)) = {
             let mut guard = tasks.lock().await;
             match guard.get_mut(&task.id) {
                 Some(t) => {
-                    t.state = state;
-                    t.error = Some(msg.clone());
                     // 与 wait 后的取消分支同一纪律：停止也要落历史，否则重启后
                     // 任务以「入队时的旧状态」复活，与用户「已取消」的认知冲突。
-                    crate::history::upsert_entry(t);
-                    stop_snapshot(t, state)
+                    apply_stopped_state(t, &token)
                 }
-                None => (0.0, 0, None),
+                None => (stopped_state(&token).0, stopped_state(&token).1, (0.0, 0, None)),
             }
         };
         let _ = app.emit(
@@ -1065,19 +1084,15 @@ async fn run_download_inner(
 
     // 被取消 / 被暂停
     if token.is_canceled() {
-        let (state, msg) = stopped_state(&token);
-        let (prog, bytes, total) = {
+        let (state, msg, (prog, bytes, total)) = {
             let mut guard = tasks.lock().await;
             match guard.get_mut(&task.id) {
                 Some(t) => {
-                    t.state = state;
-                    t.error = Some(msg.clone());
                     // 暂停也要落历史：历史是任务表唯一的持久化层，
                     // 不写的话用户暂停后退出软件，任务连同「继续」入口一起消失。
-                    crate::history::upsert_entry(t);
-                    stop_snapshot(t, state)
+                    apply_stopped_state(t, &token)
                 }
-                None => (0.0, 0, None),
+                None => (stopped_state(&token).0, stopped_state(&token).1, (0.0, 0, None)),
             }
         };
         let _ = app.emit(
@@ -1129,11 +1144,7 @@ async fn run_download_inner(
             let mut guard = tasks.lock().await;
             match guard.get_mut(&task.id) {
                 Some(t) if token.is_canceled() => {
-                    let (state, msg) = stopped_state(&token);
-                    t.state = state;
-                    t.error = Some(msg.clone());
-                    crate::history::upsert_entry(t);
-                    let snap = stop_snapshot(t, state);
+                    let (state, msg, snap) = apply_stopped_state(t, &token);
                     (state, Some(msg), snap)
                 }
                 Some(t) => {
@@ -1197,12 +1208,12 @@ async fn run_download_inner(
         let (state, ev_msg) = {
             let mut guard = tasks.lock().await;
             if token.is_canceled() {
-                let (state, smsg) = stopped_state(&token);
-                if let Some(t) = guard.get_mut(&task.id) {
-                    t.state = state;
-                    t.error = Some(smsg.clone());
-                    crate::history::upsert_entry(t);
-                }
+                let (state, smsg, _snap) = {
+                    match guard.get_mut(&task.id) {
+                        Some(t) => apply_stopped_state(t, &token),
+                        None => (stopped_state(&token).0, stopped_state(&token).1, (0.0, 0, None)),
+                    }
+                };
                 (state, smsg)
             } else {
                 if let Some(t) = guard.get_mut(&task.id) {
@@ -1253,17 +1264,11 @@ pub async fn run_direct_download(
     // attach 之前就被取消的话，别再去发探测请求了。
     // attach_flag 会把已有取消状态同步进来，这里只是省掉一次无谓的网络往返。
     if cancel_flag.load(Ordering::SeqCst) {
-        let (state, msg) = stopped_state(&token);
-        let (prog, bytes, total) = {
+        let (state, msg, (prog, bytes, total)) = {
             let mut guard = tasks.lock().await;
             match guard.get_mut(&task.id) {
-                Some(t) => {
-                    t.state = state;
-                    t.error = Some(msg.clone());
-                    crate::history::upsert_entry(t);
-                    stop_snapshot(t, state)
-                }
-                None => (0.0, 0, None),
+                Some(t) => apply_stopped_state(t, &token),
+                None => (stopped_state(&token).0, stopped_state(&token).1, (0.0, 0, None)),
             }
         };
         let _ = app.emit(
@@ -1387,11 +1392,7 @@ pub async fn run_direct_download(
                 let mut guard = tasks.lock().await;
                 match guard.get_mut(&task.id) {
                     Some(t) if token.is_canceled() => {
-                        let (state, msg) = stopped_state(&token);
-                        t.state = state;
-                        t.error = Some(msg.clone());
-                        crate::history::upsert_entry(t);
-                        let snap = stop_snapshot(t, state);
+                        let (state, msg, snap) = apply_stopped_state(t, &token);
                         (state, Some(msg), snap)
                     }
                     Some(t) => {
@@ -1447,16 +1448,18 @@ pub async fn run_direct_download(
                 let mut guard = tasks.lock().await;
                 match guard.get_mut(&task.id) {
                     Some(t) => {
-                        let (state, msg) = if token.is_canceled() || e.contains("已取消") {
-                            stopped_state(&token)
+                        if token.is_canceled() || e.contains("已取消") {
+                            // 暂停/取消压着失败到达：落停止态并按语义清瞬时字段
+                            apply_stopped_state(t, &token)
                         } else {
-                            (TaskState::Failed, e.clone())
-                        };
-                        t.state = state;
-                        t.error = Some(msg.clone());
-                        crate::history::upsert_entry(t);
-                        let snap = stop_snapshot(t, state);
-                        (state, msg, snap)
+                            t.state = TaskState::Failed;
+                            t.error = Some(e.clone());
+                            t.speed = None;
+                            t.eta = None;
+                            crate::history::upsert_entry(t);
+                            let snap = stop_snapshot(t, t.state);
+                            (TaskState::Failed, e.clone(), snap)
+                        }
                     }
                     None => (TaskState::Failed, e.clone(), (0.0, 0, None)),
                 }

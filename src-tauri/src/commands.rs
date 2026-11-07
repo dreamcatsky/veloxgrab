@@ -916,6 +916,13 @@ async fn cancel_one(state: &AppState, id: &str) {
             if let Some(t) = guard.get_mut(id) {
                 t.state = TaskState::Canceled;
                 t.error = Some("已取消".into());
+                // 与 engine 的停止分支同一语义：取消清瞬时字段（P3-1），
+                // 否则前端全量刷新把旧进度画回去，与事件里的「进度 0」矛盾
+                t.progress = 0.0;
+                t.downloaded_bytes = 0;
+                t.total_bytes = None;
+                t.speed = None;
+                t.eta = None;
                 // 入队即落盘的取消态也要记进历史
                 crate::history::upsert_entry(t);
             }
@@ -938,6 +945,11 @@ async fn cancel_one(state: &AppState, id: &str) {
                 if !t.state.is_terminal() {
                     t.state = TaskState::Canceled;
                     t.error = Some("已取消".into());
+                    t.progress = 0.0;
+                    t.downloaded_bytes = 0;
+                    t.total_bytes = None;
+                    t.speed = None;
+                    t.eta = None;
                     crate::history::upsert_entry(t);
                 }
             }
@@ -947,6 +959,11 @@ async fn cancel_one(state: &AppState, id: &str) {
                 if !t.state.is_terminal() {
                     t.state = TaskState::Canceled;
                     t.error = Some("已取消".into());
+                    t.progress = 0.0;
+                    t.downloaded_bytes = 0;
+                    t.total_bytes = None;
+                    t.speed = None;
+                    t.eta = None;
                 }
                 crate::history::upsert_entry(t);
             }

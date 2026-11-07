@@ -283,8 +283,6 @@
     mergeMp4: "Always merge output to MP4",
     autostart: "Start with Windows",
     autostartHint: "(writes HKCU Run key on save)",
-    telemetry: "Anonymous usage stats",
-    telemetryHint: "(no reporting exists yet; checkbox is a placeholder)",
     clipboardWatch: "Watch clipboard for download links",
     clipboardWatchHint: "(shows a hint in the window; never downloads automatically)",
     notifyComplete: "Notify when a download finishes",
@@ -1619,8 +1617,7 @@
     $("setAutoProgress").checked = s.auto_progress_popup ?? true;
     $("setMergeMp4").checked = !!s.merge_to_mp4;
     $("setAutostart").checked = !!s.autostart;
-    $("setTelemetry").checked = !!s.telemetry;
-    $("setClipboardWatch").checked = s.clipboard_watch ?? true;
+    $("setClipboardWatch").checked = s.clipboard_watch ?? false;
     $("setNotifyComplete").checked = s.notify_on_complete ?? true;
     $("setCloseMode").value = s.close_mode || "background";
     $("setBrowser").value = s.cookies_from_browser || "none";
@@ -1672,7 +1669,6 @@
       header_presets: collectHeaderPresets(),
       auto_progress_popup: $("setAutoProgress").checked,
       autostart: $("setAutostart").checked,
-      telemetry: $("setTelemetry").checked,
       clipboard_watch: $("setClipboardWatch").checked,
       notify_on_complete: $("setNotifyComplete").checked,
       close_mode: $("setCloseMode").value,

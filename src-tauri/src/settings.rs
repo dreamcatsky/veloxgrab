@@ -130,12 +130,15 @@ pub struct Settings {
     pub auto_progress_popup: bool,
     /// 开机自启（后台待命）
     pub autostart: bool,
-    /// 匿名使用统计
-    pub telemetry: bool,
     /// 后台监听剪贴板：复制到 http(s) 链接时在窗口内提示。
     ///
     /// 只提示、不自动入队：剪贴板是任意程序都能写的地方，自动下载等于把
     /// 「往剪贴板塞一条链接」变成「让 VeloxGrab 静默下载任意文件」的原语。
+    ///
+    /// 默认关闭（P3-7）：功能本身无害，但「每 800ms 读一次全局剪贴板」对
+    /// 隐私敏感用户观感不佳，且开关首次出现在升级用户的 settings.json 里时
+    /// serde(default) 会给 false——出厂默认与升级路径保持一致，不搞
+    /// 「新装机开、老用户关」的双标行为。
     pub clipboard_watch: bool,
     /// 任务完成时提醒（闪烁任务栏 + 更新托盘提示）
     pub notify_on_complete: bool,
@@ -190,8 +193,7 @@ impl Default for Settings {
             rate_limit_kb: 0,
             auto_progress_popup: true,
             autostart: false,
-            telemetry: false,
-            clipboard_watch: true,
+            clipboard_watch: false,
             notify_on_complete: true,
             close_mode: "background".into(),
             proxy_enabled: false,
