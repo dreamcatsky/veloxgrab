@@ -224,9 +224,18 @@ fn redirect_is_allowed(from: &str, to: &str) -> Result<(), String> {
 static RATE_WINDOW: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
 const RATE_WINDOW_MS: u64 = 100;
 
+/// 限速等待的单片睡眠上限。低限速 + 大批次时总等待可达几十秒（限速 8 KB/s
+/// 攒满 256 KiB 要跨 300+ 个窗口），旧实现按「窗口数 × 100ms」一次睡完，
+/// 期间不查取消标志——点暂停/取消要干等几十秒，界面停在「下载中」。
+/// 切成小片睡、片间复查，取消响应延迟的上限就是这一片。
+const RATE_SLEEP_SLICE: Duration = Duration::from_millis(100);
+
 /// 请求把 `need` 字节记入限速窗口；超预算时异步等待。rate_kb = 0 表示不限速。
-async fn rate_wait(rate_kb: u64, need: u64) {
-    if rate_kb == 0 || need == 0 {
+///
+/// `cancel` 已置位时立即返回：调用方随后因取消退出，这批已收到的字节照常落盘，
+/// 与「取消时写完缓冲再退出」的既有语义一致。
+async fn rate_wait(rate_kb: u64, need: u64, cancel: &AtomicBool) {
+    if rate_kb == 0 || need == 0 || cancel.load(Ordering::SeqCst) {
         return;
     }
     let budget = rate_kb
@@ -238,7 +247,7 @@ async fn rate_wait(rate_kb: u64, need: u64) {
     // 按需要几个窗口来睡，而不是死循环等一个永远装不下的窗口。
     let windows_needed = need.div_ceil(budget);
     loop {
-        let wait = {
+        let mut wait = {
             let mut g = match RATE_WINDOW.lock() {
                 Ok(g) => g,
                 Err(err) => err.into_inner(),
@@ -265,7 +274,18 @@ async fn rate_wait(rate_kb: u64, need: u64) {
             remain.max(Duration::from_millis(RATE_WINDOW_MS * (windows_needed - 1)))
         };
         // 睡在锁外：抱着全局锁睡觉会把所有并发分块一起卡死。
-        tokio::time::sleep(wait).await;
+        // 长等待切成小片，片间复查取消标志——低限速下点暂停不必等整段睡完。
+        loop {
+            tokio::time::sleep(wait.min(RATE_SLEEP_SLICE)).await;
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            let slept = wait.min(RATE_SLEEP_SLICE);
+            if slept >= wait {
+                break;
+            }
+            wait -= slept;
+        }
     }
 }
 
@@ -842,7 +862,7 @@ async fn download_segment(
             // 限速按「已下载的字节」计：数据已经收进内存，先过闸再落盘。
             // 放在 write 前而不是 stream 里，是为了只在每 256 KiB 抢一次全局锁，
             // 而不是每个 8 KiB 流块抢一次。
-            rate_wait(net.rate_kb, buf.len() as u64).await;
+            rate_wait(net.rate_kb, buf.len() as u64, &cancel).await;
             file.write_all(&buf)
                 .await
                 .map_err(|e| format!("写入失败: {e}"))?;
@@ -858,7 +878,7 @@ async fn download_segment(
     // 收尾：缓冲区里剩下的也写掉（取消时同样要写，这些字节已经收下了，
     // 不写就等于白下载，而且 written 与磁盘内容会不一致）
     if !buf.is_empty() {
-        rate_wait(net.rate_kb, buf.len() as u64).await;
+        rate_wait(net.rate_kb, buf.len() as u64, &cancel).await;
         file.write_all(&buf)
             .await
             .map_err(|e| format!("写入失败: {e}"))?;
@@ -1623,7 +1643,7 @@ async fn download_single(
         // 与分块路径一致：攒够 256 KiB 或距上次落盘超过 200ms 再写，
         // 否则 8 KiB 一块就是每秒上千次 write_all + spawn_blocking 往返。
         if buf.len() >= WRITE_BATCH || last_flush.elapsed() >= FLUSH_INTERVAL {
-            rate_wait(rate_kb, buf.len() as u64).await;
+            rate_wait(rate_kb, buf.len() as u64, &cancel).await;
             file.write_all(&buf)
                 .await
                 .map_err(|e| format!("写入失败: {e}"))?;
@@ -1654,7 +1674,7 @@ async fn download_single(
     }
 
     if !buf.is_empty() {
-        rate_wait(rate_kb, buf.len() as u64).await;
+        rate_wait(rate_kb, buf.len() as u64, &cancel).await;
         file.write_all(&buf)
             .await
             .map_err(|e| format!("写入失败: {e}"))?;
@@ -1728,6 +1748,53 @@ pub fn looks_like_media_site(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 取消已置位时 rate_wait 必须立即返回：低限速下点暂停/取消，
+    /// 响应延迟不能被限速睡眠拖住（P2-1）。
+    #[test]
+    fn rate_wait_returns_immediately_when_canceled() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let t = std::time::Instant::now();
+        // 总等待需求远超一个窗口（限速 8 KB/s、一次 1 MiB ≈ 128 个窗口）；
+        // 旧实现会睡十几秒，取消后必须秒回。
+        tokio_test_block_on(async {
+            rate_wait(8, 1024 * 1024, &cancel).await;
+        });
+        assert!(t.elapsed() < Duration::from_secs(1), "取消后不得进入限速等待");
+    }
+
+    /// 未取消时超窗口批次的长等待被切成 ≤100ms 的片：总时长仍接近原需求
+    /// （限速语义不丢），但任何时刻的单片睡眠都有上限。
+    /// 第一次调用只初始化限速窗口并放行（首批免费），所以要调两次：
+    /// 第二批才会真正进入等待。
+    #[test]
+    fn rate_wait_slices_long_sleeps() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        // 2 MB/s 的窗口预算约 200 KiB，1 MiB 批需要约 5 个窗口 ≈ 400ms 等待
+        const RATE: u64 = 2048;
+        const BATCH: u64 = 1024 * 1024;
+        tokio_test_block_on(async {
+            rate_wait(RATE, BATCH, &cancel).await; // 种窗口，直接放行
+        });
+        let t = std::time::Instant::now();
+        tokio_test_block_on(async {
+            rate_wait(RATE, BATCH, &cancel).await;
+        });
+        let elapsed = t.elapsed();
+        // 旧实现在这里一次性睡满估算值；切片后总时长不变，只是可被取消打断。
+        assert!(elapsed >= Duration::from_millis(300), "未取消时限速等待必须真实发生: {elapsed:?}");
+        assert!(elapsed <= Duration::from_secs(3), "估算的等待不该显著超出: {elapsed:?}");
+    }
+
+    /// 测试用单线程 runtime 跑 async：不引 dev-dependency（#[tokio::test] 需要
+    /// rt 特性，tokio 依赖里已有，但 direct 的测试只需要最小 block_on）。
+    fn tokio_test_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
 
     /// 分段必须无缝无重叠地覆盖整个文件，否则完成度校验和写入偏移都会错
     #[test]
