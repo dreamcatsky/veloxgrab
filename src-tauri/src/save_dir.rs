@@ -512,15 +512,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // 根用普通拼写（模拟 settings.json 里存的下载目录），
-        // canonicalize 产物是 verbatim（模拟经 finalize 持久化的 save_dir）。
-        let root_plain = dir.clone();
+        // 根用「canonicalize 后剥 verbatim」的普通拼写，而不是裸的 temp_dir()：
+        // CI runner 的临时目录可能带 8.3 短名或其它未经解析的形态，裸拼写的
+        // root 与它的 canonicalize 产物就不保证是「同一目录的两种等价拼写」，
+        // 断言会随 runner 环境漂移（main 上连红数日即此因）。显式归一一次，
+        // 两侧就只剩「带不带 \\?\ 前缀」这一个受控差异——这正是本测试要验的。
         let root_canon = dir.canonicalize().unwrap();
-        assert!(
-            root_canon
-                .as_os_str()
-                .to_string_lossy()
-                .starts_with(r"\\?\"),
+        let root_plain = crate::util::strip_verbatim_prefix(&root_canon);
+        assert_ne!(
+            root_canon, root_plain,
             "测试前提：canonicalize 返回 verbatim 拼写"
         );
 
