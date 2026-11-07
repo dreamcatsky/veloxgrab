@@ -32,7 +32,9 @@ pub const ENC_PREFIX: &str = "dpapi1:";
 /// 固定可选熵（域分隔），进 CryptProtectData 的 optional-entropy 参数。
 const ENTROPY: &[u8] = b"VeloxGrab.settings.v1";
 
-fn to_hex(bytes: &[u8]) -> String {
+/// 字节序列 → 小写十六进制。与 `from_hex` 成对；bridge 的随机 token、
+/// update 的摘要展示等场合共用，避免每个模块各写一份编码循环。
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));

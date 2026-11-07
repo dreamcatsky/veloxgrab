@@ -383,9 +383,10 @@
   let i18nPhOriginal = null;
 
   function applyLanguage(lang) {
-    // 注意：progress.html 里在用 data-i18n-title，但本窗口的实现只支持
-    // data-i18n（内容）与 data-i18n-ph（placeholder）；曾经的
-    // data-i18n-attr 分支语义写错且无任何元素使用，已删除。
+    // 本窗口的实现只支持 data-i18n（内容）与 data-i18n-ph（placeholder）；
+    // 曾经的 data-i18n-attr 分支语义写错且无任何元素使用，已删除。
+    // progress 窗口（progress.html）不参与 i18n：它只显示后端事件里的
+    // 动态文本，没有静态标记节点。
     const nodes = document.querySelectorAll("[data-i18n]");
     const phNodes = document.querySelectorAll("[data-i18n-ph]");
     if (!i18nOriginal) {

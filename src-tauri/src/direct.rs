@@ -30,6 +30,20 @@ const MAX_THREADS: usize = 64;
 /// 下载中的临时文件后缀。完成后再 rename 成最终名字。
 const TEMP_SUFFIX: &str = ".veloxgrab-downloading";
 
+/// 「下载被用户停止」的错误文本。
+///
+/// download_direct 的三个停止点都以 `Err(Self)` 返回；engine::run_direct_download
+/// 的失败分支用 `is_cancelled_error` 认出它（与 `token.is_canceled()` 并列），
+/// 落 Paused/Canceled 而不是 Failed。曾经两边各自手写这串字面量——文案一处
+/// 改动就会让判定静默失配，取消被记成失败。收口到一个常量后改文案不可能
+/// 再漏改判定侧。
+pub const ERR_CANCELLED: &str = "已取消";
+
+/// 错误串是否是「用户停止」信号。生产者与消费者共用同一常量。
+pub fn is_cancelled_error(e: &str) -> bool {
+    e == ERR_CANCELLED
+}
+
 /// 直链探测结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectProbe {
@@ -460,7 +474,7 @@ pub async fn probe_direct(
     let probe = match cancel {
         Some(flag) => tokio::select! {
             r = fut => r.map_err(|_| timed_out())??,
-            _ = wait_cancel(flag) => return Err("已取消".into()),
+            _ = wait_cancel(flag) => return Err(ERR_CANCELLED.into()),
         },
         None => fut.await.map_err(|_| timed_out())??,
     };
@@ -1554,7 +1568,7 @@ pub async fn download_direct(
     }
     if cancel.load(Ordering::SeqCst) {
         meta.save(&target);
-        return Err("已取消".into());
+        return Err(ERR_CANCELLED.into());
     }
 
     // 完成度只能按每段自己写了多少来判断。
@@ -1614,7 +1628,7 @@ async fn download_single(
     while let Some(chunk) = stream.next().await {
         if cancel.load(Ordering::SeqCst) {
             let _ = file.flush().await;
-            return Err("已取消".into());
+            return Err(ERR_CANCELLED.into());
         }
         let chunk = chunk.map_err(|e| format!("读取数据流失败: {}", e.without_url()))?;
 
@@ -1748,6 +1762,20 @@ pub fn looks_like_media_site(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ERR_CANCELLED 的生产/消费配对：三个停止点发出的文本必须被
+    /// is_cancelled_error 认出，普通失败不得误判（P3 收尾项）。
+    #[test]
+    fn cancelled_error_sentinel_roundtrip() {
+        assert!(is_cancelled_error(ERR_CANCELLED));
+        assert_eq!(Err(ERR_CANCELLED.into()), Err::<(), String>(ERR_CANCELLED.into()));
+        // 探测与下载路径实际产出的形态
+        assert!(is_cancelled_error("已取消"));
+        // 普通失败与「包含但不是」的串不得命中（判定是全等不是子串）
+        assert!(!is_cancelled_error("服务器返回 HTTP 403"));
+        assert!(!is_cancelled_error("请求失败: connection reset"));
+        assert!(!is_cancelled_error("前缀已取消后缀"));
+    }
 
     /// 取消已置位时 rate_wait 必须立即返回：低限速下点暂停/取消，
     /// 响应延迟不能被限速睡眠拖住（P2-1）。

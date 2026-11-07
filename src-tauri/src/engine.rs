@@ -1448,7 +1448,7 @@ pub async fn run_direct_download(
                 let mut guard = tasks.lock().await;
                 match guard.get_mut(&task.id) {
                     Some(t) => {
-                        if token.is_canceled() || e.contains("已取消") {
+                        if token.is_canceled() || crate::direct::is_cancelled_error(&e) {
                             // 暂停/取消压着失败到达：落停止态并按语义清瞬时字段
                             apply_stopped_state(t, &token)
                         } else {

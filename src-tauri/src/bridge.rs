@@ -167,11 +167,7 @@ fn random_token() -> Option<String> {
     if status < 0 {
         return None;
     }
-    let mut s = String::with_capacity(64);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    Some(s)
+    Some(crate::dpapi::to_hex(&bytes))
 }
 
 #[cfg(not(windows))]

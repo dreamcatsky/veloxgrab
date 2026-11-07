@@ -540,9 +540,12 @@ mod tests {
             "verbatim 拼写的根内子目录不得被判越界"
         );
 
-        // 3) 信任集里的 verbatim 条目必须命中普通拼写的输入；反向亦然
+        // 3) 信任集里的 verbatim 条目必须命中普通拼写的输入；反向亦然。
+        //    fresh 同样取归一化拼写：is_trusted 是纯词法比较，若用裸的
+        //    temp_dir 拼写（runner 上可能带短名/大小写差异），它与归一后的
+        //    根在词法上不相等，断言会随 runner 环境漂移（546 行连红即此因）。
         let trusted_verbatim = vec![root_canon.join("approved").to_string_lossy().to_string()];
-        let fresh = dir.join("approved");
+        let fresh = root_plain.join("approved");
         assert!(
             is_trusted(&root_plain, &trusted_verbatim, &fresh),
             "已批准过的目录不得因拼写差异重新弹确认框"
