@@ -838,6 +838,9 @@
     </button>
   </div>
 
+  <!-- 纯函数工具集：先于 app.js 加载（app.js 解构 window.VeloxGrabCore）。
+       同一份实现被 tests/core.test.mjs 在 Node 里直接测。 -->
+  <script src="core.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

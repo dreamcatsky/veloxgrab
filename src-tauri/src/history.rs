@@ -464,6 +464,13 @@ fn sender() -> &'static Mutex<Sender<Op>> {
 
 /// 提交一个操作。非阻塞（通道发送微秒级），因此可以在持有 tasks 锁时调用。
 fn submit(op: Op) {
+    // 单元测试不得触碰用户的真实 history.json：commands 的状态机测试会
+    // 构造真实 AppState 并走 cancel_one/pause_one 等内核，它们都调
+    // upsert_entry。测试里丢弃操作（内存态足以让测试断言状态迁移），
+    // 磁盘零副作用。
+    if cfg!(test) {
+        return;
+    }
     let lock = sender();
     // 中毒说明写线程 panic 过（磁盘 IO 路径本身不 panic，多半是未来改动引入）：
     // 取内层继续用，而不是让整个应用的落盘从此沉默。

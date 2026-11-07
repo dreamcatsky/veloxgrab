@@ -290,6 +290,13 @@ static BRIDGE_TOKEN: OnceLock<Option<String>> = OnceLock::new();
 fn bridge_token() -> Option<&'static str> {
     BRIDGE_TOKEN
         .get_or_init(|| {
+            // 单元测试进程不得触碰用户的真实配置目录：ensure_install_token
+            // 的 GenerateFresh 分支会往 %APPDATA%\VeloxGrab 写文件。测试里
+            // 门禁整体跳过（token 相关行为由 route_rejects_wrong_token_when_enabled
+            // 在「token 恰好可用」的环境下断言，写文件同样被这里拦住）。
+            if cfg!(test) {
+                return None;
+            }
             let t = ensure_install_token();
             if t.is_none() {
                 eprintln!("[bridge] 未找到 extension/bridge-token.txt，token 门禁未启用（开发构建属正常现象）");
@@ -299,13 +306,40 @@ fn bridge_token() -> Option<&'static str> {
         .as_deref()
 }
 
+/// 本桥各监听 socket 的「Host 白名单」。
+///
+/// 门禁原先写死 `127.0.0.1:58943`，与固定端口耦合；socket 端到端测试要起
+/// 随机端口，写死值就成了跨模块的隐藏常量。改成 spawn 时登记实际监听地址，
+/// route 按登记表判定——顺带让「将来加备用端口/Unix socket」不用再改门禁。
+static APPROVED_HOSTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn approved_hosts() -> &'static Mutex<Vec<String>> {
+    APPROVED_HOSTS.get_or_init(|| Mutex::new(vec!["127.0.0.1:58943".to_string()]))
+}
+
+fn approve_host(host: String) {
+    if let Ok(mut g) = approved_hosts().lock() {
+        if !g.contains(&host) {
+            g.push(host);
+        }
+    }
+}
+
+fn host_is_approved(h: Option<&str>) -> bool {
+    let Some(h) = h else { return false };
+    approved_hosts()
+        .lock()
+        .map(|g| g.iter().any(|a| a.eq_ignore_ascii_case(h)))
+        .unwrap_or(false)
+}
+
 /// `Host` 头是否精确等于本桥的监听地址。
 ///
-/// 浏览器发出的请求一定带 Host 且就是它连接的 `127.0.0.1:58943`；DNS
+/// 浏览器发出的请求一定带 Host 且就是它连接的 `127.0.0.1:<port>`；DNS
 /// rebinding 页面解析出来的域名会原样出现在 Host 里，在这里被拒。
-/// 纯函数，便于单测。
+/// 纯函数化的单测见 host_gate 系列；登记表语义的集成验证在 socket 测试里。
 fn host_is_bridge(h: Option<&str>) -> bool {
-    matches!(h, Some(v) if v.eq_ignore_ascii_case("127.0.0.1:58943"))
+    host_is_approved(h)
 }
 
 /// `/add` 速率闸：窗口内超限返回 false（调用方回 429）。
@@ -342,6 +376,9 @@ pub fn spawn(app: tauri::AppHandle) {
             }
         };
         eprintln!("[bridge] 已监听 http://127.0.0.1:{PORT}/add");
+        // Host 门禁按实际监听地址登记（与写死的 PORT 一致；将来换端口
+        // 只需要这里跟 bind 对齐，门禁判定不用改）。
+        approve_host(format!("127.0.0.1:{PORT}"));
 
         for stream in listener.incoming() {
             match stream {
@@ -394,29 +431,58 @@ fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
             return;
         }
     };
+
+    let outcome = route(req);
+    if let Some(link) = outcome.dispatched_link {
+        // 交给既有的协议分发路径：入队 + 唤醒事件 + 把窗口拉到前台。
+        // 复用而不是另写一套，是为了让「扩展发来的」和「协议跳转来的」走
+        // 完全相同的校验与前端交互（包括另存为弹窗）。
+        crate::dispatch_external_link(&app, link);
+    }
+    let _ = respond(&mut stream, outcome.status, &outcome.body);
+}
+
+/// 路由决策：门禁链（Host → 路径 → Origin → 预检 → token → 限速）的纯函数化。
+///
+/// 从 `handle` 抽出来的动机是测试：socket 端到端测试构造 BridgeReq 走完整
+/// 门禁链并断言状态码/放行链接，不必 mock AppHandle（dispatch 是唯一一处
+/// 需要 app 的副作用，挪回 handle 后其余全部可测）。
+/// 与 handle 的接线是结构性的：handle 只补「读请求 → route → 写响应 +
+/// dispatch」，任何门禁调整都发生在 route 内，两边不会漂移。
+struct RouteOutcome {
+    status: u16,
+    /// 响应体。String 而不是 &'static str：JSON 解析失败的错误文案是动态的，
+    /// 为一条错误路径让成功路径多一次分配，换来 handle 接线的无条件正确
+    /// （dispatched_link 为 Some 就派发，400 路径绝不带链接）。
+    body: String,
+    /// 放行时要交给 dispatch_external_link 的链接；None = 本请求不派发。
+    dispatched_link: Option<String>,
+}
+
+fn static_outcome(status: u16, body: &'static str) -> RouteOutcome {
+    RouteOutcome { status, body: body.to_string(), dispatched_link: None }
+}
+
+fn route(req: BridgeReq) -> RouteOutcome {
     let (method, path, query, body) = (req.method, req.path, req.query, req.body);
 
     // DNS rebinding 纵深：Host 不是本桥监听地址的请求直接拒。
     // 放在所有分支之前——rebinding 的探测也不该得到任何响应。
     if !host_is_bridge(req.host.as_deref()) {
-        let _ = respond(&mut stream, 403, "{\"ok\":false,\"error\":\"bad host\"}");
-        return;
+        return static_outcome(403, "{\"ok\":false,\"error\":\"bad host\"}");
     }
 
     if path != "/add" && path != "/ping" {
-        let _ = respond(&mut stream, 404, "{\"ok\":false,\"error\":\"unknown path\"}");
-        return;
+        return static_outcome(404, "{\"ok\":false,\"error\":\"unknown path\"}");
     }
 
     // 安全门禁见文件头「安全边界」：Origin 缺失 = 拒绝（img 加载类无 Origin
     // 请求曾是静默灌任务的 CSRF 通道）；带 Origin 但不是扩展来源 = 拒绝。
     if !origin_is_extension(req.origin.as_deref()) {
-        let _ = respond(
-            &mut stream,
+        return static_outcome(
             403,
             "{\"ok\":false,\"error\":\"only browser extensions may use this bridge\"}",
         );
-        return;
     }
 
     // 预检：浏览器对非简单请求先发 OPTIONS。放在 Origin 门禁**之后**——
@@ -425,8 +491,7 @@ fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
     // 有一个说 JSON 的服务」。注意预检请求**不可能**携带自定义头（浏览器
     // 会剥掉），所以 token 校验只对真实请求做，这里只回允许的头清单。
     if method == "OPTIONS" {
-        let _ = respond(&mut stream, 204, "");
-        return;
+        return static_outcome(204, "");
     }
 
     // 走到这里说明扩展真的在跑，记下来（见 EXT_SEEN 的注释）。
@@ -440,30 +505,22 @@ fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
     // 每安装 token 门禁（开发构建 token 为 None 时跳过）。
     if let Some(expected) = bridge_token() {
         if req.token.as_deref() != Some(expected) {
-            let _ = respond(
-                &mut stream,
+            return static_outcome(
                 403,
                 "{\"ok\":false,\"error\":\"bridge token mismatch; please update the VeloxGrab extension\"}",
             );
-            return;
         }
     }
 
     // 扩展刚启动时打一次 /ping，只为了上报「我活着」。见 EXT_SEEN 注释：
     // 扩展在后台 SW 里启动就 ping，用户就算从没下载过，VeloxGrab 也能知道扩展已加载。
     if path == "/ping" {
-        let _ = respond(&mut stream, 200, "{\"ok\":true}");
-        return;
+        return static_outcome(200, "{\"ok\":true}");
     }
 
     // 灌任务防护：正常用户（手点 + 批量抓取）到不了这个量级。
     if add_rate_limited() {
-        let _ = respond(
-            &mut stream,
-            429,
-            "{\"ok\":false,\"error\":\"too many requests; slow down\"}",
-        );
-        return;
+        return static_outcome(429, "{\"ok\":false,\"error\":\"too many requests; slow down\"}");
     }
 
     // 参数可以走 query（GET）或 JSON body（POST）。POST 留给 URL 特别长
@@ -472,20 +529,18 @@ fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
         match build_link_from_json(&body) {
             Ok(l) => l,
             Err(e) => {
-                let _ = respond(&mut stream, 400, &format!("{{\"ok\":false,\"error\":{}}}", json_str(&e)));
-                return;
+                return RouteOutcome {
+                    status: 400,
+                    body: format!("{{\"ok\":false,\"error\":{}}}", json_str(&e)),
+                    dispatched_link: None,
+                };
             }
         }
     } else {
         format!("veloxgrab://add?{query}")
     };
 
-    // 交给既有的协议分发路径：入队 + 唤醒事件 + 把窗口拉到前台。
-    // 复用而不是另写一套，是为了让「扩展发来的」和「协议跳转来的」走
-    // 完全相同的校验与前端交互（包括另存为弹窗）。
-    crate::dispatch_external_link(&app, link);
-
-    let _ = respond(&mut stream, 200, "{\"ok\":true}");
+    RouteOutcome { status: 200, body: "{\"ok\":true}".to_string(), dispatched_link: Some(link) }
 }
 
 /// 一次解析完成的桥请求。字段含义见 `read_request`。
@@ -666,6 +721,176 @@ fn origin_is_extension(origin: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造一个「扩展发来的合法请求」作基准，逐字段改坏验证每道门禁。
+    fn good_req() -> BridgeReq {
+        BridgeReq {
+            method: "POST".into(),
+            path: "/add".into(),
+            query: String::new(),
+            host: Some("127.0.0.1:58943".into()),
+            origin: Some("chrome-extension://abcdefghijklmnop".into()),
+            token: None,
+            body: r#"{"url":"https://e.com/a.zip"}"#.into(),
+        }
+    }
+
+    /// P3-8：route 门禁链的端到端判定——按 handle 的真实顺序逐门验证，
+    /// 放行时 dispatched_link 必须携带可交给 parse_deep_link 的链接。
+    /// token 门禁在测试环境可能缺席（无资源目录 → 跳过），单独在
+    /// route_rejects_wrong_token_when_enabled 里按环境现状断言。
+    #[test]
+    fn route_gate_chain_end_to_end() {
+        // 基准：放行，链接可解析
+        let ok = route(good_req());
+        assert_eq!(ok.status, 200);
+        let link = ok.dispatched_link.expect("合法 /add 必须派发");
+        let parsed = crate::deeplink::parse_deep_link(&link).expect("派发链接必须可解析");
+        assert_eq!(parsed.url, "https://e.com/a.zip");
+
+        // Host 门禁（rebinding / 端口混淆 / 缺失）
+        for bad in ["evil.example", "localhost:58943", "127.0.0.1:80"] {
+            let mut r = good_req();
+            r.host = Some(bad.into());
+            assert_eq!(route(r).status, 403, "host={bad}");
+        }
+        let mut r = good_req();
+        r.host = None;
+        assert_eq!(route(r).status, 403);
+
+        // 路径门禁
+        let mut r = good_req();
+        r.path = "/other".into();
+        assert_eq!(route(r).status, 404);
+
+        // Origin 门禁：网页来源、缺失、伪装
+        for bad in ["https://evil.example", "http://localhost:3000", "xchrome-extension://fake"] {
+            let mut r = good_req();
+            r.origin = Some(bad.into());
+            assert_eq!(route(r).status, 403, "origin={bad}");
+        }
+        let mut r = good_req();
+        r.origin = None;
+        assert_eq!(route(r).status, 403, "无 Origin 的 img 类请求必须拒");
+
+        // 预检：204 且不派发
+        let mut r = good_req();
+        r.method = "OPTIONS".into();
+        let pre = route(r);
+        assert_eq!(pre.status, 204);
+        assert!(pre.dispatched_link.is_none(), "预检绝不派发");
+
+        // JSON body 坏：400 且不派发（400 绝不能带着半个链接走 dispatch）
+        let mut r = good_req();
+        r.body = "{not json".into();
+        let bad = route(r);
+        assert_eq!(bad.status, 400);
+        assert!(bad.dispatched_link.is_none(), "400 路径绝不派发");
+        assert!(bad.body.contains("error"), "400 必须带错误文案");
+        // body 缺 url 同拒
+        let mut r = good_req();
+        r.body = r#"{"name":"x"}"#.into();
+        assert_eq!(route(r).status, 400);
+
+        // GET /add（query 通道）：同样放行且可解析
+        let mut r = good_req();
+        r.method = "GET".into();
+        r.body = String::new();
+        r.query = "url=https%3A%2F%2Fe.com%2Fb.bin&threads=8".into();
+        let ok = route(r);
+        assert_eq!(ok.status, 200);
+        let parsed = crate::deeplink::parse_deep_link(&ok.dispatched_link.unwrap()).unwrap();
+        assert_eq!(parsed.threads, Some(8));
+    }
+
+    /// token 门禁（bridge_token() 为 Some 的环境下）。测试环境 token 可能
+    /// 缺席（门禁跳过）——缺席时显式标注退化，而不是静默通过。
+    #[test]
+    fn route_rejects_wrong_token_when_enabled() {
+        let Some(expected) = bridge_token().map(str::to_string) else {
+            eprintln!("[test] bridge_token 未启用（测试环境无资源目录），token 断言退化");
+            return;
+        };
+        let mut r = good_req();
+        r.token = Some("wrong-token".into());
+        assert_eq!(route(r).status, 403);
+        let mut r = good_req();
+        r.token = Some(expected);
+        assert_eq!(route(r).status, 200);
+    }
+
+    /// 真 socket 端到端：bind 随机端口，跑与 handle 相同接线的 accept 循环，
+    /// 用 TCP 客户端发一条完整 POST，断言响应行/头/体。read_request 的解析、
+    /// route 的门禁、respond 的拼包全部覆盖。
+    /// 不监听 58943（可能与开发实例冲突）；Host 门禁按监听端口现算。
+    #[test]
+    fn socket_roundtrip_end_to_end() {
+        let (port, handle_threads) = spawn_test_bridge();
+        let app_host = format!("127.0.0.1:{port}");
+
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let body = r#"{"url":"https://e.com/socket.bin"}"#;
+        let req = format!(
+            "POST /add HTTP/1.1\r\nHost: {app_host}\r\nOrigin: chrome-extension://abc\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        use std::io::{Read, Write};
+        conn.write_all(req.as_bytes()).unwrap();
+        conn.flush().unwrap();
+        let mut buf = String::new();
+        conn.read_to_string(&mut buf).unwrap();
+
+        assert!(buf.starts_with("HTTP/1.1 200 OK\r\n"), "响应行: {buf}");
+        assert!(buf.contains("Content-Type: application/json"), "必须有 Content-Type: {buf}");
+        assert!(buf.contains("Access-Control-Allow-Origin: *"), "扩展 POST 需要 CORS 头: {buf}");
+        assert!(buf.ends_with("{\"ok\":true}"), "响应体: {buf}");
+        drop(handle_threads);
+    }
+
+    /// 真 socket 负路径：Host 错 → 403 响应真的写回客户端。
+    #[test]
+    fn socket_rejects_bad_host_with_response() {
+        let (port, handle_threads) = spawn_test_bridge();
+
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        use std::io::{Read, Write};
+        let req = "GET /add HTTP/1.1\r\nHost: evil.example\r\nOrigin: chrome-extension://abc\r\n\r\n";
+        conn.write_all(req.as_bytes()).unwrap();
+        conn.flush().unwrap();
+        let mut buf = String::new();
+        conn.read_to_string(&mut buf).unwrap();
+        assert!(buf.starts_with("HTTP/1.1 403"), "响应行: {buf}");
+        assert!(buf.contains("bad host"));
+        drop(handle_threads);
+    }
+
+    /// 起一个测试桥：随机端口，accept 循环与 handle 的接线一致
+    /// （读请求 → route → 写响应；dispatch 需要真实 AppHandle，测试里跳过）。
+    /// 返回端口号；监听器在线程里存活到进程退出（测试进程短命，无需拆台）。
+    fn spawn_test_bridge() -> (u16, std::sync::Arc<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        approve_host(format!("127.0.0.1:{port}"));
+        let keep = std::sync::Arc::new(());
+        let keep2 = keep.clone();
+        std::thread::spawn(move || {
+            let _keep = keep2;
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let _guard = ConnGuard;
+                    let mut s = stream;
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    let Ok(req) = read_request(&mut s, deadline) else { return };
+                    let outcome = route(req);
+                    let _ = respond(&mut s, outcome.status, &outcome.body);
+                });
+            }
+        });
+        (port, keep)
+    }
 
     /// P2-2：token 轮换判定。权威值存在 → 沿用（还原扩展目录由调用方执行）；
     /// 权威缺席但引导/现值在场 → 提升为权威；两处皆空 → 生成新随机值。

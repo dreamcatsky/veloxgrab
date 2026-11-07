@@ -80,6 +80,34 @@ impl AppState {
     }
 }
 
+#[cfg(test)]
+impl AppState {
+    /// 状态机测试专用构造：不读盘（settings/history 都是用户真实文件，
+    /// 读进来只会让测试结果随机器漂移），任务表为空，设置取默认值。
+    /// 与 `new()` 的唯一差别是数据来源；锁与队列结构完全一致。
+    pub fn new_for_test() -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            tokens: Arc::new(Mutex::new(HashMap::new())),
+            settings: Arc::new(std::sync::Mutex::new(Settings::default())),
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            running: Arc::new(AtomicU64::new(0)),
+            pump_lock: Arc::new(Mutex::new(())),
+            counter: AtomicU64::new(1),
+            pending_links: std::sync::Mutex::new(Vec::new()),
+            plan: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 灌一个任务进状态机（跳过 enqueue 命令层的目录/磁盘检查——
+    /// 那些闸门有自己的测试；这里只关心状态与令牌的编排语义）。
+    pub fn insert_task_for_test(&self, task: Task) {
+        if let Ok(mut g) = self.tasks.try_lock() {
+            g.insert(task.id.clone(), task);
+        }
+    }
+}
+
 /// 当前 Unix 时间戳（毫秒）。任务 id、创建时间、历史结束时间都用它。
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -2451,5 +2479,309 @@ mod tests {
         let dir = temp_dir("relative");
         assert!(delete_output_file("gone.mp4", &dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- 状态机编排回归（P3-8） ----------
+    //
+    // cancel_one / pause_one / resume_one / redo_one 的内核只需要 &AppState，
+    // 用 new_for_test() 走真实锁与令牌表，锁「显示状态」与「令牌在不在」的
+    // 配对语义。此前这些语义全靠代码注释论证，没有任何可执行验证。
+
+    use crate::engine::TaskState;
+
+    /// 造一个可入库的任务（状态可指定；kind/字段取最小集）。
+    fn mk_task(state: TaskState) -> Task {
+        Task {
+            id: format!("t{}_0", crate::commands::now_ms()),
+            url: "https://e.com/a.bin".into(),
+            title: "a.bin".into(),
+            thumbnail: None,
+            duration: None,
+            format_id: "direct".into(),
+            quality_label: "4 线程".into(),
+            has_audio: false,
+            best_audio_format: None,
+            state,
+            progress: if state == TaskState::Downloading { 42.0 } else { 0.0 },
+            downloaded_bytes: 0,
+            total_bytes: Some(1000),
+            speed: None,
+            eta: None,
+            output_path: None,
+            error: None,
+            file_missing: false,
+            created_at: crate::commands::now_ms(),
+            kind: "direct".into(),
+            threads: 4,
+            save_dir: None,
+            expected_ext: Some("bin".into()),
+        }
+    }
+
+    async fn task_state_of(state: &AppState, id: &str) -> Option<TaskState> {
+        state.tasks.lock().await.get(id).map(|t| t.state)
+    }
+
+    async fn has_token(state: &AppState, id: &str) -> bool {
+        state.tokens.lock().await.contains_key(id)
+    }
+
+    /// 排队中的取消：出队 + 落 Canceled + 瞬时字段清零（P3-1 语义）。
+    #[tokio::test]
+    async fn cancel_one_dequeues_and_clears_progress() {
+        let state = AppState::new_for_test();
+        let mut t = mk_task(TaskState::Queued);
+        t.progress = 42.0;
+        t.downloaded_bytes = 100;
+        let id = t.id.clone();
+        state.insert_task_for_test(t);
+        state.queue.lock().await.push_back(id.clone());
+
+        cancel_one(&state, &id).await;
+
+        assert_eq!(task_state_of(&state, &id).await, Some(TaskState::Canceled));
+        assert!(!has_token(&state, &id).await, "无令牌路径不得凭空造令牌");
+        assert!(!state.queue.lock().await.iter().any(|x| *x == id), "必须出队");
+        let t = state.tasks.lock().await.get(&id).cloned().unwrap();
+        assert_eq!(t.progress, 0.0, "取消后进度清零（P3-1）");
+        assert_eq!(t.downloaded_bytes, 0);
+        assert!(t.total_bytes.is_none());
+    }
+
+    /// 运行中的取消：令牌被 cancel（标志置位），状态交给 worker 收尾——
+    /// 但「非终态才覆盖」的守卫存在时这里直接落 Canceled（测试里无 worker，
+    /// 状态停留在中间态，走覆盖分支）。
+    #[tokio::test]
+    async fn cancel_one_running_cancels_token_and_falls_to_canceled() {
+        let state = AppState::new_for_test();
+        let t = mk_task(TaskState::Downloading);
+        let id = t.id.clone();
+        state.insert_task_for_test(t);
+        let token = Arc::new(CancelToken::new());
+        state.tokens.lock().await.insert(id.clone(), token.clone());
+
+        cancel_one(&state, &id).await;
+
+        assert!(token.is_canceled(), "必须取消真实令牌");
+        assert_eq!(task_state_of(&state, &id).await, Some(TaskState::Canceled));
+    }
+
+    /// 终态守卫：worker 已写 Done 后迟到的 cancel 不得覆盖成 Canceled。
+    #[tokio::test]
+    async fn cancel_one_never_overrides_done() {
+        let state = AppState::new_for_test();
+        let t = mk_task(TaskState::Done);
+        let id = t.id.clone();
+        state.insert_task_for_test(t);
+        let token = Arc::new(CancelToken::new());
+        state.tokens.lock().await.insert(id.clone(), token.clone());
+
+        cancel_one(&state, &id).await;
+
+        assert_eq!(task_state_of(&state, &id).await, Some(TaskState::Done), "终态必须保留");
+        assert!(token.is_canceled(), "令牌照常取消（收尾用）");
+    }
+
+    /// 排队中的暂停：出队 + 落 Paused（进度保留——断点还在盘上）。
+    #[tokio::test]
+    async fn pause_one_dequeues_and_keeps_progress() {
+        let state = AppState::new_for_test();
+        let mut t = mk_task(TaskState::Queued);
+        t.progress = 42.0;
+        let id = t.id.clone();
+        state.insert_task_for_test(t);
+        state.queue.lock().await.push_back(id.clone());
+
+        pause_one(&state, &id).await.unwrap();
+
+        assert_eq!(task_state_of(&state, &id).await, Some(TaskState::Paused));
+        let t = state.tasks.lock().await.get(&id).cloned().unwrap();
+        assert_eq!(t.progress, 42.0, "暂停必须保留进度（断点语义）");
+    }
+
+    /// 运行中的暂停：pause() 先写 paused 再置取消位——worker 收尾时据此
+    /// 落 Paused。这里验证令牌标志序与「不直接写状态」的既有设计。
+    #[tokio::test]
+    async fn pause_one_running_pauses_token_without_state_write() {
+        let state = AppState::new_for_test();
+        let t = mk_task(TaskState::Downloading);
+        let id = t.id.clone();
+        state.insert_task_for_test(t);
+        let token = Arc::new(CancelToken::new());
+        state.tokens.lock().await.insert(id.clone(), token.clone());
+
+        pause_one(&state, &id).await.unwrap();
+
+        assert!(token.is_paused(), "先写 paused");
+        assert!(token.is_canceled(), "再置取消位（stop 传输）");
+        assert_eq!(
+            task_state_of(&state, &id).await,
+            Some(TaskState::Downloading),
+            "有令牌时不写状态：交给 worker 收尾（避免与它抢锁回跳）"
+        );
+    }
+
+    /// 终态暂停拒绝：Done 不能被拍成 Paused。
+    #[tokio::test]
+    async fn pause_one_rejects_terminal() {
+        let state = AppState::new_for_test();
+        let t = mk_task(TaskState::Done);
+        let id = t.id.clone();
+        state.insert_task_for_test(t);
+
+        let err = pause_one(&state, &id).await.unwrap_err();
+        assert!(err.contains("已结束"), "{err}");
+        assert_eq!(task_state_of(&state, &id).await, Some(TaskState::Done));
+    }
+
+    /// 恢复：Paused → Queued 入队；已有令牌（旧 worker 未收尾）必须拒绝。
+    #[tokio::test]
+    async fn resume_one_rejects_when_token_alive() {
+        let state = AppState::new_for_test();
+        let t = mk_task(TaskState::Paused);
+        let id = t.id.clone();
+        state.insert_task_for_test(t);
+        let token = Arc::new(CancelToken::new());
+        state.tokens.lock().await.insert(id.clone(), token.clone());
+
+        let err = resume_one(&state, &id).await.unwrap_err();
+        assert!(err.contains("收尾"), "{err}");
+        assert_eq!(
+            task_state_of(&state, &id).await,
+            Some(TaskState::Paused),
+            "拒绝时不得翻态（防双线程写同一份断点）"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_one_queues_paused_task() {
+        let state = AppState::new_for_test();
+        let t = mk_task(TaskState::Paused);
+        let id = t.id.clone();
+        state.insert_task_for_test(t);
+
+        resume_one(&state, &id).await.unwrap();
+
+        assert_eq!(task_state_of(&state, &id).await, Some(TaskState::Queued));
+        assert!(state.queue.lock().await.iter().any(|x| *x == id), "必须入队");
+    }
+
+    /// Done 不能 resume（是 redo 的入口）。
+    #[tokio::test]
+    async fn resume_one_rejects_done() {
+        let state = AppState::new_for_test();
+        let t = mk_task(TaskState::Done);
+        let id = t.id.clone();
+        state.insert_task_for_test(t);
+
+        let err = resume_one(&state, &id).await.unwrap_err();
+        assert!(err.contains("已完成"), "{err}");
+    }
+
+    /// 重下：取消态允许（清断点从头下）；运行中拒绝；快照与复查之间状态
+    /// 变化（并发 resume 抢先）必须拒绝。
+    #[tokio::test]
+    async fn redo_one_rejects_running_and_racing() {
+        // 运行中拒绝
+        let state = AppState::new_for_test();
+        let t = mk_task(TaskState::Downloading);
+        let id = t.id.clone();
+        state.insert_task_for_test(t);
+        let err = redo_one(&state, &id).await.unwrap_err();
+        assert!(err.contains("先取消"), "{err}");
+
+        // 并发抢先：快照时是 Canceled，提交前被改回 Paused（模拟另一命令）
+        let state2 = AppState::new_for_test();
+        let t2 = mk_task(TaskState::Canceled);
+        let id2 = t2.id.clone();
+        state2.insert_task_for_test(t2);
+        // 在快照与提交之间插队：直接把状态改成 Paused 且插令牌
+        let token = Arc::new(CancelToken::new());
+        state2.tokens.lock().await.insert(id2.clone(), token.clone());
+        state2.tasks.lock().await.get_mut(&id2).unwrap().state = TaskState::Paused;
+        let err = redo_one(&state2, &id2).await.unwrap_err();
+        assert!(
+            err.contains("发生了变化") || err.contains("先取消"),
+            "快照判定或复查必须拦住: {err}"
+        );
+        assert_eq!(
+            task_state_of(&state2, &id2).await,
+            Some(TaskState::Paused),
+            "被抢先后不得再写 Queued"
+        );
+    }
+
+    /// 重下的正常路径：Canceled → Queued，进度归零，入队。
+    #[tokio::test]
+    async fn redo_one_canceled_goes_queued_with_progress_reset() {
+        let state = AppState::new_for_test();
+        let mut t = mk_task(TaskState::Canceled);
+        t.progress = 88.0;
+        let id = t.id.clone();
+        state.insert_task_for_test(t);
+
+        redo_one(&state, &id).await.unwrap();
+
+        let t = state.tasks.lock().await.get(&id).cloned().unwrap();
+        assert_eq!(t.state, TaskState::Queued);
+        assert_eq!(t.progress, 0.0, "断点已清，进度归零");
+        assert!(state.queue.lock().await.iter().any(|x| *x == id));
+    }
+
+    /// 并发取消 vs 完成竞态的结构验证：两个任务并发跑 cancel_one 与
+    /// 「写 Done」，终态只有一个赢家，绝不出现「Done 被改成 Canceled」
+    /// 或相反的写丢。跑若干轮放大窗口。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_vs_done_race_converges() {
+        for round in 0..32 {
+            let state = AppState::new_for_test();
+            let t = mk_task(TaskState::Downloading);
+            let id = t.id.clone();
+            state.insert_task_for_test(t);
+            let token = Arc::new(CancelToken::new());
+            state.tokens.lock().await.insert(id.clone(), token.clone());
+
+            let s1 = clone_state(&state);
+            let s2 = clone_state(&state);
+            let id1 = id.clone();
+            let id2 = id.clone();
+            let (a, b) = tokio::join!(
+                async move { cancel_one(&s1, &id1).await },
+                async move {
+                    // 模拟 worker 收尾的「锁内写 Done」分支
+                    let mut guard = s2.tasks.lock().await;
+                    if let Some(t) = guard.get_mut(&id2) {
+                        t.state = TaskState::Done;
+                    }
+                },
+            );
+            let _ = (a, b);
+
+            let final_state = task_state_of(&state, &id).await.unwrap();
+            assert!(
+                matches!(final_state, TaskState::Done | TaskState::Canceled),
+                "round {round}: 终态只能是 Done 或 Canceled，实际 {final_state:?}"
+            );
+            // 状态与令牌取消标志的关系：Done 赢家可能发生在 cancel 前
+            //（token.is_canceled() 可真可假），但 Canceled 赢家必然源自
+            // cancel 路径——此时令牌一定被 cancel 过。
+            if final_state == TaskState::Canceled {
+                assert!(token.is_canceled(), "round {round}: Canceled 必然伴随令牌取消");
+            }
+        }
+    }
+
+    fn clone_state(state: &AppState) -> AppState {
+        AppState {
+            tasks: state.tasks.clone(),
+            tokens: state.tokens.clone(),
+            settings: state.settings.clone(),
+            queue: state.queue.clone(),
+            running: state.running.clone(),
+            pump_lock: state.pump_lock.clone(),
+            counter: AtomicU64::new(0),
+            pending_links: std::sync::Mutex::new(Vec::new()),
+            plan: std::sync::Mutex::new(None),
+        }
     }
 }

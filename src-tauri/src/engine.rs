@@ -1518,6 +1518,68 @@ use std::os::windows::process::CommandExt;
 mod tests {
     use super::*;
 
+    /// P3-8/P3-1：apply_stopped_state 的字段语义——取消清全部瞬时字段，
+    /// 暂停全保留（断点还在盘上，这些值就是「下到哪」的事实）。
+    /// 这个函数是 P3-1 修复的核心收口，7 个停止点都走它，语义必须锁死。
+    fn stopped_task_fixture() -> Task {
+        Task {
+            id: "t1_0".into(),
+            url: "https://e.com/a.bin".into(),
+            title: "a.bin".into(),
+            thumbnail: None,
+            duration: None,
+            format_id: "direct".into(),
+            quality_label: "4 线程".into(),
+            has_audio: false,
+            best_audio_format: None,
+            state: TaskState::Downloading,
+            progress: 42.5,
+            downloaded_bytes: 425,
+            total_bytes: Some(1000),
+            speed: Some("1.2 MiB/s".into()),
+            eta: Some("00:07".into()),
+            output_path: None,
+            error: None,
+            file_missing: false,
+            created_at: crate::commands::now_ms(),
+            kind: "direct".into(),
+            threads: 4,
+            save_dir: None,
+            expected_ext: Some("bin".into()),
+        }
+    }
+
+    #[test]
+    fn apply_stopped_state_canceled_clears_transient_fields() {
+        let mut t = stopped_task_fixture();
+        let token = CancelToken::new();
+        token.cancel();
+        let (state, _msg, (prog, bytes, total)) = apply_stopped_state(&mut t, &token);
+        assert_eq!(state, TaskState::Canceled);
+        assert_eq!((prog, bytes, total), (0.0, 0, None), "事件快照同步清零");
+        assert_eq!(t.progress, 0.0);
+        assert_eq!(t.downloaded_bytes, 0);
+        assert!(t.total_bytes.is_none());
+        assert!(t.speed.is_none());
+        assert!(t.eta.is_none());
+        assert!(t.error.is_some(), "错误文案必须带「已取消」");
+    }
+
+    #[test]
+    fn apply_stopped_state_paused_keeps_everything() {
+        let mut t = stopped_task_fixture();
+        let token = CancelToken::new();
+        token.pause();
+        let (state, _msg, (prog, bytes, total)) = apply_stopped_state(&mut t, &token);
+        assert_eq!(state, TaskState::Paused);
+        assert_eq!((prog, bytes, total), (42.5, 425, Some(1000)), "暂停快照原样");
+        assert_eq!(t.progress, 42.5);
+        assert_eq!(t.downloaded_bytes, 425);
+        assert_eq!(t.total_bytes, Some(1000));
+        // speed/eta 保留与否不属本函数契约（worker 停止时前端按 live 判定隐藏），
+        // 但进度/字节/总量是断点语义的载体，必须原样。
+    }
+
     /// P2-3：URL 字面量闸的拒绝文案必须算「 hopeless」——地址本身违规，
     /// 换 Cookie 重试不会改变判定，两轮重试纯属浪费。
     #[test]

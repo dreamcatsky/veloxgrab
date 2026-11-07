@@ -53,6 +53,15 @@ if (!portFromJs || !portFromRs || portFromJs !== portFromRs) {
   );
 }
 
+// ---- 前端脚本加载顺序 ----
+// app.js 解构 window.VeloxGrabCore（core.js 挂的全局），core.js 必须先加载。
+const index = read("src/index.html");
+const corePos = index.indexOf('<script src="core.js">');
+const appPos = index.indexOf('<script src="app.js">');
+if (corePos < 0 || appPos < 0 || corePos > appPos) {
+  problems.push("src/index.html: core.js 必须在 app.js 之前加载（app.js 解构 VeloxGrabCore）");
+}
+
 if (problems.length) {
   console.error("一致性校验失败：");
   for (const p of problems) console.error(`  - ${p}`);

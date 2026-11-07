@@ -63,12 +63,18 @@ jobs:
       - name: node --check
         run: |
           node --check src/app.js
+          node --check src/core.js
           node --check src/progress.js
           node --check src/theme.js
           node --check extension/background.js
           node --check extension/popup.js
           node --check make-icon.js
           node --check scripts/check-consistency.mjs
+
+      # 前端纯函数（core.js）的行为测试：app.js 的解构别名保证生产路径用的
+      # 就是这些函数，锁的是真实现。
+      - name: node --test
+        run: node --test tests/core.test.mjs
 
       # 版本号（4 处）与桥端口（2 处）分散在手工维护的文件里，漏改一处
       # 就是「扩展版本 ≠ 桌面版本」的 403 或扩展连错端口。合并前挡住。
