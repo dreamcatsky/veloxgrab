@@ -31,13 +31,17 @@
 //!    带 Origin（预检也带），所以默认拒绝不伤正常路径。
 //! 2. 请求体上限 64 KiB、请求头上限 8 KiB，防止本机程序用超长行把内存吃满。
 //! 3. 只解析 `/add` 与 `/ping` 两个路径，其它一律 404——桥不是通用 RPC。
-//! 4. **共享 token 门禁**（`bridge-token.txt`，随安装包同时打进扩展目录与
-//!    程序资源目录）：请求必须带 `X-VeloxGrab-Token` 头。Origin 只认 scheme
-//!    前缀，意味着**任何一个已装扩展**（哪怕零权限、被供应链投毒）都能通过
-//!    门禁驱动下载器；token 把这道闸收紧到「持有本程序分发的扩展」。本机
-//!    进程读得到安装目录里的 token 文件——那本来就在威胁模型之外（能读写
-//!    你磁盘的进程不需要经过桥）。开发构建没有资源目录，token 缺席时**不
-//!    启用**门禁（fail-open）并打警告——否则 `tauri dev` 全靠手搓请求调试。
+//! 4. **每安装 token 门禁**（`bridge-token.txt`）：请求必须带 `X-VeloxGrab-Token`
+//!    头。Origin 只认 scheme 前缀，意味着任何已装扩展都能过 Origin 这关；token
+//!    挡的是「照抄公开值就能驱动下载器」的抄写型扩展——安装包/仓库里那份
+//!    token 只是**公开引导值**，首次运行即被替换成每安装随机值（见
+//!    `ensure_install_token`），副本存配置目录（安装器覆盖不到）：应用自更新
+//!    用公开值覆盖扩展目录后据此**还原**而不是再随机一次，已运行的扩展 SW
+//!    缓存的旧 token 继续有效，升级零摩擦。其它扩展的沙箱读不到本程序的
+//!    扩展目录与配置目录，「从 GitHub 抄 token」从此不成立。本机进程仍读得到
+//!    这两处文件——那本来就在威胁模型之外（能读写你磁盘的进程不需要经过
+//!    桥）。开发构建资源目录下没有扩展目录，token 缺席时**不启用**门禁
+//!    （fail-open）并打警告——否则 `tauri dev` 全靠手搓请求调试。
 //! 5. `Host` 头必须精确等于 `127.0.0.1:58943`：把 DNS rebinding 从「靠
 //!    Origin 门禁间接覆盖」变成结构性不可能（rebinding 页面解析出的 evil.com
 //!    会作为 Host 出现，直接 403）。
@@ -48,8 +52,7 @@
 //! 残余风险（如实声明）：固定端口 + 无挑战应答，意味着本机恶意进程仍可
 //! 抢先 bind 58943 冒充桥收割扩展上发的 URL——token 在请求里，挡不住「接收」，
 //! 只挡「驱动」。彻底解法要 Native Messaging（扩展 ID 固定）或端口协商文件，
-//! 成本见文件头，暂不做。
-//!
+//! 成本见文件头，暂不做。//!
 //! curl 手工测试要带 `-H "Origin: chrome-extension://manual-test"`；能连上
 //! 127.0.0.1 的本机进程本来就能直接拉 `veloxgrab://`，这条闸防的是**浏览器
 //! 里的网页**，不是本机进程。
@@ -130,26 +133,168 @@ const ADD_RATE_WINDOW: Duration = Duration::from_secs(10);
 const ADD_RATE_MAX: usize = 20;
 static ADD_HITS: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
 
-/// 随安装包分发的共享 token（扩展目录与程序资源目录各一份同样的文件）。
+/// 随安装 token 的权威副本位置（配置目录，安装器覆盖不到）。
 ///
-/// 读到并缓存：`Some(token)` = 启用门禁；`None` = 开发构建（资源目录里没有
-/// 这个文件），门禁不启用。OnceLock 缓存避免每个请求都读盘。
-static BRIDGE_TOKEN: OnceLock<Option<String>> = OnceLock::new();
+/// 放配置目录而不是安装目录是轮换方案的关键：应用自更新会用安装包里的
+/// **公开引导值**覆盖扩展目录与资源目录下的 bridge-token.txt。若权威值也在
+/// 安装目录，更新后扩展继续拿公开值——轮换等于没做。权威值在配置目录，
+/// 「更新后公开值回归扩展目录」就能被识别并用权威值还原（见
+/// `ensure_install_token` 的写入分支）。
+fn install_token_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("VeloxGrab").join("bridge-token.txt"))
+}
 
-fn load_bridge_token() -> Option<String> {
-    let dir = crate::ytdlp::resource_dir()?;
-    let p = dir.join("extension").join("bridge-token.txt");
-    std::fs::read_to_string(p)
-        .ok()
+/// 资源目录里的随包 token（公开引导值）。开发构建没有资源目录 → None。
+fn bundled_token_path() -> Option<std::path::PathBuf> {
+    crate::ytdlp::resource_dir().map(|d| d.join("extension").join("bridge-token.txt"))
+}
+
+/// 32 字节加密随机数 → 64 位十六进制。BCryptGenRandom 走系统首选 RNG
+/// （BCRYPT_USE_SYSTEM_PREFERRED_RNG），无需打开算法句柄；与 update.rs 的
+/// SHA-256 同属 BCrypt，不新增特性面。
+#[cfg(windows)]
+fn random_token() -> Option<String> {
+    use windows_sys::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+    let mut bytes = [0u8; 32];
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return None;
+    }
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    Some(s)
+}
+
+#[cfg(not(windows))]
+fn random_token() -> Option<String> {
+    // 本程序只发布 Windows 构建；非 Windows 平台门禁本就 fail-open
+    //（资源目录缺席），这里返回 None 走同一条降级路径。
+    None
+}
+
+/// 确保生效 token 存在并写回扩展目录，返回当前生效值。
+///
+/// 判定读三个位置，优先级：配置目录（权威）> 扩展目录现值 > 随包引导值 > 新随机。
+/// 分支语义：
+/// - 权威值存在：扩展目录里的值若与它不同（安装包覆盖、用户手改），用权威值
+///   **还原**扩展目录——扩展 SW 每次醒来重读文件，缓存值只在 SW 生命周期内，
+///   还原后下一轮 SW 就同步了。已装扩展若正持有被覆盖掉的旧值（极小窗口），
+///   会收到一次 403 并由前端提示「刷新扩展」，随后自愈。
+/// - 权威值缺席：**沿用扩展目录现值**（含随包公开值）并提升为权威——不强行
+///   换新，避免「重装系统丢配置目录」之外的场景里已加载扩展的缓存失效。
+/// - 两处都空：生成随机值，同时写权威与扩展目录。
+///
+/// 只在 token 门禁首次求值时调用一次（OnceLock），之后全部走内存缓存。
+#[cfg(windows)]
+fn ensure_install_token() -> Option<String> {
+    fn read_trim(p: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+    fn write_atomic(p: &std::path::Path, s: &str) {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = p.with_extension("txt.tmp");
+        if std::fs::write(&tmp, s).is_ok() {
+            let _ = std::fs::rename(&tmp, p);
+        }
+    }
+
+    let authority = install_token_path().and_then(|p| read_trim(&p));
+    let installed = bundled_token_path().and_then(|p| read_trim(&p));
+
+    // 判定拆成纯函数（decision_for）；文件副作用（还原/提升/新写）只按它的
+    // 指示执行，便于单测三种分支的判定语义。
+    let action = resolve_token_action(authority.as_deref(), installed.as_deref());
+    let token = match action {
+        TokenAction::KeepAuthority => {
+            // 权威值存在：扩展目录与它不一致就用权威值还原（安装包把公开值
+            // 写回去是每次自更新都会发生的事，还原让扩展目录与生效值重新一致）。
+            if installed.as_deref() != authority.as_deref() {
+                if let Some(p) = bundled_token_path() {
+                    write_atomic(&p, authority.as_deref().unwrap_or_default());
+                }
+            }
+            authority.unwrap()
+        }
+        TokenAction::PromoteInstalled => {
+            // 权威缺席：现值（可能是公开引导值）提升为权威，写入配置目录。
+            // 从公开值切到「公开值即权威」对请求方无感；真正的随机轮换发生在
+            // 下一次配置目录被清且扩展目录也被覆盖时——那已经是全新安装。
+            let t = installed.unwrap();
+            if let Some(p) = install_token_path() {
+                write_atomic(&p, &t);
+            }
+            t
+        }
+        TokenAction::GenerateFresh => {
+            // 全新环境：生成每安装随机值，同时落权威与扩展目录。
+            let Some(t) = random_token() else {
+                eprintln!("[bridge] 随机 token 生成失败，token 门禁未启用");
+                return None;
+            };
+            if let Some(p) = install_token_path() {
+                write_atomic(&p, &t);
+            }
+            if let Some(p) = bundled_token_path() {
+                write_atomic(&p, &t);
+            }
+            t
+        }
+    };
+    Some(token)
+}
+
+/// token 轮换判定的三种动作（判定与文件 IO 分离，纯函数可单测）。
+#[derive(Debug, PartialEq, Eq)]
+enum TokenAction {
+    /// 权威值生效；调用方负责把扩展目录还原成权威值。
+    KeepAuthority,
+    /// 扩展目录现值提升为权威（权威缺席、引导值/现值在场）。
+    PromoteInstalled,
+    /// 两处皆空：生成每安装随机值。
+    GenerateFresh,
+}
+
+fn resolve_token_action(authority: Option<&str>, installed: Option<&str>) -> TokenAction {
+    match (
+        authority.map(str::trim).filter(|s| !s.is_empty()),
+        installed.map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (Some(_), _) => TokenAction::KeepAuthority,
+        (None, Some(_)) => TokenAction::PromoteInstalled,
+        (None, None) => TokenAction::GenerateFresh,
+    }
+}
+
+#[cfg(not(windows))]
+fn ensure_install_token() -> Option<String> {
+    bundled_token_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-/// 当前生效的 token；None 表示门禁未启用（开发构建）。
+/// 随安装 token 的内存缓存：首次求值时经 `ensure_install_token` 建立或轮换。
+static BRIDGE_TOKEN: OnceLock<Option<String>> = OnceLock::new();
+
+/// 当前生效的 token；None 表示门禁未启用（开发构建 / 生成失败）。
 fn bridge_token() -> Option<&'static str> {
     BRIDGE_TOKEN
         .get_or_init(|| {
-            let t = load_bridge_token();
+            let t = ensure_install_token();
             if t.is_none() {
                 eprintln!("[bridge] 未找到 extension/bridge-token.txt，token 门禁未启用（开发构建属正常现象）");
             }
@@ -296,7 +441,7 @@ fn handle(mut stream: TcpStream, app: tauri::AppHandle) {
         persist_seen();
     }
 
-    // 共享 token 门禁（开发构建 token 为 None 时跳过）。
+    // 每安装 token 门禁（开发构建 token 为 None 时跳过）。
     if let Some(expected) = bridge_token() {
         if req.token.as_deref() != Some(expected) {
             let _ = respond(
@@ -525,6 +670,43 @@ fn origin_is_extension(origin: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2-2：token 轮换判定。权威值存在 → 沿用（还原扩展目录由调用方执行）；
+    /// 权威缺席但引导/现值在场 → 提升为权威；两处皆空 → 生成新随机值。
+    /// 空/纯空白输入与缺席同义。
+    #[test]
+    fn token_rotation_decision_prefers_authority() {
+        use TokenAction::{GenerateFresh, KeepAuthority, PromoteInstalled};
+        assert_eq!(
+            resolve_token_action(Some("a"), Some("b")),
+            KeepAuthority,
+            "权威优先于扩展目录现值"
+        );
+        assert_eq!(resolve_token_action(Some("a"), None), KeepAuthority);
+        // 权威值是空白串视为缺席，走提升分支
+        assert_eq!(
+            resolve_token_action(Some("   "), Some("bundled")),
+            PromoteInstalled
+        );
+        assert_eq!(
+            resolve_token_action(None, Some("bundled-or-installed")),
+            PromoteInstalled
+        );
+        assert_eq!(resolve_token_action(None, None), GenerateFresh);
+        assert_eq!(resolve_token_action(None, Some("")), GenerateFresh);
+    }
+
+    /// 每安装 token 必须是 64 位十六进制（32 随机字节），两次生成不重复。
+    /// 非 Windows 平台 random_token 恒 None，本测试随 cfg(windows) 跳过。
+    #[test]
+    #[cfg(windows)]
+    fn random_token_is_64_hex_and_unique() {
+        let a = random_token().expect("Windows 上 BCryptGenRandom 应当可用");
+        let b = random_token().expect("第二次生成");
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "两次随机不得相同");
+    }
 
     #[test]
     fn bridge_gate_requires_extension_origin() {

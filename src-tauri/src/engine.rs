@@ -745,6 +745,11 @@ fn is_hopeless_error(msg: &str) -> bool {
         "Not Found",
         "Unsupported URL",
         "is not a valid URL",
+        // URL 字面量闸（url_target_guarded）的拒绝文案：地址本身违规，
+        // 换 Cookie 策略不会改变判定
+        "下载地址指向链路本地/保留地址",
+        "下载地址协议不支持",
+        "下载地址不是合法 URL",
         "No space left",
         "os error 112", // Windows: ERROR_DISK_FULL
         "磁盘空间",
@@ -764,6 +769,10 @@ async fn run_download_inner(
 ) -> Result<Option<String>, String> {
     use tauri::Emitter;
 
+    // 与 probe 同一道字面量闸（纵深防御）：任务的 url 可能来自 history.json
+    // 回灌（威胁模型里的不可信输入），run_download 是真正把 URL 交给
+    // yt-dlp 的那一点，不能只依赖入队入口的检查。
+    crate::direct::url_target_guarded(&task.url)?;
     let ytdlp = resolve_ytdlp()?;
     // 每个任务的保存目录可能不同（见 Task::save_dir）
     let dir = resolve_task_dir(&settings, &task)?;
@@ -1505,6 +1514,18 @@ use std::os::windows::process::CommandExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2-3：URL 字面量闸的拒绝文案必须算「 hopeless」——地址本身违规，
+    /// 换 Cookie 重试不会改变判定，两轮重试纯属浪费。
+    #[test]
+    fn gate_rejections_are_hopeless_errors() {
+        assert!(is_hopeless_error("下载地址指向链路本地/保留地址"));
+        assert!(is_hopeless_error("下载地址协议不支持: file"));
+        assert!(is_hopeless_error("下载地址不是合法 URL"));
+        // 对照：普通 yt-dlp 网络错误不算（带 Cookie 重试可能有意义）
+        assert!(!is_hopeless_error("HTTP Error 403: Forbidden"));
+        assert!(!is_hopeless_error("Sign in to confirm you're not a bot"));
+    }
 
     #[test]
     fn parse_size_handles_estimate_prefix() {

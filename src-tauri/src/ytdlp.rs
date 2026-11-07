@@ -491,6 +491,11 @@ async fn run_probe(
 /// 早期版本无条件带 Cookie，一旦浏览器指纹保护让 yt-dlp 读不了 Cookie 库，
 /// 连公开视频都会解析失败，表现为「视频无法解析下载地址」。
 pub async fn probe(url: &str, settings: &Settings) -> Result<MediaInfo, String> {
+    // 与直链路径同一道字面量闸：probe_url / probe_auto 的入口只做了 http(s)
+    // 字符串前缀检查，`https://[fe80::1]/`、`http://0.0.0.0/` 这类「前缀合法、
+    // host 违规」的写法会漏过去，而 yt-dlp 会跟随重定向到任意目标。第一跳
+    // 就拦（direct::url_target_guarded 同时拒绝 file:// 等非 http(s) scheme）。
+    crate::direct::url_target_guarded(url)?;
     let ytdlp = resolve_ytdlp()?;
 
     // 两轮（不带/带 Cookie）共享一个总预算：旧实现各 90 秒，前端「解析」
@@ -646,6 +651,32 @@ fn parse_height(res: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2-3：probe 入口的字面量闸。拒绝发生在 resolve_ytdlp 之前——
+    /// 元数据地址/非 http(s) scheme 不该把请求交给 yt-dlp，更不该等它跑完。
+    #[test]
+    fn probe_rejects_unsafe_targets_before_spawning_ytdlp() {
+        let settings = Settings::default();
+        // 云元数据地址：直接拒绝，错误来自 url_target_guarded 而不是 yt-dlp
+        let err = tokio_test_block_on(probe("http://169.254.169.254/latest/meta-data/", &settings))
+            .unwrap_err();
+        assert!(err.contains("链路本地/保留地址"), "实际错误: {err}");
+        // file:// 同拒（直接闸的 scheme 检查）
+        let err = tokio_test_block_on(probe("file:///C:/Windows/win.ini", &settings)).unwrap_err();
+        assert!(err.contains("协议不支持"), "实际错误: {err}");
+        // 合法 http URL 会走到 resolve_ytdlp：CI/测试环境不保证有 yt-dlp，
+        // 错误必须是「未找到 yt-dlp」而不是 panic 或闸门拒绝
+        let err = tokio_test_block_on(probe("https://example.com/v", &settings)).unwrap_err();
+        assert!(err.contains("yt-dlp"), "实际错误: {err}");
+    }
+
+    fn tokio_test_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
 
     #[test]
     fn parse_height_handles_wxh_and_p_suffix() {
