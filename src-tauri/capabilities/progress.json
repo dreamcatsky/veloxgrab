@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "progress-window",
+  "description": "监视窗自身需要的窗口控制权限。core:window:default 只含只读权限，不含 close——progress.js 的 × 按钮调 getCurrentWindow().close() 会被 ACL 静默拒绝，窗口关不掉。只授 close、只授 progress 窗口：主窗口的关闭必须继续走 window_control 命令（close_mode 的询问/托盘/退出语义在那里），不能借这条 capability 让前端绕过它。",
+  "windows": ["progress"],
+  "permissions": ["core:window:allow-close"]
+}

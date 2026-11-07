@@ -106,10 +106,17 @@
     }
   }
 
-  $("pwClose").addEventListener("click", async () => {
-    try {
-      await window.__TAURI__.window.getCurrentWindow().close();
-    } catch {}
+  $("pwClose").addEventListener("click", () => {
+    // close 走的是 core:window|close IPC，需要 capabilities 里的
+    // core:window:allow-close（见 progress-window capability）。权限缺失时
+    // 这里的 promise 会 reject——静默吞掉的话，症状只是「点了没反应」，
+    // 和权限被拒时一模一样，无法排查。
+    window.__TAURI__.window
+      .getCurrentWindow()
+      .close()
+      .catch((e) => {
+        document.body.textContent = "关闭监视窗失败：" + String(e);
+      });
   });
 
   if (listen) {
