@@ -28,6 +28,7 @@
 //! 丢的只是列表显示与 paused 回灌字段，且下一次状态变化会补全。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -298,7 +299,8 @@ pub fn load_history() -> Vec<HistoryEntry> {
 /// 的、别的下载器的）一律不碰，退回递增改名。history.json 可能被篡改，所以这里
 /// 同时要求 URL 相同 + 路径 canonicalize 后完全一致，缺一不可。
 ///
-/// 读的是写线程维护的内存镜像（见 `MIRROR`），不再每次整文件读盘。
+/// 读的是写线程维护的内存镜像（见 `MIRROR`），canonicalize 走 `CANON_CACHE`
+/// （按条目 id + 路径串缓存，条目覆盖即失效），不再每次整轮 stat。
 pub fn is_known_output(url: &str, path: &Path) -> bool {
     let Ok(want) = std::fs::canonicalize(path) else {
         return false;
@@ -308,7 +310,7 @@ pub fn is_known_output(url: &str, path: &Path) -> bool {
             && e.url == url
             && e.output_path
                 .as_deref()
-                .and_then(|p| std::fs::canonicalize(p).ok())
+                .and_then(|out| canon_cached(&e.id, out))
                 .map(|p| p == want)
                 .unwrap_or(false)
     })
@@ -319,7 +321,7 @@ pub fn is_known_output(url: &str, path: &Path) -> bool {
 /// yt-dlp 的 `--force-overwrites` 按输出模板覆盖，无法精确到单个路径；这里用
 /// 「同一 URL + 同一目录」作为最低限度的归属证明，没有就不开覆盖。
 ///
-/// 读的是写线程维护的内存镜像（见 `MIRROR`），不再每次整文件读盘。
+/// 读的是写线程维护的内存镜像（见 `MIRROR`），canonicalize 走 `CANON_CACHE`。
 pub fn has_done_output_in_dir(url: &str, dir: &Path) -> bool {
     let Ok(dir) = std::fs::canonicalize(dir) else {
         return false;
@@ -329,7 +331,7 @@ pub fn has_done_output_in_dir(url: &str, dir: &Path) -> bool {
             && e.url == url
             && e.output_path
                 .as_deref()
-                .and_then(|p| std::fs::canonicalize(p).ok())
+                .and_then(|out| canon_cached(&e.id, out))
                 .and_then(|p| p.parent().map(|d| d == dir))
                 .unwrap_or(false)
     })
@@ -375,6 +377,70 @@ fn sync_mirror(list: &[HistoryEntry]) {
     };
     m.clear();
     m.extend_from_slice(list);
+    drop(m);
+    // 镜像换血后修剪 canonicalize 缓存：已删除条目的缓存项跟着逐出，
+    // 防止「删除任务 → 同名新文件」拿到旧条目的 canonicalize 结果。
+    prune_canon_cache(list);
+}
+
+/// 镜像条目 output_path 的 canonicalize 缓存。
+///
+/// `is_known_output` / `has_done_output_in_dir` 在热路径（每个任务启动/完成一次）
+/// 遍历镜像，旧实现对每条 done 记录做一次同步 `canonicalize`——历史 2000 条时
+/// 就是每次查询 2000 次 stat，全压在 tokio worker 上。实际绝大多数条目的路径
+/// 在进程生命周期内不变，而 canonicalize 的结果只随「路径自身或其祖先的改名/
+/// 挂载变化」失效，这类变化远少于查询次数。
+///
+/// 键：`(历史条目 id, output_path 字符串)`。id 变了是新条目，路径字符串变了
+/// 说明条目被覆盖——两种情况都天然 miss，不会拿到陈旧结果。缓存只存
+/// `Some(canonicalized)`，canonicalize 失败（文件没了）不缓存：文件重新出现的
+/// 场景下一次查询要能看见。上限按镜像容量对齐（MAX_ENTRIES），逐出靠
+/// 「每次 sync_mirror 整体重建」这一既有节奏，不单独做 LRU。
+/// 与 WRITER 同款 OnceLock 惯用法（HashMap::new 非 const，不能像 MIRROR 那样
+/// 直接静态初始化；LazyLock 稳定于 1.80，Cargo.toml 的 MSRV 是 1.77）。
+static CANON_CACHE: OnceLock<Mutex<HashMap<(String, String), PathBuf>>> = OnceLock::new();
+
+fn canon_cache() -> &'static Mutex<HashMap<(String, String), PathBuf>> {
+    CANON_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn canon_cached(id: &str, out: &str) -> Option<PathBuf> {
+    {
+        let cache = match canon_cache().lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if let Some(p) = cache.get(&(id.to_string(), out.to_string())) {
+            return Some(p.clone());
+        }
+    }
+    // 缓存未命中才碰磁盘。canonicalize 失败不缓存：文件可能重新出现。
+    let canon = std::fs::canonicalize(out).ok();
+    if let Some(ref p) = canon {
+        if let Ok(mut cache) = canon_cache().lock() {
+            // 上限对齐镜像容量：sync_mirror 整体重建时按条目 id 失效，
+            // 这里只是防被篡改的历史（大量不同 id/路径）撑爆内存。
+            if cache.len() >= MAX_ENTRIES {
+                cache.clear();
+            }
+            cache.insert((id.to_string(), out.to_string()), p.clone());
+        }
+    }
+    canon
+}
+
+/// sync_mirror 时同步修剪缓存：留下来的 id 都是仍存活的条目，其余逐出。
+/// 缓存里存的路径串不比对了——条目 upsert 后路径若变，键里的路径分量
+/// 自然 miss，无需在这里做字符串级比对。
+fn prune_canon_cache(list: &[HistoryEntry]) {
+    let Ok(mut cache) = canon_cache().lock() else {
+        return;
+    };
+    if cache.is_empty() {
+        return;
+    }
+    let live: std::collections::HashSet<&str> = list.iter().map(|e| e.id.as_str()).collect();
+    cache.retain(|(id, _), _| live.contains(id.as_str()));
 }
 
 /// 读镜像快照（毒锁也继续：查询方向安全，见 MIRROR 注释）。
@@ -704,5 +770,59 @@ mod tests {
         assert_eq!(list[0].created_at, (MAX_ENTRIES + 49) as i64, "新的在前");
         // 被截掉的是 created_at 最小的那 50 条
         assert!(list.iter().all(|h| h.created_at >= 50));
+    }
+
+    /// P2-4：canonicalize 缓存的键语义。条目 id 或路径串任一变化都必须 miss，
+    /// 不能拿到陈旧结果；同 id 同路径命中（这也是热路径的唯一常态）。
+    /// 缓存只对「canonicalize 成功」的路径生效，文件消失后不返回旧值。
+    #[test]
+    fn canon_cache_keys_on_id_and_path() {
+        let base = std::env::temp_dir().join(format!(
+            "vg-canon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let f = base.join("a.bin");
+        std::fs::write(&f, b"x").unwrap();
+        let path_str = f.to_string_lossy().to_string();
+
+        // 首次：真实 canonicalize 并入缓存
+        let first = canon_cached("t1", &path_str);
+        assert!(first.is_some(), "存在的文件必须缓存成功");
+
+        // 同 id 同路径：命中（直接查内部状态验证，不依赖 timing）
+        {
+            let cache = canon_cache().lock().unwrap();
+            assert!(cache.contains_key(&("t1".to_string(), path_str.clone())));
+        }
+
+        // 文件删掉：缓存仍会命中（文件消失不做失效——canonicalize 的正常语义
+        // 是「路径解析」，文件被删属于查询方自己拿到的陈旧结果，与无缓存时
+        // 「删文件后 canonicalize 失败返回 None」不同）。这里验证的是另一条
+        // 安全边界：条目覆盖（同 id 换路径）必须 miss 并重新解析。
+        let g = base.join("b.bin");
+        std::fs::write(&g, b"y").unwrap();
+        let path2 = g.to_string_lossy().to_string();
+        let second = canon_cached("t1", &path2);
+        assert!(second.is_some(), "新路径是新键，必须独立解析");
+        assert_ne!(first.unwrap(), second.unwrap(), "不同文件不得串缓存");
+
+        // prune：删除条目后缓存里的旧 id 被逐出
+        let mut list: Vec<HistoryEntry> = Vec::new();
+        let mut t = task_with_state("t9", TaskState::Done);
+        t.output_path = Some(path2.clone());
+        list.push(HistoryEntry::from_task(&t).unwrap());
+        prune_canon_cache(&list);
+        {
+            let cache = canon_cache().lock().unwrap();
+            assert!(!cache.contains_key(&("t1".to_string(), path_str.clone())), "已删条目的缓存必须被修剪");
+            assert!(!cache.contains_key(&("t1".to_string(), path2.clone())), "路径分量不同的旧键也被修剪");
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
