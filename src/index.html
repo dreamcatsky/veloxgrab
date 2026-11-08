@@ -225,6 +225,9 @@
     <section class="center">
       <!-- 任务表：表头与行用同一套 grid 模板，列才对得齐 -->
       <div id="taskView" class="center-view active">
+        <div class="list-tools">
+          <input id="taskSearch" type="search" data-i18n-ph="searchPh" placeholder="搜索名称 / 链接 / 路径…" spellcheck="false" />
+        </div>
         <div class="list-head" id="listHead">
           <label class="lh-check"><input id="selectAll" type="checkbox" /></label>
           <span data-i18n="colName">名称</span>
@@ -382,6 +385,29 @@
               <option value="quit" data-i18n="closeQuit">退出程序</option>
             </select>
           </label>
+
+          <label class="fld">
+            <span data-i18n="monitorSize">下载监视窗大小</span>
+            <select id="setMonitorSize">
+              <option value="s" data-i18n="monitorSizeS">小（196×92，只看数字）</option>
+              <option value="m" data-i18n="monitorSizeM">中（236×128，默认）</option>
+              <option value="l" data-i18n="monitorSizeL">大（288×168，全内容）</option>
+            </select>
+          </label>
+          <div class="nd-grid">
+            <label class="fld checkbox">
+              <input id="setMonName" type="checkbox" />
+              <span data-i18n="monName">监视窗显示任务名</span>
+            </label>
+            <label class="fld checkbox">
+              <input id="setMonSub" type="checkbox" />
+              <span data-i18n="monSub">监视窗显示副行（速度/总量说明）</span>
+            </label>
+            <label class="fld checkbox">
+              <input id="setMonBar" type="checkbox" />
+              <span data-i18n="monBar">监视窗显示进度条</span>
+            </label>
+          </div>
           </section>
 
           <section class="set-card">
@@ -544,6 +570,17 @@
           </div>
         </div>
 
+        <div class="nd-grid">
+          <div class="fmt-head nd-row">
+            <label><span data-i18n="ndStartAt">定时开始</span> <em class="dim" data-i18n="ndStartAtHint">（可选，留空立即下载）</em></label>
+            <input id="ndStartAt" type="datetime-local" spellcheck="false" />
+          </div>
+          <div class="fmt-head nd-row">
+            <label><span data-i18n="ndSha">预期 SHA-256</span> <em class="dim" data-i18n="ndShaHint">（可选，64 位 hex）</em></label>
+            <input id="ndSha" type="text" spellcheck="false" />
+          </div>
+        </div>
+
         <div class="actions">
           <button id="ndStart" class="primary"><span data-i18n="startDownload">开始下载</span></button>
           <span class="dim" data-i18n="ndHint">不解析直接下载，适合已知地址的直链</span>
@@ -696,6 +733,14 @@
           <span data-i18n="threadsLabel">下载线程数</span>
           <select id="editThreads" title="修改线程数会使已有的分块断点失效，恢复将从已下部分重新分段"></select>
         </label>
+        <label class="fld">
+          <span data-i18n="editRate">本任务限速（KB/s）</span>
+          <input id="editRate" type="number" min="0" step="any" placeholder="留空 = 跟随全局设置" spellcheck="false" />
+        </label>
+        <label class="fld">
+          <span data-i18n="editSha">预期 SHA-256（可选）</span>
+          <input id="editSha" type="text" spellcheck="false" placeholder="64 位十六进制，下载完成后校验" />
+        </label>
         <small class="dim" data-i18n="editHint">只能编辑排队、暂停或失败的任务；修改文件名、保存目录或线程数后，已有断点不会迁移。</small>
       </div>
       <div class="actions dialog-actions">
@@ -831,6 +876,7 @@
     <button class="ctx-item" data-ctx="resume"><span data-i18n="cxResume">继续</span></button>
     <button class="ctx-item" data-ctx="redo"><span data-i18n="cxRedo">重新下载</span></button>
     <button class="ctx-item" data-ctx="edit"><span data-i18n="cxEdit">编辑…</span></button>
+    <button class="ctx-item" data-ctx="bump"><span data-i18n="cxBump">在队列中置顶</span></button>
     <div class="ctx-sep"></div>
     <button class="ctx-item danger" data-ctx="remove"><span data-i18n="cxRemove">移除任务</span></button>
     <button class="ctx-item danger" data-ctx="removeWithFile">

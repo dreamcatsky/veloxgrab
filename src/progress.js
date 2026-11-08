@@ -11,9 +11,16 @@
     return;
   }
 
-  // 主题跟随主窗口
+  // 主题跟随主窗口；监视窗的内容行/尺寸偏好也在这里首帧应用——
+  // monitor.rs 每次浮出时会用窗口 eval 重放同一组 data 属性，两边一致；
+  // 这里兜的是「窗口刚创建、eval 还没跑」的首帧，避免内容闪现。
   invoke("get_settings")
-    .then((s) => window.VeloxGrabTheme?.apply(s.theme || "system"))
+    .then((s) => {
+      window.VeloxGrabTheme?.apply(s.theme || "system");
+      document.body.dataset.monName = s.monitor_show_name ? "1" : "0";
+      document.body.dataset.monSub = s.monitor_show_sub ? "1" : "0";
+      document.body.dataset.monBar = s.monitor_show_bar ? "1" : "0";
+    })
     .catch(() => {});
 
   const $ = (id) => document.getElementById(id);

@@ -299,6 +299,21 @@
     cxResume: "Resume",
     cxRedo: "Redownload",
     cxEdit: "Edit…",
+    cxBump: "Move to top of queue",
+    editRate: "Speed limit for this task (KB/s)",
+    editSha: "Expected SHA-256 (optional)",
+    searchPh: "Search name / URL / path…",
+    monitorSize: "Monitor window size",
+    monitorSizeS: "Small (196×92, numbers only)",
+    monitorSizeM: "Medium (236×128, default)",
+    monitorSizeL: "Large (288×168, full content)",
+    monName: "Monitor: show task name",
+    monSub: "Monitor: show sub line (speed/total)",
+    monBar: "Monitor: show progress bar",
+    ndStartAt: "Start at",
+    ndStartAtHint: "(optional; empty = start now)",
+    ndSha: "Expected SHA-256",
+    ndShaHint: "(optional, 64 hex chars)",
     cxRemove: "Remove task",
     cxRemoveFile: "Delete task and file",
     editTitle: "Edit task",
@@ -621,6 +636,20 @@
       return;
     }
 
+    // 定时开始：datetime-local → Unix 毫秒；空/过去 = 立即（后端同样钳）
+    let startAt = null;
+    const sa = $("ndStartAt").value;
+    if (sa) {
+      const ms = new Date(sa).getTime();
+      if (Number.isFinite(ms) && ms > Date.now()) startAt = ms;
+    }
+    // SHA-256 预期：给了就先做形状校验，省一次 IPC 往返
+    const sha = $("ndSha").value.trim();
+    if (sha && !/^[0-9a-fA-F]{64}$/.test(sha)) {
+      toast("SHA-256 必须是 64 位十六进制", true);
+      return;
+    }
+
     const btn = $("ndStart");
     btn.disabled = true;
     try {
@@ -630,11 +659,15 @@
           filename: $("ndFilename").value.trim() || null,
           threads: Number($("ndThreads").value || 1),
           save_dir: $("ndDir").value.trim() || null,
+          start_at: startAt,
+          sha256: sha || null,
         },
       });
       // 建完把地址清掉，方便连续粘下一个
       $("ndUrl").value = "";
       $("ndFilename").value = "";
+      $("ndStartAt").value = "";
+      $("ndSha").value = "";
       onDownloadAccepted();
     } catch (e) {
       toast(String(e), true);
@@ -819,6 +852,9 @@
     $("editDir").value = task.save_dir || "";
     $("editDir").placeholder =
       (appSettings && appSettings.download_dir) || "默认下载目录";
+    // 任务级限速/校验预期：None = 跟随全局（输入框留空）
+    $("editRate").value = typeof task.rate_kb === "number" ? task.rate_kb : "";
+    $("editSha").value = task.sha256 || "";
     const direct = task.kind === "direct";
     $("editThreadsRow").classList.toggle("hidden", !direct);
     if (direct) {
@@ -843,8 +879,16 @@
     const title = $("editName").value.trim();
     if (!title) return toast("文件名不能为空", true);
     const dir = $("editDir").value.trim();
+    // SHA-256：空 = 清除；给了就必须是 64 位 hex
+    const sha = $("editSha").value.trim();
+    if (sha && !/^[0-9a-fA-F]{64}$/.test(sha)) {
+      return toast("SHA-256 必须是 64 位十六进制", true);
+    }
+    const rateRaw = $("editRate").value.trim();
+    const rateKb = rateRaw === "" ? null : Math.max(0, Number(rateRaw) || 0);
     // 改目录 / 文件名 / 线程数都会让断点失效：临时文件与分段布局分别绑在
     // 「最终路径」和 .veloxgrab-meta 上，换任何一个都只能从头重下。
+    // 限速与校验预期是元数据，不影响断点。
     const dirChanged = dir !== (task.save_dir || "").trim();
     const titleChanged = title !== (task.title || "").trim();
     const threadsChanged =
@@ -862,7 +906,7 @@
       );
       if (!ok) return;
     }
-    const args = { id: task.id, title, save_dir: dir };
+    const args = { id: task.id, title, save_dir: dir, rate_kb: rateKb, sha256: sha || null };
     if (task.kind === "direct") {
       args.threads = Number($("editThreads").value) || 0;
     }
@@ -920,6 +964,7 @@
       ["queued", "paused", "failed"].includes(task.state)
     );
     setEnabled("remove", true);
+    setEnabled("bump", task.state === "queued");
     // 「删除任务和文件」只在主目标是已完成且有成品时可用：其余情况删无可删，
     // 灰掉比点了弹「没有可删的文件」更清楚。
     setEnabled("removeWithFile", done);
@@ -936,6 +981,24 @@
 
   // 双击行 = 打开文件（IDM 习惯）。只对已完成且有实物（未被删）的任务生效；
   // 其余状态双击不做任何事，避免误触发。
+  // 搜索框：输入即过滤（输入防抖 150ms，避免每个字符一次全量重建）；
+  // Esc 清空（全局 Esc 分支之外单独挂，输入框里的 Esc 不抢弹窗逻辑）。
+  let searchTimer = null;
+  $("taskSearch").addEventListener("input", (e) => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      searchQuery = e.target.value.trim().toLowerCase();
+      refreshTasks();
+    }, 150);
+  });
+  $("taskSearch").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.target.value = "";
+      searchQuery = "";
+      refreshTasks();
+    }
+  });
+
   $("taskList").addEventListener("dblclick", (e) => {
     if (e.target.closest(".task-check")) return;
     const row = e.target.closest(".task-row");
@@ -1008,6 +1071,11 @@
         refreshTasks();
       } else if (action === "edit") {
         openEditDialog(main);
+      } else if (action === "bump") {
+        // 只对「还在队列里」的任务有效；后端返回实际挪动数
+        const n = await invoke("bump_tasks", { args: { ids: picked.map((t) => t.id) } });
+        toast(n > 0 ? `已把 ${n} 个任务挪到队列最前` : "选中任务不在队列中（运行中或已结束）");
+        refreshTasks();
       } else if (action === "remove") {
         const ids = picked.map((t) => t.id);
         const ok = confirm(
@@ -1147,7 +1215,21 @@
 
   // 当前视图是否接受这条任务。分类项与状态项是两套维度，
   // 但都作用在同一张表上，所以用同一个 currentView 决定。
+  // 搜索框：匹配名称 / URL / 输出路径（大小写不敏感的子串）。空串 = 不过滤。
+  // 与视图过滤是 AND 关系；清空后立即恢复当前视图的全集。
+  let searchQuery = "";
+  function matchesSearch(t) {
+    if (!searchQuery) return true;
+    const q = searchQuery;
+    return (
+      (t.title || "").toLowerCase().includes(q) ||
+      (t.url || "").toLowerCase().includes(q) ||
+      (t.output_path || "").toLowerCase().includes(q)
+    );
+  }
+
   function matchView(t) {
+    if (!matchesSearch(t)) return false;
     switch (currentView) {
       case "active":
         return t.state !== "done" && t.state !== "canceled";
@@ -1542,6 +1624,11 @@
     $("setClipboardWatch").checked = s.clipboard_watch ?? false;
     $("setNotifyComplete").checked = s.notify_on_complete ?? true;
     $("setCloseMode").value = s.close_mode || "background";
+    // 监视窗偏好：尺寸 + 内容行（旧配置没有这些字段时回落到默认档）
+    $("setMonitorSize").value = s.monitor_size || "m";
+    $("setMonName").checked = s.monitor_show_name ?? true;
+    $("setMonSub").checked = s.monitor_show_sub ?? true;
+    $("setMonBar").checked = s.monitor_show_bar ?? true;
     $("setBrowser").value = s.cookies_from_browser || "none";
     $("setCookiesFile").value = s.cookies_file || "";
     $("setProxyEnabled").checked = !!s.proxy_enabled;
@@ -1594,6 +1681,10 @@
       clipboard_watch: $("setClipboardWatch").checked,
       notify_on_complete: $("setNotifyComplete").checked,
       close_mode: $("setCloseMode").value,
+      monitor_size: $("setMonitorSize").value || "m",
+      monitor_show_name: $("setMonName").checked,
+      monitor_show_sub: $("setMonSub").checked,
+      monitor_show_bar: $("setMonBar").checked,
       proxy_enabled: $("setProxyEnabled").checked,
       proxy_type: $("setProxyType").value,
       proxy_host: $("setProxyHost").value.trim(),

@@ -43,6 +43,7 @@ fn main() {
         4,
         false,
         cancel.clone(),
+        None, // sha256
         move |p| {
             s1.store(p.downloaded, Ordering::Relaxed);
         },
@@ -86,6 +87,7 @@ fn main() {
         4,
         false,
         cancel2.clone(),
+        None, // sha256
         move |p| {
             // 记录首次回调的值：它就是续传起点
             let _ = fr.compare_exchange(

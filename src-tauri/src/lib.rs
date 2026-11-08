@@ -8,6 +8,8 @@ pub mod dpapi;
 pub mod direct;
 pub mod disk;
 pub mod engine;
+pub mod ftp;
+pub mod hash;
 pub mod history;
 pub mod notify;
 pub mod plan;
@@ -214,6 +216,9 @@ pub fn run() {
             // 历史模块要能触达用户（损坏重置等事件经它 emit），启动时把句柄给它
             crate::history::set_app_handle(app.handle().clone());
 
+            // 定时开始观察者：到点唤醒队列泵（无定时任务时是 30 秒一次的轻心跳）
+            commands::spawn_start_at_watcher(app.handle().clone());
+
             // 托盘图标：关窗口缩到托盘，后台继续下载。
             tray::setup(app.handle());
 
@@ -304,6 +309,7 @@ pub fn run() {
             commands::cancel_task,
             commands::remove_task,
             commands::clear_finished,
+            commands::bump_tasks,
             commands::health_check,
             commands::open_extension_dir,
             commands::extension_installed,

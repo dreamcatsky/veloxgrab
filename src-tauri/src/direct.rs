@@ -178,7 +178,8 @@ pub(crate) fn url_target_guarded(u: &str) -> Result<(), String> {
         Err(_) => return Err("下载地址不是合法 URL".into()),
     };
     let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
+    // ftp:// 走独立的最小 FTP 客户端（ftp.rs），host 校验同一套字面量规则
+    if scheme != "http" && scheme != "https" && scheme != "ftp" {
         return Err(format!("下载地址协议不支持: {scheme}"));
     }
     if let Some(host) = parsed.host_str() {
@@ -1230,6 +1231,8 @@ pub async fn download_direct(
     // 同名文件是否允许覆盖（仍会校验「同一 URL 的本程序产物」）
     overwrite: bool,
     cancel: Arc<AtomicBool>,
+    // 完成前的 SHA-256 校验预期（None = 不校验）
+    sha256: Option<&str>,
     on_progress: impl Fn(DirectProgress) + Send + Sync + 'static,
     net: &NetCfg,
 ) -> Result<PathBuf, String> {
@@ -1589,6 +1592,10 @@ pub async fn download_direct(
     }
 
     PartMeta::remove(&target);
+    // SHA-256 完整性校验在改名**之前**（任务声明了摘要时）：失败时临时
+    // 文件保留原样供人工比对字节，不以「成功」的名义落成品名。校验不过
+    // = 任务失败（文案进任务表，文件保留）。
+    crate::engine::verify_sha256_by(sha256, &target.to_string_lossy())?;
     finish_download(&target, &final_target, url, overwrite)
 }
 
@@ -1757,6 +1764,101 @@ pub fn looks_like_media_site(url: &str) -> bool {
     MEDIA_HOSTS
         .iter()
         .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+}
+
+/// FTP 下载的托管入口：临时文件命名、断点元数据、限速、进度与避让改名
+/// 全部复用 direct 的既有机制，协议部分委托 `ftp::download_ftp`。
+/// `sha256` 非空时在改名前校验（失败保留临时文件，与 HTTP 路径同语义）。
+/// 返回最终落盘路径。
+#[allow(clippy::too_many_arguments)]
+pub fn download_ftp_managed(
+    url: &str,
+    task_id: &str,
+    dir: &Path,
+    title: &str,
+    rate_kb: u64,
+    sha256: Option<&str>,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut on_progress: impl FnMut(DirectProgress) + Send,
+) -> Result<PathBuf, String> {
+    let final_target = dir.join(resolve_target_name(
+        title.rsplit('/').next().unwrap_or("file"),
+        None,
+    ));
+    let target = temp_path_for(&final_target, task_id);
+
+    // 断点：direct 的 PartMeta（url 一致才认）。伪造/换 URL 弃断点从头下。
+    let resume_done = PartMeta::load(&target)
+        .filter(|m| m.url == url)
+        .map(|m| m.segments_done.iter().copied().sum())
+        .unwrap_or(0);
+    if resume_done == 0 {
+        PartMeta::remove(&target);
+    }
+
+    let mut last_bytes = resume_done;
+    let mut last_t = Instant::now();
+    // total 由下载器回调前未知（SIZE 可能失败）：用共享格子供进度闭包读取
+    let total_cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let total_cell2 = total_cell.clone();
+
+    let (written, total) = crate::ftp::download_ftp(
+        url,
+        &target,
+        resume_done,
+        cancel,
+        rate_kb,
+        |done| {
+            let now = Instant::now();
+            let dt = now.duration_since(last_t).as_secs_f64();
+            if dt < 0.15 {
+                return;
+            }
+            let t = total_cell2.load(Ordering::Relaxed);
+            let t_opt = if t > 0 { Some(t) } else { None };
+            let speed = (done.saturating_sub(last_bytes)) as f64 / dt;
+            let pct = t_opt
+                .map(|t| (done as f64 / t as f64 * 100.0).min(100.0))
+                .unwrap_or(0.0);
+            on_progress(DirectProgress {
+                downloaded: done,
+                total: t_opt,
+                progress: pct,
+                speed: Some(human_speed(speed)),
+                eta: human_eta(t_opt.unwrap_or(0).saturating_sub(done), speed),
+            });
+            last_bytes = done;
+            last_t = now;
+        },
+    )?;
+    total_cell.store(total.unwrap_or(0), Ordering::Relaxed);
+
+    if cancel.load(Ordering::SeqCst) {
+        let meta = PartMeta {
+            url: url.to_string(),
+            total: total.unwrap_or(0),
+            segments_total: vec![total.unwrap_or(written)],
+            segments_done: vec![written],
+            etag: None,
+            last_modified: None,
+        };
+        meta.save(&target);
+        return Err(ERR_CANCELLED.to_string());
+    }
+
+    // 完成前校验（任务声明了摘要时）
+    if let Some(expected) = sha256 {
+        let got = crate::hash::sha256_file(&target)?;
+        let got_hex = crate::dpapi::to_hex(&got);
+        if !crate::hash::digest_matches(&got_hex, expected) {
+            return Err(format!(
+                "SHA-256 校验失败：预期 {expected}，实际 {got_hex}。文件已保留，请核对来源提供的摘要"
+            ));
+        }
+    }
+
+    PartMeta::remove(&target);
+    finish_download(&target, &final_target, url, false)
 }
 
 #[cfg(test)]

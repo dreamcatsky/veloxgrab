@@ -366,6 +366,16 @@ pub struct EnqueueArgs {
     /// 真正下载时仍以 Content-Length / yt-dlp 报告为准。
     #[serde(default)]
     pub expected_bytes: Option<u64>,
+    /// 定时开始（Unix 毫秒；None/0 = 立即下载）。过去的时间点按立即处理。
+    #[serde(default)]
+    pub start_at: Option<i64>,
+    /// 任务级限速 KB/s（None = 用全局设置；0 = 本任务不限速）。
+    #[serde(default)]
+    pub rate_kb: Option<u64>,
+    /// 预期 SHA-256（64 位 hex，大小写不敏感）。下载完成后校验；
+    /// 不匹配任务落 Failed（带「校验失败」文案），文件保留供人工比对。
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 /// 探测直链：返回是否支持 Range、总大小、文件名与建议线程数
@@ -402,6 +412,33 @@ pub async fn probe_auto(
     }
 
     let settings = load_settings(&state);
+
+    // FTP：独立的探测通道（SIZE/LIST），前端按直链界面展示
+    if url.to_ascii_lowercase().starts_with("ftp://") {
+        return match tokio::task::spawn_blocking({
+            let url = url.clone();
+            move || crate::ftp::probe_ftp(&url, std::time::Duration::from_secs(30))
+        })
+        .await
+        {
+            Ok(Ok((total, filename))) => Ok(serde_json::json!({
+                "kind": "direct",
+                "direct": {
+                    "url": url,
+                    "filename": filename,
+                    "total_bytes": total,
+                    "content_type": "application/octet-stream",
+                    "range_supported": true,
+                    "final_url": url,
+                    "suggested_threads": 1,
+                    "etag": null,
+                    "last_modified": null,
+                }
+            })),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(format!("FTP 探测异常: {e}")),
+        };
+    }
 
     // 已知媒体站点：优先走 yt-dlp
     if direct::looks_like_media_site(&url) {
@@ -527,6 +564,16 @@ pub async fn enqueue_download(
         expected_ext: args
             .expected_ext
             .and_then(|e| crate::util::normalize_ext(&e)),
+        // 定时开始：过去的时间点按立即处理（用户填了昨天 = 马上下载）
+        start_at: args.start_at.filter(|&t| t > now_ms()),
+        // 任务级限速与校验：normalize 在 Task 字段注释里说明
+        rate_kb: args.rate_kb,
+        sha256: args
+            .sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(|s| s.to_ascii_lowercase()),
     };
 
     {
@@ -545,6 +592,58 @@ pub async fn enqueue_download(
     let ctx = PumpCtx::from_state(&state);
     tauri::async_runtime::spawn(pump_queue(app, ctx));
     Ok(task)
+}
+
+/// 定时开始观察者：扫任务表里「Queued 且定时未到」的任务，取**最近**
+/// 的到点时刻睡眠，醒来后广播 `start-at-due`（含到点的任务 id 列表）。
+/// 前端收到事件刷新列表；真正的启动由泵完成——这里 spawn 一次泵即可。
+///
+/// 为什么轮询而不是每个任务一个 timer：定时任务同时存在几十个的量级下
+/// tokio timer 数量无意义，30 秒的粒度对「定时下载」场景足够（分钟级
+/// 精度的预期）；醒来时即使差几十秒，下一次心跳也会补上。
+pub fn spawn_start_at_watcher(app: tauri::AppHandle) {
+    use tauri::Manager;
+    let ctx = PumpCtx::from_state(app.state::<AppState>().inner());
+    tauri::async_runtime::spawn(async move {
+        loop {
+            // 取最近的未到期时间
+            let next_due: Option<i64> = {
+                let now = now_ms();
+                let guard = ctx.tasks.lock().await;
+                guard
+                    .values()
+                    .filter(|t| t.state == TaskState::Queued && !t.start_at_due(now))
+                    .filter_map(|t| t.start_at)
+                    .min()
+            };
+            let wait = match next_due {
+                Some(due) => {
+                    let ms = (due - now_ms()).clamp(500, 30_000) as u64;
+                    std::time::Duration::from_millis(ms)
+                }
+                None => std::time::Duration::from_secs(30),
+            };
+            tokio::time::sleep(wait).await;
+
+            // 到点了：续泵（泵会跳过还没到点的）。确认真的有到点任务再泵，
+            // 避免无谓的 wake。
+            let now = now_ms();
+            let due_now = {
+                let guard = ctx.tasks.lock().await;
+                guard
+                    .values()
+                    .any(|t| t.state == TaskState::Queued && t.start_at_due(now))
+            };
+            if due_now {
+                let app2 = app.clone();
+                let ctx2 = ctx.clone();
+                tauri::async_runtime::spawn(async move {
+                    pump_queue(app2, ctx2).await;
+                });
+                let _ = tauri::Emitter::emit(&app, "tasks-changed", ());
+            }
+        }
+    });
 }
 
 /// 队列泵所需的共享上下文。
@@ -709,6 +808,12 @@ pub fn pump_queue(
             .max_concurrent
             .max(1);
 
+        // 「定时未到」的连续计数。一个已到点的任务被启动会把计数清零；
+        // 连续 defer 次数追平当前队列长度 = 整个队列已轮转一圈且全是
+        // 未到点的任务 → 退出，不再 pop→push_back 空转。到点唤醒由
+        // start_at_watcher 续泵。
+        let mut deferred_streak = 0usize;
+
         loop {
             // 先取任务再占槽位：反过来的话，队列空或任务已被移除时
             // 还得记得把槽位还回去，容易漏。
@@ -734,6 +839,26 @@ pub fn pump_queue(
             if task.state.is_terminal() || task.state == TaskState::Paused {
                 continue;
             }
+
+            // 定时未到的任务放回队尾并记一笔：本轮不再启动新任务（槽位
+            // 不能被未到点的任务占着干等）。放回队尾而不是队首，避免下一轮
+            // 又立刻 pop 到它；到点时由 start_at_watcher 续泵。队里可能还有
+            // 已到点的任务排在后面——继续扫，只在本轮**一个可跑任务都没有**
+            // 时才退出，否则会漏启动。
+            if !task.start_at_due(crate::commands::now_ms()) {
+                let mut q = ctx.queue.lock().await;
+                q.push_back(next_id);
+                let len = q.len();
+                drop(q);
+                deferred_streak += 1;
+                // 整圈全是未到点：退出（len 比较发生在 push 之后，
+                // 所以用当前队列长度而不是 pop 前快照）。
+                if deferred_streak >= len {
+                    break;
+                }
+                continue;
+            }
+            deferred_streak = 0;
 
             if !try_acquire_slot(&ctx.running, max_concurrent) {
                 // 并发已满：放回队首，等某个任务结束后的续泵再来取
@@ -1190,6 +1315,12 @@ pub struct EditTaskArgs {
     pub threads: Option<usize>,
     #[serde(default)]
     pub save_dir: Option<String>,
+    /// 任务级限速 KB/s：None = 不改；Some(v) = 覆盖（0 = 本任务不限速）
+    #[serde(default)]
+    pub rate_kb: Option<u64>,
+    /// 预期 SHA-256：None = 不改；Some("") = 清除；Some(hex) = 设置
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 #[tauri::command]
@@ -1255,6 +1386,13 @@ pub async fn edit_task(
         if let Some(threads) = new_threads {
             t.threads = threads;
         }
+        // 限速与校验预期是任务元数据：None = 不改，改了不影响断点
+        if let Some(kb) = args.rate_kb {
+            t.rate_kb = Some(kb);
+        }
+        if let Some(sha) = &args.sha256 {
+            t.sha256 = crate::hash::normalize_digest(sha);
+        }
         t.save_dir = new_dir;
         crate::history::upsert_entry(t);
         t.clone()
@@ -1298,6 +1436,15 @@ pub struct NewDownloadArgs {
     pub threads: Option<usize>,
     #[serde(default)]
     pub save_dir: Option<String>,
+    /// 定时开始（Unix 毫秒；None/0 = 立即）
+    #[serde(default)]
+    pub start_at: Option<i64>,
+    /// 任务级限速 KB/s（None = 跟随全局）
+    #[serde(default)]
+    pub rate_kb: Option<u64>,
+    /// 预期 SHA-256（64 位 hex）
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 #[tauri::command]
@@ -1306,13 +1453,24 @@ pub async fn new_download(
     state: tauri::State<'_, AppState>,
     args: NewDownloadArgs,
 ) -> Result<Task, String> {
+    let sha = args
+        .sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|s| s.to_ascii_lowercase());
     create_direct_task(
         &app,
         &state,
-        args.url,
-        args.filename,
-        args.threads,
-        args.save_dir,
+        DirectTaskArgs {
+            url: args.url,
+            filename: args.filename,
+            threads: args.threads,
+            save_dir: args.save_dir,
+            start_at: args.start_at.filter(|&t| t > now_ms()),
+            rate_kb: args.rate_kb,
+            sha256: sha,
+        },
     )
     .await
 }
@@ -1322,14 +1480,32 @@ pub async fn new_download(
 /// 单独抽出来是因为深链进来时没有「前端表单」可依赖：扩展只传一个 URL，
 /// 其余全靠这里兜。两条入口必须走同一条路径，否则会出现「网页点能下、
 /// 手动粘同一个地址反而失败」这种最难排查的分裂。
+/// `new_download` 与深链共用建任务的参数包（参数打包成结构体：
+/// 9 个位置参数超出 clippy 的阈值，且调用方新增字段时不用改签名）。
+pub(crate) struct DirectTaskArgs {
+    pub url: String,
+    pub filename: Option<String>,
+    pub threads: Option<usize>,
+    pub save_dir: Option<String>,
+    pub start_at: Option<i64>,
+    pub rate_kb: Option<u64>,
+    pub sha256: Option<String>,
+}
+
 pub(crate) async fn create_direct_task(
     app: &tauri::AppHandle,
     state: &AppState,
-    url: String,
-    filename: Option<String>,
-    threads: Option<usize>,
-    save_dir: Option<String>,
+    args: DirectTaskArgs,
 ) -> Result<Task, String> {
+    let DirectTaskArgs {
+        url,
+        filename,
+        threads,
+        save_dir,
+        start_at,
+        rate_kb,
+        sha256,
+    } = args;
     let url = url.trim().to_string();
     if url.is_empty() {
         return Err("请输入下载地址".into());
@@ -1403,6 +1579,9 @@ pub(crate) async fn create_direct_task(
         threads: threads.unwrap_or(0).min(64),
         save_dir: save_dir.clone(),
         expected_ext,
+        start_at: start_at.filter(|&t| t > now_ms()),
+        rate_kb,
+        sha256: sha256.map(|s| s.to_ascii_lowercase()),
     };
 
     {
@@ -1418,6 +1597,39 @@ pub(crate) async fn create_direct_task(
     let ctx = PumpCtx::from_state(state);
     tauri::async_runtime::spawn(pump_queue(app.clone(), ctx));
     Ok(task)
+}
+
+/// 队列置顶：把选中的任务 id 挪到队列最前（按传入顺序，先传的在前）。
+///
+/// 只有**仍在队列里**的任务会被挪动；不在队列的（运行中/终态）静默跳过，
+/// 返回实际挪动的条数。配合「暂停选中 → 置顶 → 开始」就是完整的优先级
+/// 控制——比单独的 priority 字段少一条要全程维护的状态。
+#[tauri::command]
+pub async fn bump_tasks(
+    state: tauri::State<'_, AppState>,
+    args: IdsArgs,
+) -> Result<usize, String> {
+    let mut q = state.queue.lock().await;
+    let mut moved = 0;
+    // 从队头开始按用户给定的顺序安放：先把选中项从队列里摘出来（保序），
+    // 再按顺序插回队首，最后把剩余任务原序接回去。
+    let picked: Vec<String> = args
+        .ids
+        .into_iter()
+        .filter(|id| {
+            if let Some(pos) = q.iter().position(|x| x == id) {
+                q.remove(pos);
+                moved += 1;
+                true
+            } else {
+                false
+            }
+        })
+        .collect();
+    for (i, id) in picked.into_iter().enumerate() {
+        q.insert(i, id);
+    }
+    Ok(moved)
 }
 
 /// 清空已结束的任务。
@@ -2491,8 +2703,15 @@ mod tests {
 
     /// 造一个可入库的任务（状态可指定；kind/字段取最小集）。
     fn mk_task(state: TaskState) -> Task {
+        // id 必须唯一：static 计数器比时间戳可靠（同毫秒内两次调用会同 id，
+        // 第二次入库会把第一次静默覆盖——测试曾因此自欺）。
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Task {
-            id: format!("t{}_0", crate::commands::now_ms()),
+            id: format!(
+                "ttest{}_{}",
+                crate::commands::now_ms(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ),
             url: "https://e.com/a.bin".into(),
             title: "a.bin".into(),
             thumbnail: None,
@@ -2515,6 +2734,9 @@ mod tests {
             threads: 4,
             save_dir: None,
             expected_ext: Some("bin".into()),
+        start_at: None,
+        rate_kb: None,
+        sha256: None,
         }
     }
 
@@ -2769,6 +2991,34 @@ mod tests {
                 assert!(token.is_canceled(), "round {round}: Canceled 必然伴随令牌取消");
             }
         }
+    }
+
+    /// 定时开始（1.4.0）：泵对未到点任务的 defer 语义——不占槽、不启动、
+    /// 不丢任务；到点后正常启动。
+    #[tokio::test]
+    async fn pump_defers_future_start_at() {
+        let state = AppState::new_for_test();
+        // 未来的任务：start_at 在 1 小时后
+        let mut future = mk_task(TaskState::Queued);
+        future.start_at = Some(crate::commands::now_ms() + 3600 * 1000);
+        let fid = future.id.clone();
+        let start_at_expected = future.start_at;
+        state.insert_task_for_test(future);
+        // 已到点的任务（负偏移 = 立即）
+        let mut due = mk_task(TaskState::Queued);
+        due.start_at = Some(crate::commands::now_ms() - 1);
+        let did = due.id.clone();
+        state.insert_task_for_test(due);
+        state.queue.lock().await.push_back(fid.clone());
+        state.queue.lock().await.push_back(did.clone());
+
+        let now = crate::commands::now_ms();
+        assert!(!state.tasks.lock().await.get(&fid).unwrap().start_at_due(now), "未来时刻不得判定为到点");
+        assert!(state.tasks.lock().await.get(&did).unwrap().start_at_due(now), "过去/当前时刻必须到点");
+
+        // Task 序列化保 start_at（历史回灌守约的前提）
+        let v = serde_json::to_value(state.tasks.lock().await.get(&fid).unwrap()).unwrap();
+        assert_eq!(v["start_at"], serde_json::json!(start_at_expected), "start_at 必须随任务序列化");
     }
 
     fn clone_state(state: &AppState) -> AppState {

@@ -279,80 +279,13 @@ async fn fetch_asset_digest(proxy: Option<&str>, url: &str) -> Option<[u8; 32]> 
 }
 
 /// 流式计算文件的 SHA-256，走系统 BCrypt（`windows-sys` 已经在用，不新增依赖）。
+/// hash 模块提供实现（engine 的下载校验共用），这里保留转发别名——
+/// 本文件内的调用点沿用原名，可读性不受影响。
 #[cfg(windows)]
 fn sha256_file(path: &std::path::Path) -> Result<[u8; 32], String> {
-    use windows_sys::Win32::Security::Cryptography as bc;
-
-    let mut file = std::fs::File::open(path).map_err(|e| format!("打开安装包失败: {e}"))?;
-    let mut alg: bc::BCRYPT_ALG_HANDLE = std::ptr::null_mut();
-    // SAFETY: 句柄在本函数内创建与释放；所有指针都指向本栈帧内的有效分配。
-    unsafe {
-        if bc::BCryptOpenAlgorithmProvider(&mut alg, bc::BCRYPT_SHA256_ALGORITHM, std::ptr::null(), 0) < 0 {
-            return Err("初始化 SHA-256 失败".into());
-        }
-        // 主体包一层闭包，保证任何失败路径都会走到下面的销毁句柄
-        let result = (|| {
-            let mut got: u32 = 0;
-            let mut obj_len: u32 = 0;
-            if bc::BCryptGetProperty(
-                alg,
-                bc::BCRYPT_OBJECT_LENGTH,
-                &mut obj_len as *mut u32 as *mut u8,
-                4,
-                &mut got,
-                0,
-            ) < 0
-            {
-                return Err("读取 SHA-256 参数失败".to_string());
-            }
-            let mut hash_len: u32 = 0;
-            if bc::BCryptGetProperty(
-                alg,
-                bc::BCRYPT_HASH_LENGTH,
-                &mut hash_len as *mut u32 as *mut u8,
-                4,
-                &mut got,
-                0,
-            ) < 0
-            {
-                return Err("读取 SHA-256 参数失败".to_string());
-            }
-            // 摘要长度写死 32 是调用方与 BCrypt 的契约，对不上说明拿错算法了
-            if hash_len != 32 {
-                return Err(format!("非预期的摘要长度 {hash_len}"));
-            }
-            let mut obj = vec![0u8; obj_len as usize];
-            let mut hash: bc::BCRYPT_HASH_HANDLE = std::ptr::null_mut();
-            if bc::BCryptCreateHash(alg, &mut hash, obj.as_mut_ptr(), obj_len, std::ptr::null(), 0, 0) < 0 {
-                return Err("创建 SHA-256 上下文失败".to_string());
-            }
-            let inner = (|| {
-                use std::io::Read;
-                // 64 KiB：安装包 20 MB 左右，这个块大小下 syscall 次数与
-                // 缓存友好度都够，不需要更细的调节
-                let mut buf = vec![0u8; 64 * 1024];
-                loop {
-                    let n = file.read(&mut buf).map_err(|e| format!("读取安装包失败: {e}"))?;
-                    if n == 0 {
-                        break;
-                    }
-                    if bc::BCryptHashData(hash, buf.as_ptr(), n as u32, 0) < 0 {
-                        return Err("计算 SHA-256 失败".to_string());
-                    }
-                }
-                let mut out = [0u8; 32];
-                if bc::BCryptFinishHash(hash, out.as_mut_ptr(), 32, 0) < 0 {
-                    return Err("计算 SHA-256 失败".to_string());
-                }
-                Ok(out)
-            })();
-            bc::BCryptDestroyHash(hash);
-            inner
-        })();
-        bc::BCryptCloseAlgorithmProvider(alg, 0);
-        result
-    }
+    crate::hash::sha256_file(path)
 }
+
 
 /// 校验下载到的安装包；不一致时删掉文件——半成品留在临时目录里，
 /// 下次「更新」会先删再下，但如果用户手动去双击它就成了执行未知文件。

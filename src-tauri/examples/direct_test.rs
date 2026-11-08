@@ -181,6 +181,7 @@ fn main() {
         threads,
         false,
         cancel.clone(),
+        None, // sha256
         cb,
         &veloxgrab_lib::settings::NetCfg::default(),
     ));
@@ -295,6 +296,7 @@ fn main() {
             segs,
             false,
             cancel2,
+            None, // sha256
             cb2,
             &veloxgrab_lib::settings::NetCfg::default(),
         )) {

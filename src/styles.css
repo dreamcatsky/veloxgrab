@@ -600,6 +600,24 @@ body.is-max #winMax .ic-restore { display: block; }
 #settingsView.active { padding: 18px 24px 24px; overflow-y: auto; }
 
 /* ---------- 任务表格 ---------- */
+/* 搜索条：贴在表头上方的一行输入，与表格同宽同内边距。 */
+.list-tools {
+  padding: 10px 12px 0;
+}
+.list-tools input[type="search"] {
+  width: 100%;
+  padding: 7px 12px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--glass-thin);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: none;
+}
+.list-tools input[type="search"]:focus { border-color: var(--accent); }
+.list-tools input[type="search"]::placeholder { color: var(--faint); }
+
 /* 表头与数据行共用同一套 grid 模板，列才能严格对齐。
    名称列 1fr 吃掉剩余宽度，其余固定，滚动条出现时也不会错位。 */
 .list-head,
@@ -1677,6 +1695,13 @@ body.monitor-body {
   position: relative;
   letter-spacing: .01em;
 }
+/* 内容行开关：设置里的 monitor_show_* 落到 body 的 data 属性，
+   progress.js 首帧与 monitor.rs 每次浮出时都会写。1 = 显示。 */
+body[data-mon-sub="0"] .m-sub { display: none; }
+body[data-mon-bar="0"] .m-bar { display: none; }
+body[data-mon-name="0"] .m-name { visibility: hidden; }
+/* 名称行藏掉但关闭钮保留：拖拽区在 .m-top 上，行可隐、窗得能拖能关。 */
+body[data-mon-name="0"] .m-top { min-height: 18px; }
 .m-bar {
   height: 6px;
   border-radius: 99px;

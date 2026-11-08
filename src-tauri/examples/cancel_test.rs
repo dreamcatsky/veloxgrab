@@ -52,6 +52,7 @@ fn main() {
         threads,
         false,
         cancel.clone(),
+        None, // sha256
         move |p| {
             if let Ok(mut g) = lb.lock() {
                 *g = p.downloaded;

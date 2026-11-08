@@ -130,10 +130,38 @@ pub struct Task {
     /// 同一任务的成品和断点就会分居两处。
     #[serde(default)]
     pub expected_ext: Option<String>,
+    /// 定时开始：Unix 毫秒时间戳。None / 0 = 立即。
+    ///
+    /// 泵跳过「还没到点」的 Queued 任务并把它们放回队首——定时语义是
+    /// 「到点才开始下载」，不是「到点才入队」。持锁轮询由独立的
+    /// scheduler 线程承担（见 commands::spawn_start_at_watcher）。
+    /// history 回灌后依然生效（断电重来也守约）。
+    #[serde(default)]
+    pub start_at: Option<i64>,
+    /// 任务级限速 KB/s。None = 跟随全局设置；Some(0) = 本任务不限速
+    /// （即使全局开了限速）。视频任务（yt-dlp）不受此字段影响——
+    /// yt-dlp 走全局 --limit-rate。
+    #[serde(default)]
+    pub rate_kb: Option<u64>,
+    /// 预期 SHA-256（小写 hex，64 位）。下载完成后逐字节校验；不匹配
+    /// 落 Failed。直链任务完成时校验；yt-dlp 任务在拿到输出路径后校验。
+    /// 历史回灌同样生效——「下错了」比「下不了」更该被拦下。
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 fn default_kind() -> String {
     "video".into()
+}
+
+impl Task {
+    /// 任务是否已到定时开始的时间点（None/0 视为立即）。
+    pub fn start_at_due(&self, now_ms: i64) -> bool {
+        match self.start_at {
+            Some(t) if t > 0 => t <= now_ms,
+            _ => true,
+        }
+    }
 }
 
 /// 进度事件负载（emit 到前端）
@@ -533,6 +561,29 @@ fn find_recent_output(
         }
     }
     best.map(|(_, p)| p.to_string_lossy().to_string())
+}
+
+/// 下载完成后按声明的 SHA-256 校验成品（hash.rs 的 BCrypt 实现）。
+///
+/// 返回 Err = 摘要不符或读取失败，文案进任务表。文件**保留**在盘上：
+/// 「校验失败」可能是用户抄错摘要——自动删文件会把可人工比对的证据一起删掉。
+/// 尚未下载完成的半成品不走这里（worker 的完成路径才调用）。
+/// 摘要参数而不是 Task：direct.rs 的完成点在 download_direct 内部，
+/// 那里拿不到整个 Task。
+pub fn verify_sha256_by(expected: Option<&str>, path: &str) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let got = crate::hash::sha256_file(std::path::Path::new(path))?;
+    let got_hex = crate::dpapi::to_hex(&got);
+    if crate::hash::digest_matches(&got_hex, expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "SHA-256 校验失败：预期 {}，实际 {}。文件已保留，请核对来源提供的摘要",
+            expected, got_hex
+        ))
+    }
 }
 
 /// 组装输出模板
@@ -1129,6 +1180,50 @@ async fn run_download_inner(
     let missing_output = status.success() && !untrusted_success && resolved_path.is_none();
 
     if status.success() && !untrusted_success && !missing_output {
+        // SHA-256 完整性校验（任务声明了摘要时）：失败按普通失败落表，
+        // 走与 yt-dlp 报错相同的失败分支（文件保留，见 verify_sha256 注释）。
+        if let Some(p) = &resolved_path {
+            if let Err(v_err) = verify_sha256_by(task.sha256.as_deref(), p) {
+                let v_err: String = v_err;
+                let (state, ev_msg) = {
+                    let mut guard = tasks.lock().await;
+                    if token.is_canceled() {
+                        let (state, smsg) = stopped_state(&token);
+                        if let Some(t) = guard.get_mut(&task.id) {
+                            t.state = state;
+                            t.error = Some(smsg.clone());
+                            crate::history::upsert_entry(t);
+                        }
+                        (state, smsg)
+                    } else {
+                        if let Some(t) = guard.get_mut(&task.id) {
+                            t.state = TaskState::Failed;
+                            t.error = Some(v_err.clone());
+                            crate::history::upsert_entry(t);
+                        }
+                        (TaskState::Failed, v_err.clone())
+                    }
+                };
+                let _ = app.emit(
+                    "task-progress",
+                    &ProgressEvent {
+                        id: task.id.clone(),
+                        state,
+                        progress: 0.0,
+                        downloaded_bytes: 0,
+                        total_bytes: None,
+                        speed: None,
+                        eta: None,
+                        error: Some(ev_msg),
+                        output_path: None,
+                    },
+                );
+                if state == TaskState::Failed {
+                    return Err(v_err);
+                }
+                return Ok(None);
+            }
+        }
         // 同 run_direct_download：yt-dlp 的终态事件也要带上真实大小，
         // 否则「大小」列对完成的视频任务恒为「—」。
         let final_size = resolved_path
@@ -1290,7 +1385,12 @@ pub async fn run_direct_download(
 
     // 按目标 host 决定是否带上 HuggingFace token：直链请求走的是 reqwest，
     // 不经过 yt-dlp 的参数拼装，凭证作用域必须在这一层同样成立。
-    let net = crate::settings::NetCfg::for_url(&settings, &task.url);
+    let mut net = crate::settings::NetCfg::for_url(&settings, &task.url);
+    // 任务级限速覆盖全局：Some(v) 时以任务为准（Some(0) = 本任务不限速，
+    // 即使全局开了限速——「这个任务要抢速度」是明确意图）。
+    if let Some(kb) = task.rate_kb {
+        net.rate_kb = kb;
+    }
     let mut threads = if task.threads > 0 {
         task.threads
     } else {
@@ -1344,6 +1444,128 @@ pub async fn run_direct_download(
         }
     });
 
+    // FTP 任务：direct 的托管入口走阻塞 IO，包进 spawn_blocking；
+    // 进度经同一 mpsc 通道，断点用 direct 的 .veloxgrab-part（REST 续传）。
+    if task.url.to_ascii_lowercase().starts_with("ftp://") {
+        let url = task.url.clone();
+        let dir_c = dir.clone();
+        let title_c = task.title.clone();
+        let id_c = task.id.clone();
+        let cancel_c = cancel_flag.clone();
+        let rate_c = net.rate_kb;
+        let sha_c = task.sha256.clone();
+        let tx_c = tx.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::direct::download_ftp_managed(
+                &url, &id_c, &dir_c, &title_c, rate_c, sha_c.as_deref(), &cancel_c, |dp| {
+                    let _ = tx_c.send(ProgressEvent {
+                        id: id_c.clone(),
+                        state: TaskState::Downloading,
+                        progress: dp.progress,
+                        downloaded_bytes: dp.downloaded,
+                        total_bytes: dp.total,
+                        speed: dp.speed,
+                        eta: dp.eta,
+                        error: None,
+                        output_path: None,
+                    });
+                },
+            )
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("FTP 下载任务异常: {e}")));
+
+        // 通道消费完再走统一的完成/失败落表
+        let _ = consumer.await;
+        return match result {
+            Ok(path) => {
+                let path_str = path.to_string_lossy().to_string();
+                let final_size = std::fs::metadata(&path).map(|m| m.len()).ok();
+                let (state, ev_err, snap) = {
+                    let mut guard = tasks.lock().await;
+                    match guard.get_mut(&task.id) {
+                        Some(t) if token.is_canceled() => {
+                            let (state, msg, snap) = apply_stopped_state(t, &token);
+                            (state, Some(msg), snap)
+                        }
+                        Some(t) => {
+                            let done_bytes = final_size.unwrap_or(t.downloaded_bytes);
+                            let done_total = final_size.or(t.total_bytes);
+                            t.state = TaskState::Done;
+                            t.progress = 100.0;
+                            t.output_path = Some(path_str.clone());
+                            t.error = None;
+                            t.speed = None;
+                            t.downloaded_bytes = done_bytes;
+                            t.total_bytes = done_total;
+                            crate::history::upsert_entry(t);
+                            (TaskState::Done, None, (100.0, done_bytes, done_total))
+                        }
+                        None => (
+                            TaskState::Done,
+                            None,
+                            (100.0, final_size.unwrap_or(0), final_size),
+                        ),
+                    }
+                };
+                let (prog, done_bytes, done_total) = snap;
+                let _ = app.emit(
+                    "task-progress",
+                    &ProgressEvent {
+                        id: task.id.clone(),
+                        state,
+                        progress: prog,
+                        downloaded_bytes: done_bytes,
+                        total_bytes: done_total,
+                        speed: None,
+                        eta: None,
+                        error: ev_err,
+                        output_path: (state == TaskState::Done).then_some(path_str.clone()),
+                    },
+                );
+                Ok(if state == TaskState::Done { Some(path_str) } else { None })
+            }
+            Err(e) => {
+                let (state, msg, snap) = {
+                    let mut guard = tasks.lock().await;
+                    match guard.get_mut(&task.id) {
+                        Some(t) => {
+                            if token.is_canceled() || crate::direct::is_cancelled_error(&e) {
+                                // 暂停/取消压着失败到达：落停止态并按语义清瞬时字段
+                                apply_stopped_state(t, &token)
+                            } else {
+                                t.state = TaskState::Failed;
+                                t.error = Some(e.clone());
+                                t.speed = None;
+                                t.eta = None;
+                                crate::history::upsert_entry(t);
+                                let snap = stop_snapshot(t, t.state);
+                                (TaskState::Failed, e.clone(), snap)
+                            }
+                        }
+                        None => (TaskState::Failed, e.clone(), (0.0, 0, None)),
+                    }
+                };
+                let (prog, bytes, total) = snap;
+                let _ = app.emit(
+                    "task-progress",
+                    &ProgressEvent {
+                        id: task.id.clone(),
+                        state,
+                        progress: prog,
+                        downloaded_bytes: bytes,
+                        total_bytes: total,
+                        speed: None,
+                        eta: None,
+                        error: Some(msg),
+                        output_path: None,
+                    },
+                );
+                Ok(None)
+            }
+        };
+    }
+
     let result = crate::direct::download_direct(
         &task.url,
         &task.id,
@@ -1354,6 +1576,8 @@ pub async fn run_direct_download(
         // 覆盖仍由 direct 侧按「同一 URL 的本程序产物」再校验一次
         settings.name_conflict == "overwrite",
         cancel_flag.clone(),
+        // 完成前 SHA-256 校验的预期值（任务声明了才传）
+        task.sha256.as_deref(),
         move |p| {
             let _ = tx.send(ProgressEvent {
                 id: id2.clone(),
@@ -1546,6 +1770,9 @@ mod tests {
             threads: 4,
             save_dir: None,
             expected_ext: Some("bin".into()),
+        start_at: None,
+        rate_kb: None,
+        sha256: None,
         }
     }
 
@@ -1712,6 +1939,9 @@ mod tests {
             threads: 4,
             save_dir: save_dir.map(str::to_string),
             expected_ext: None,
+        start_at: None,
+        rate_kb: None,
+        sha256: None,
         }
     }
 

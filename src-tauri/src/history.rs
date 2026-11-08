@@ -55,6 +55,15 @@ pub struct HistoryEntry {
     /// 分类目录依赖的预计扩展名；旧版本历史没有这个字段，按 None 处理
     #[serde(default)]
     pub expected_ext: Option<String>,
+    /// 定时开始（Unix 毫秒，None/0 = 立即）；旧版本历史没有，按 None 处理
+    #[serde(default)]
+    pub start_at: Option<i64>,
+    /// 任务级限速 KB/s（None = 跟随全局）
+    #[serde(default)]
+    pub rate_kb: Option<u64>,
+    /// 预期 SHA-256（小写 hex）；旧版本历史没有，按 None 处理
+    #[serde(default)]
+    pub sha256: Option<String>,
     pub total_bytes: Option<u64>,
     pub error: Option<String>,
     pub created_at: i64,
@@ -106,6 +115,9 @@ impl HistoryEntry {
             output_path: task.output_path.clone(),
             save_dir: task.save_dir.clone(),
             expected_ext: task.expected_ext.clone(),
+            start_at: task.start_at,
+            rate_kb: task.rate_kb,
+            sha256: task.sha256.clone(),
             total_bytes: task.total_bytes,
             error: task.error.clone(),
             created_at: task.created_at,
@@ -188,6 +200,10 @@ impl HistoryEntry {
             },
             threads: self.threads,
             save_dir: self.save_dir.clone(),
+            start_at: self.start_at,
+            // 限速/校验预期随任务落盘：续传重试后仍然生效
+            rate_kb: self.rate_kb,
+            sha256: self.sha256.clone(),
             // 历史文件是不可信输入：扩展名回灌前再收敛一次
             expected_ext: self
                 .expected_ext
@@ -631,6 +647,9 @@ mod tests {
             threads: 4,
             save_dir: Some("D:\\custom".into()),
             expected_ext: Some("bin".into()),
+        start_at: None,
+        rate_kb: None,
+        sha256: None,
         }
     }
 

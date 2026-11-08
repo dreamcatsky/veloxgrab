@@ -3,6 +3,12 @@ use std::path::PathBuf;
 
 use crate::AppState;
 
+/// serde(default) 用的布尔真值（结构体级 #[serde(default)] 兜不住「字段缺席
+/// 但要默认 true」的场景——这里副行/进度条的缺席语义就是「显示」）。
+fn default_true() -> bool {
+    true
+}
+
 /// 一条「按扩展名分目录」规则。
 ///
 /// 只允许单层目录名（`Video`、`压缩包`），不允许 `..`、路径分隔符或盘符：
@@ -144,6 +150,23 @@ pub struct Settings {
     pub notify_on_complete: bool,
     /// 点窗口「×」的行为：background（最小化到托盘）| ask（询问）| quit（退出）
     pub close_mode: String,
+    /// 监视窗尺寸档位：s（196×92）| m（236×128，默认）| l（288×168）。
+    ///
+    /// 小窗常驻桌面的核心诉求是「不碍事」，尺寸交给用户。档位而不是自由
+    /// 拖拽缩放：无框小窗做 resize 手柄的成本（命中区与拖拽区打架）配不上
+    /// 收益，三档覆盖「只看数字 / 看数字+副行 / 全都要」。
+    /// serde(default)：旧配置文件没有这个字段时回 m，与升级前行为一致。
+    #[serde(default)]
+    pub monitor_size: String,
+    /// 监视窗显示哪些内容行：名称行、数值副行（"下载速度"/"已下/总量"）、
+    /// 进度条。三档独立开关；全关 = 只剩一个大数字。
+    #[serde(default)]
+    pub monitor_show_name: bool,
+    #[serde(default = "default_true")]
+    pub monitor_show_sub: bool,
+    #[serde(default = "default_true")]
+    pub monitor_show_bar: bool,
+    /// 点窗口「×」的行为：background（最小化到托盘）| ask（询问）| quit（退出）
     /// 外观主题：system（跟随系统）| dark | light
     pub theme: String,
     /// 启用代理（下载与视频解析都走代理）
@@ -196,6 +219,10 @@ impl Default for Settings {
             clipboard_watch: false,
             notify_on_complete: true,
             close_mode: "background".into(),
+            monitor_size: "m".into(),
+            monitor_show_name: true,
+            monitor_show_sub: true,
+            monitor_show_bar: true,
             proxy_enabled: false,
             proxy_type: "http".into(),
             proxy_host: String::new(),
