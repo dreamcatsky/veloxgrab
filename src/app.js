@@ -2294,6 +2294,23 @@
       const port = evt && evt.payload;
       toast(`浏览器扩展桥启动失败（端口 ${port || 58943} 被占用），扩展暂时无法连接 VeloxGrab`, true);
     });
+    // 桥检测到浏览器里挂的还是旧版扩展（ping 版本 < 桌面端）：弹可操作的提醒。
+    // 旧扩展在 VeloxGrab 未运行时会跳系统协议确认页（开新标签），必须刷新
+    // 扩展才能吃到 1.4.0 起的修复——这条提醒就是那次「点了没反应」的根因。
+    listen("extension-outdated", (evt) => {
+      const p = (evt && evt.payload) || {};
+      toast(
+        "浏览器扩展是旧版本（" +
+          (p.ext || "未知") +
+          " < " +
+          (p.app || "?") +
+          "）：到 chrome://extensions 刷新 VeloxGrab 扩展",
+        true
+      );
+      // 普通 toast 3.2 秒就消失，这条是「要用户动手」的——重新挂一个长驻版
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => $("toast").classList.add("hidden"), 15000);
+    });
     // history.json 损坏被重置：旧实现只有 stderr 一行，用户只会发现记录消失
     listen("history-reset", () => {
       toast("下载记录文件损坏，已自动备份并重置（原文件保留为 history.json.bad-*）", true);

@@ -74,6 +74,10 @@ use std::time::{Duration, Instant};
 /// 一个字节的标志不值得为它引入互斥量。
 static EXT_SEEN: AtomicBool = AtomicBool::new(false);
 
+/// 桥的 AppHandle 登记处（spawn 时注入）：旧版扩展检测等需要触达用户的
+/// 事件经它 emit。与 history::APP 同款 OnceLock 模式。
+static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+
 /// 「扩展活跃」的**持久化**副本：`%APPDATA%\VeloxGrab\extension-seen.flag`。
 ///
 /// 为什么内存标志不够：EXT_SEEN 随进程清零，而扩展的 ping 只在它的 service
@@ -364,6 +368,7 @@ fn add_rate_limited() -> bool {
 /// 正好占了 58943）时，程序其余功能必须照常可用，扩展侧会自动退回
 /// `veloxgrab://` 协议路径。
 pub fn spawn(app: tauri::AppHandle) {
+    let _ = APP.set(app.clone());
     std::thread::spawn(move || {
         let listener = match TcpListener::bind(("127.0.0.1", PORT)) {
             Ok(l) => l,
@@ -515,6 +520,7 @@ fn route(req: BridgeReq) -> RouteOutcome {
     // 扩展刚启动时打一次 /ping，只为了上报「我活着」。见 EXT_SEEN 注释：
     // 扩展在后台 SW 里启动就 ping，用户就算从没下载过，VeloxGrab 也能知道扩展已加载。
     if path == "/ping" {
+        detect_stale_extension(&body);
         return static_outcome(200, "{\"ok\":true}");
     }
 
@@ -668,6 +674,73 @@ fn build_link_from_json(body: &str) -> Result<String, String> {
         parts.push(format!("threads={t}"));
     }
     Ok(format!("veloxgrab://add?{}", parts.join("&")))
+}
+
+/// 扩展版本落后于桌面端的提醒：只弹一次（进程内 OnceLock 记账）。
+static STALE_EXT_WARNED: OnceLock<()> = OnceLock::new();
+
+/// 检测「浏览器里挂的还是旧版扩展」。
+///
+/// 用户从 1.3.x 覆盖升级到 1.4.x 后，桌面端安装目录里的扩展文件已更新，
+/// 但 Chrome **不会自动从磁盘重载已加载的扩展**——旧版 service worker
+/// 继续跑旧逻辑：VeloxGrab 未运行时它调不通桥，就会跳系统协议确认页
+/// （「此站点正在尝试打开 VeloxGrab」，还开一个新标签）。ping body 里
+/// 的 version 字段（1.4.0 起携带）与桌面端版本对比，旧了就发一次事件
+/// 让前端弹可操作的提醒。旧扩展不发 version 字段——同样视为落后。
+fn detect_stale_extension(ping_body: &str) {
+    static APP_VERSION: OnceLock<Option<String>> = OnceLock::new();
+
+    let ext_version: Option<String> = serde_json::from_str::<serde_json::Value>(ping_body)
+        .ok()
+        .and_then(|v| {
+            v.get("version")
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+
+    // 桌面端版本：进程生命周期内不变，缓存一次。
+    // APP 未登记（测试环境）时跳过检测。
+    let app_version = APP_VERSION
+        .get_or_init(|| {
+            APP.get()
+                .map(|app| app.package_info().version.to_string())
+        })
+        .clone();
+    let Some(app_ver) = app_version else { return };
+    if STALE_EXT_WARNED.get().is_some() {
+        return;
+    }
+
+    // 版本比较用 update.rs 的三段式解析：ext < app = 落后；相等 = 正常；
+    // ext > app（桌面端落后）同样不提醒——发版窗口期的正常状态。
+    let stale = match &ext_version {
+        // 旧扩展不发 version：视为落后（1.4.0 起才有此字段）
+        None => true,
+        Some(v) => {
+            let Some(parsed_ext) = crate::update::parse_ver(v) else {
+                return;
+            };
+            let parsed_app = crate::update::parse_ver(&app_ver).unwrap_or([0, 0, 0]);
+            parsed_ext < parsed_app
+        }
+    };
+    if stale && STALE_EXT_WARNED.set(()).is_ok() {
+        if let Some(app) = APP.get() {
+            eprintln!(
+                "[bridge] 检测到旧版浏览器扩展（{} < {app_ver}），提示用户刷新扩展",
+                ext_version.as_deref().unwrap_or("(未上报)")
+            );
+            use tauri::Emitter;
+            let _ = app.emit(
+                "extension-outdated",
+                serde_json::json!({
+                    "ext": ext_version,
+                    "app": app_ver,
+                }),
+            );
+        }
+    }
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
@@ -892,7 +965,19 @@ mod tests {
         (port, keep)
     }
 
-    /// P2-2：token 轮换判定。权威值存在 → 沿用（还原扩展目录由调用方执行）；
+    /// 旧版扩展检测（1.4.1）：APP 未登记（测试环境）时必须静默跳过、
+    /// 不得 panic；body 解析对畸形 JSON 免疫。
+    #[test]
+    fn detect_stale_extension_is_safe_without_app() {
+        // 无 AppHandle：整个检测走不到版本比较，函数必须安静返回
+        detect_stale_extension(r#"{"version":"0.0.1"}"#);
+        detect_stale_extension("not json at all");
+        detect_stale_extension("{}");
+        detect_stale_extension("");
+        // 无断言：能跑完就是目的（panic 会拖垮调用它的连接线程）
+    }
+
+    /// token 轮换判定。权威值存在 → 沿用（还原扩展目录由调用方执行）；
     /// 权威缺席但引导/现值在场 → 提升为权威；两处皆空 → 生成新随机值。
     /// 空/纯空白输入与缺席同义。
     #[test]

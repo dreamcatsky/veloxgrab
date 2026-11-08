@@ -75,11 +75,17 @@ async function ping() {
   // 却没被记成「扩展已加载」——用户装好了扩展，程序还在提示没装。
   // POST 带 Content-Type: application/json 会触发 CORS 预检，浏览器必定附上
   // Origin: chrome-extension://<id>，门禁才认得出它。
+  //
+  // body 里带上扩展版本：桌面端据此检测「浏览器里挂的还是旧版扩展」并
+  // 弹提醒（旧版扩展在 VeloxGrab 未运行时会跳系统协议确认页，开新标签）。
   try {
     const res = await fetch(`${BRIDGE}/ping`, {
       method: "POST",
       headers: await bridgeHeaders(),
-      body: JSON.stringify({ ext: chrome.runtime.id }),
+      body: JSON.stringify({
+        ext: chrome.runtime.id,
+        version: chrome.runtime.getManifest().version,
+      }),
       cache: "no-store",
     });
     console.log("[veloxgrab] ping", res.status);

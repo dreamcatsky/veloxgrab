@@ -1,7 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "progress-window",
-  "description": "监视窗自身需要的窗口控制权限。core:window:default 只含只读权限，不含 close——progress.js 的 × 按钮调 getCurrentWindow().close() 会被 ACL 静默拒绝，窗口关不掉。只授 close、只授 progress 窗口：主窗口的关闭必须继续走 window_control 命令（close_mode 的询问/托盘/退出语义在那里），不能借这条 capability 让前端绕过它。",
+  "description": "监视窗自身需要的窗口控制权限。core:window:default 只含只读权限，不含 close——progress.js 的 × 按钮调 getCurrentWindow().close() 会被 ACL 静默拒绝，窗口关不掉。startDragging 是拖拽兜底（progress.js 的 mousedown 兜底，除关闭钮外全窗可拖）；set-position 供位置记忆（重启回原位）。只授 progress 窗口：主窗口的关闭/移动走 window_control 与系统拖拽（data-tauri-drag-region），不能借这条 capability 让前端绕过。",
   "windows": ["progress"],
-  "permissions": ["core:window:allow-close"]
+  "permissions": [
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-position"
+  ]
 }

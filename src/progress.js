@@ -122,7 +122,8 @@
     // close 走的是 core:window|close IPC，需要 capabilities 里的
     // core:window:allow-close（见 progress-window capability）。权限缺失时
     // 这里的 promise 会 reject——静默吞掉的话，症状只是「点了没反应」，
-    // 和权限被拒时一模一样，无法排查。
+    // 和权限被拒时一模一样，无法排查。关闭前顺手记住窗口位置。
+    savePosition();
     window.__TAURI__.window
       .getCurrentWindow()
       .close()
@@ -130,6 +131,66 @@
         document.body.textContent = "关闭监视窗失败：" + String(e);
       });
   });
+
+  // ---------- 拖拽兜底与位置持久化 ----------
+  //
+  // data-tauri-drag-region 只命中「被按住的那个元素自带属性」：进度条、
+  // 空隙、padding 上按下都拖不动——小窗一半面积是死的。这里用 mousedown
+  // 统一兜底：除关闭钮以外的任何位置按下（左键）都进入系统拖拽。
+  // startDragging 走 core:window 权限（与 close 同一组 ACL，见 capability）。
+  document.body.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    if (e.target.closest("#pwClose")) return;
+    // 文本选择不需要（user-select:none 已全局），直接交给系统拖拽
+    window.__TAURI__.window
+      .getCurrentWindow()
+      .startDragging()
+      .catch(() => {});
+  });
+
+  // 位置持久化：挪过之后重启还在原处。存 localStorage（与主题缓存同款
+  // 容忍度——隐私模式写不进去就退回默认位置，不值得为它上 IPC）。
+  const POS_KEY = "veloxgrab.monitorPos";
+  function savePosition() {
+    try {
+      const w = window.__TAURI__.window.getCurrentWindow();
+      const p = w.outerPosition();
+      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) {
+        localStorage.setItem(POS_KEY, JSON.stringify({ x: p.x, y: p.y }));
+      }
+    } catch (e) {
+      // 位置记忆失败不影响任何主流程
+    }
+  }
+  function restorePosition() {
+    try {
+      const raw = localStorage.getItem(POS_KEY);
+      if (!raw) return;
+      const { x, y } = JSON.parse(raw);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      const w = window.__TAURI__.window.getCurrentWindow();
+      // setPosition 需要 core:window:allow-set-position —— capabilities 里补
+      w.setPosition(new window.__TAURI__.dpi.PhysicalPosition(x, y))
+        .catch(() => {});
+    } catch (e) {
+      // 坏数据/权限缺失：退回默认位置
+    }
+  }
+  restorePosition();
+  // 拖拽结束（mouseup）与窗口挪动时记录位置：move 事件高频，500ms 节流
+  let posTimer = null;
+  if (window.__TAURI__?.window) {
+    window.__TAURI__.window
+      .getCurrentWindow()
+      .onMoved(() => {
+        if (posTimer) return;
+        posTimer = setTimeout(() => {
+          posTimer = null;
+          savePosition();
+        }, 500);
+      })
+      .catch(() => {});
+  }
 
   if (listen) {
     listen("task-progress", (evt) => {

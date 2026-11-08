@@ -114,7 +114,7 @@ pub struct UpdateInfo {
 }
 
 /// "1.2.3" / "v1.2.3" / "1.2" → [1,2,3]；解析不了返回 None。
-fn parse_ver(s: &str) -> Option<[u64; 3]> {
+pub fn parse_ver(s: &str) -> Option<[u64; 3]> {
     let t = s.trim().trim_start_matches('v');
     let mut it = t.split('.');
     let major = it.next()?.parse().ok()?;
