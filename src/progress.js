@@ -66,6 +66,11 @@
     const { act, done, total, known, pct } = agg();
     const queued = tasks.filter((t) => t.state === "queued").length;
 
+    // live 类驱动样式层的「活动/待机」两态：活动时数值染 accent + 辉光、
+    // 顶部光带全亮；待机时全部收敛。className 整体写，避免残留旧类。
+    const monitor = document.querySelector(".monitor");
+    if (monitor) monitor.classList.toggle("live", act.length > 0);
+
     if (!act.length) {
       $("mName").textContent = queued > 0 ? `${queued} 个任务排队中` : "待机";
       $("mValue").textContent = "—";

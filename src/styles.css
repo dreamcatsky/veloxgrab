@@ -1579,7 +1579,9 @@ input[type="number"]:focus {
 
 /* ---------- 下载监视框（无框小方窗） ----------
    窗口本体 transparent + decorations(false)，圆角和描边由 .monitor 画。
-   整体 data-tauri-drag-region 可拖动；速度 / 进度每 2.5 秒轮流显示。 */
+   整体 data-tauri-drag-region 可拖动；速度 / 进度每 2.5 秒轮流显示。
+   材质与主窗口同一套 Frost 设计系统：玻璃底 + 噪点颗粒 + 顶部 accent
+   高光带，让悬浮的小窗看起来是主程序的延伸而不是一块普通灰板。 */
 body.monitor-body {
   background: transparent;
   overflow: hidden;
@@ -1588,19 +1590,47 @@ body.monitor-body {
   width: 100vw;
   height: 100vh;
   box-sizing: border-box;
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: 5px;
-  padding: 9px 12px 11px;
-  background: color-mix(in srgb, var(--bg) 90%, transparent);
-  border: 1px solid var(--line-2);
-  border-radius: 12px;
-  box-shadow: 0 10px 32px rgba(0, 0, 0, .35);
-  backdrop-filter: blur(20px) saturate(150%);
-  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  gap: 4px;
+  padding: 12px 14px 13px;
+  background: var(--glass);
+  border: 1px solid var(--glass-line);
+  border-radius: 14px;
+  box-shadow:
+    0 16px 44px var(--shadow-strong),
+    0 2px 8px var(--shadow-soft),
+    inset 0 1px 0 var(--glass-edge);
+  backdrop-filter: blur(var(--blur)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(150%);
+  overflow: hidden;
   user-select: none;
 }
-.m-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+/* 噪点颗粒 + 顶部渐变光带：与主窗口的 Frost 材质同源。
+   ::before 铺颗粒，::after 是 2px 的 accent 渐变顶带（speed/progress
+   主题色在窗口顶端露一条，材质立刻有了「同一设计系统」的辨识度）。 */
+.monitor::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--grain);
+  opacity: .5;
+  pointer-events: none;
+}
+.monitor::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 10%;
+  right: 10%;
+  height: 2px;
+  border-radius: 99px;
+  background: var(--grad);
+  opacity: .85;
+  pointer-events: none;
+}
+.m-top { display: flex; align-items: center; gap: 6px; min-width: 0; position: relative; }
 .m-name {
   flex: 1;
   font-size: 11px;
@@ -1615,30 +1645,45 @@ body.monitor-body {
   color: var(--faint);
   font-size: 14px;
   line-height: 1;
-  padding: 0 3px;
-  border-radius: 5px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
   cursor: default;
+  transition: background .12s, color .12s;
 }
 .m-close:hover { color: var(--text); background: var(--hover); }
+/* 数值：等宽 + tabular-nums，轮播切换时数字不跳宽。
+   active 任务存在时数值染 accent——静止灰、活动亮，扫一眼就知道状态。 */
+.monitor.live .m-value { color: var(--accent); }
 .m-value {
   font-family: var(--mono);
-  font-size: 26px;
-  font-weight: 600;
+  font-size: 27px;
+  font-weight: 650;
+  letter-spacing: -.02em;
   color: var(--text);
-  line-height: 1.05;
+  line-height: 1.08;
   font-variant-numeric: tabular-nums;
+  position: relative;
+  text-shadow: 0 0 18px color-mix(in srgb, var(--accent) 22%, transparent);
 }
 .m-sub {
   font-size: 10.5px;
   color: var(--faint);
   min-height: 14px;
   line-height: 14px;
+  position: relative;
+  letter-spacing: .01em;
 }
 .m-bar {
-  height: 5px;
+  height: 6px;
   border-radius: 99px;
-  background: color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, .18);
   overflow: hidden;
+  position: relative;
 }
 .m-fill {
   height: 100%;
@@ -1646,4 +1691,19 @@ body.monitor-body {
   border-radius: 99px;
   background: var(--grad);
   transition: width .25s;
+  position: relative;
 }
+/* 进度条头部高光：渐变填充上再叠一道顶部反光，厚度感来自这 1px。 */
+.m-fill::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 1px;
+  right: 1px;
+  height: 1px;
+  background: rgba(255, 255, 255, .28);
+  border-radius: 99px;
+}
+/* 待机态（无活跃任务）：去掉 accent 光带与数值辉光，安静。 */
+.monitor:not(.live) .m-value { text-shadow: none; }
+.monitor:not(.live)::after { opacity: .35; }
