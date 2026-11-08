@@ -105,6 +105,17 @@
    * 后端返回的目录名来自安装/解压位置，用户完全可能把它放在 `D:\a&b\<c>`
    * 这种路径下；直接拼进模板会让路径里的标签被当成 HTML 解析。
    */
+  /**
+   * 统一的确认入口：Tauri 2 把 window.confirm 重写成返回 Promise<boolean>
+   * 且**不阻塞**——把返回值当布尔用的话 Promise 恒为真值，`if (!ok) return`
+   * 永远拦不住，「确认框还开着、文件已经删了」就是这个（1.4.1 实测事故）。
+   * 这里统一 await：Promise 形态等用户作答，同步布尔形态（非 Tauri 环境）
+   * 原样透传，两种形态都安全。
+   */
+  async function askConfirm(message) {
+    return Boolean(await confirm(message));
+  }
+
   function showError(msg) {
     const b = $("parseError");
     if (!msg) {
@@ -901,7 +912,7 @@
       ]
         .filter(Boolean)
         .join("、");
-      const ok = confirm(
+      const ok = await askConfirm(
         `这个任务已经下载了一部分。修改${what}后，已有断点不会迁移，任务会从头重新开始。\n\n继续吗？`
       );
       if (!ok) return;
@@ -1078,7 +1089,7 @@
         refreshTasks();
       } else if (action === "remove") {
         const ids = picked.map((t) => t.id);
-        const ok = confirm(
+        const ok = await askConfirm(
           `确定移除选中的 ${ids.length} 个任务吗？\n\n正在下载的任务会被中止，未完成的临时文件会被删除。\n（已下载完成的文件会保留在硬盘上；如需连文件一起删，请用「删除任务和文件」）`
         );
         if (!ok) return;
@@ -1097,7 +1108,7 @@
           return;
         }
         const skip = ids.length - done.length;
-        const ok = confirm(
+        const ok = await askConfirm(
           `确定删除 ${done.length} 个任务的下载文件吗？\n\n` +
             `文件会从硬盘上永久删除，无法恢复。\n` +
             (skip > 0 ? `另有 ${skip} 个未完成的任务只移除记录（没有成品文件）。\n` : "") +
@@ -2063,7 +2074,7 @@
         }
         // 清空是不可撤销的：它会删掉所有临时文件，正在下载的也会被中止。
         // 这里必须确认一次，不能像「清除已结束」那样点了就做。
-        const ok = confirm(
+        const ok = await askConfirm(
           `确定清空全部 ${total} 个任务吗？\n\n正在下载的任务会被中止，未完成的临时文件会被删除。`
         );
         if (!ok) break;
