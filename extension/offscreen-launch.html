@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8" /></head>
+<!--
+  offscreen 文档：service worker 里没有 location，无法导航到自定义协议；
+  chrome.tabs 对 veloxgrab:// 又会静默拦截。MV3 官方给 SW 的「有 DOM 的
+  代理页」就是 offscreen document——它是一个真实的扩展页面，导航到
+  veloxgrab://launch 会触发 Windows 的协议分发，把 VeloxGrab 拉起来。
+
+  导航即使命令完成：本页只做一件事，done 后没有存在的必要。桌面端起来
+  之后 single_instance 插件会把已有实例的窗口拉到前台。
+-->
+<body>
+<script>
+  location.href = "veloxgrab://launch";
+</script>
+</body>
+</html>

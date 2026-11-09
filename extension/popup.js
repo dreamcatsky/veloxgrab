@@ -371,7 +371,12 @@ async function send(url) {
       msg("已发送给 VeloxGrab");
       setTimeout(() => window.close(), 700);
     } else {
-      msg("VeloxGrab 没有响应，请确认它正在运行（托盘图标可见）", true);
+      // 桌面端没在运行：让后台用 offscreen 文档拉起它（协议导航），
+      // 提示用户稍后重试——桌面端起来需要几秒，立刻重发大概率还是失败。
+      try {
+        await chrome.runtime.sendMessage({ type: "veloxgrab-launch" });
+      } catch {}
+      msg("VeloxGrab 未运行，已尝试启动它——几秒后重试", true);
     }
   } catch (e) {
     msg("发送失败：" + String(e), true);

@@ -3011,7 +3011,14 @@
   }
 
   async function acceptExternalLink(p) {
-    if (!p || !p.url) return;
+    if (!p || p.error) return;
+    // launch 动作：扩展在桌面端未运行时发来的「只拉起」请求，不带任务。
+    // 窗口已经被 dispatch_external_link 拉到前台了，这里只需提示。
+    if (p.action === "launch") {
+      toast("VeloxGrab 已启动");
+      return;
+    }
+    if (!p.url) return;
     // 「先选目录再下载」开关：关掉时保持老行为，静默存入默认目录
     const s = appSettings || (await getSettingsCached());
     if (!s.popup_save_as) {

@@ -298,8 +298,8 @@ chrome.downloads.onCreated.addListener(async (item) => {
         notify("已转给 VeloxGrab", filename || item.url);
       } else {
         notify(
-          "VeloxGrab 未响应，已交回浏览器下载",
-          "请确认 VeloxGrab 正在运行（托盘图标可见）"
+          "VeloxGrab 未运行，已尝试启动它",
+          "已交回浏览器下载；启动 VeloxGrab 后再下一次即可由它接管"
         );
       }
     }
@@ -435,14 +435,55 @@ async function send(target) {
     // 桥不可用 → 走协议
   }
 
-  // 2. 桥不通：到此为止，**不开任何标签页**。
+  // 2. 桥不通：VeloxGrab 没在运行。通过 offscreen 文档导航到
+  //    veloxgrab://launch，触发系统协议分发把桌面端拉起来。
   //
-  // 曾经的 veloxgrab:// 协议兜底已删除：Chrome 会静默拦截扩展发起的自定义
-  // 协议导航（文件头注释），「劫持当前标签页」和「开后台标签页」两种写法
-  // 的实际产出都只是一个多余的空标签页 + 一条假动作通知，用户点一次下载
-  // 凭空多出一个标签页（实测反馈）。桥不通时调用方各有一条诚实的失败路径：
-  // 拦截下载交回浏览器继续、右键/弹窗提示启动 VeloxGrab。
+  //    为什么这里能用协议（而文件头注释说 tabs 导航会被拦）：MV3 的
+  //    offscreen document 是一个**真实的扩展页面**（有 DOM），location.href
+  //    导航到自定义协议触发的是 Windows 协议分发，与用户手点链接同一条
+  //    通路——被拦的只是 tabs.update/create 这类「导航标签页」的写法。
+  //    拉起后桌面端的 single_instance 把已有实例带到前台；冷启动则由
+  //    setup 里的 cold_link 通路处理。任务本身不随 launch 重发：桌面端
+  //    起来后用户重试一次即可（避免「拉起 + 下载」的时序竞态——桌面端
+  //    可能还没监听桥）。
+  await launchDesktopViaOffscreen();
   return false;
+}
+
+/**
+ * 用 offscreen document 拉起桌面端。
+ *
+ * offscreen 文档的创建有原因（reason）与生命周期约束：AUDIO_PLAYBACK 之外
+ * 的 reason 一般要求页面自证用途。这里用 `WORKERS`（官方对「无 UI 的后台
+ * 页面」的宽松分类）+ 一次性导航。Chrome 限制同 reason 只能一个实例，
+ * 所以发完导航就关掉，下次需要再建。
+ */
+let launchingOffscreen = false;
+async function launchDesktopViaOffscreen() {
+  if (launchingOffscreen) return; // 并发的失败 send 只拉一次
+  launchingOffscreen = true;
+  try {
+    if (!chrome.offscreen) return; // Chrome < 109：没有该 API，静默跳过
+    const has = await chrome.offscreen.hasDocument?.();
+    if (!has) {
+      await chrome.offscreen.createDocument({
+        url: "offscreen-launch.html",
+        reasons: ["WORKERS"],
+        justification: "Navigate to veloxgrab://launch to start the desktop app",
+      });
+    }
+    // offscreen-launch.html 自身导航即触发协议；给它 3 秒完成，然后关掉。
+    await new Promise((r) => setTimeout(r, 3000));
+    try {
+      await chrome.offscreen.closeDocument();
+    } catch {
+      // 已经关了/从未建成：不影响任何主流程
+    }
+  } catch {
+    // offscreen 不可用（旧浏览器/权限问题）：退回「只提示用户」的旧行为
+  } finally {
+    launchingOffscreen = false;
+  }
 }
 
 function guessName(url) {
@@ -531,7 +572,8 @@ async function handleMenuClick(info, tab) {
   if (ok === true) {
     // 桥已确认，不用打扰用户
   } else {
-    notify("VeloxGrab 没有响应", "请确认 VeloxGrab 正在运行（托盘图标可见）");
+    // send() 失败时已顺带用 offscreen 拉起桌面端；这里告知结果
+    notify("VeloxGrab 未运行，已尝试启动它", "稍后重试一次即可把链接交给它");
   }
 }
 
@@ -545,6 +587,11 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg) return;
+  // popup 请求拉起桌面端（send 失败时触发；offscreen 文档导航协议）
+  if (msg.type === "veloxgrab-launch") {
+    launchDesktopViaOffscreen().then(() => sendResponse({ ok: true }));
+    return true;
+  }
   // popup 查询当前页签嗅探到的流媒体候选
   if (msg.type === "veloxgrab-sniff-query") {
     sniffedFor(msg.tabId).then((list) => sendResponse({ list }));

@@ -83,6 +83,7 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
     if lb.starts_with("http://") || lb.starts_with("https://") {
         return Ok(LinkRequest {
             url: body.to_string(),
+            action: None,
             filename: None,
             save_dir: None,
             threads: None,
@@ -103,9 +104,22 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
         None => (body, ""),
     };
     let path = path.trim_end_matches('/');
+    // launch：浏览器扩展在桌面端未运行时用来拉起主窗（不带任务）。
+    // 只要求窗口到前台，不需要任何参数；队列里可能有历史暂停任务，
+    // 但「自动开始下载」是用户的决定，拉起 ≠ 恢复。
+    if path.eq_ignore_ascii_case("launch") {
+        return Ok(LinkRequest {
+            url: String::new(),
+            action: Some("launch".into()),
+            filename: None,
+            save_dir: None,
+            threads: None,
+            referer: None,
+        });
+    }
     if !path.eq_ignore_ascii_case("add") {
         return Err(format!(
-            "不支持的动作：{path}（可用：add）"
+            "不支持的动作：{path}（可用：add、launch）"
         ));
     }
 
@@ -157,6 +171,7 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
 
     Ok(LinkRequest {
         url,
+        action: None,
         // 空串与缺省一视同仁
         filename: filename.filter(|f| !f.trim().is_empty()),
         save_dir: save_dir.filter(|d| !d.trim().is_empty()),
@@ -173,7 +188,11 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
 /// 一个待入队的下载请求（来自外部链接）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkRequest {
+    /// 下载地址；`action = "launch"` 时为空串（那不是一个下载请求）。
     pub url: String,
+    /// 动作：None = 下载（默认，兼容旧字段）；Some("launch") = 只拉起主窗。
+    #[serde(default)]
+    pub action: Option<String>,
     pub filename: Option<String>,
     pub save_dir: Option<String>,
     pub threads: Option<usize>,
@@ -382,6 +401,24 @@ mod tests {
             .unwrap()
             .referer
             .is_none());
+    }
+
+    /// launch 动作：扩展拉起桌面端用的「只唤醒」请求，不带任务。
+    #[test]
+    fn launch_action_parses_without_task() {
+        let r = parse_deep_link("veloxgrab://launch").unwrap();
+        assert_eq!(r.action.as_deref(), Some("launch"));
+        assert_eq!(r.url, "", "launch 不是下载请求，url 必须为空");
+        assert!(r.filename.is_none() && r.threads.is_none());
+
+        // 浏览器规范化的补斜杠形态
+        let r = parse_deep_link("veloxgrab://launch/").unwrap();
+        assert_eq!(r.action.as_deref(), Some("launch"));
+
+        // add 形态不受影响：action 缺省 = 下载
+        let r = parse_deep_link("veloxgrab://add?url=https%3A%2F%2Fa.com%2Fx").unwrap();
+        assert_eq!(r.action, None);
+        assert_eq!(r.url, "https://a.com/x");
     }
 
     #[test]

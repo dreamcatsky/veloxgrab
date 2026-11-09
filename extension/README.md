@@ -47,6 +47,17 @@ VeloxGrab 启动时在 `127.0.0.1:58943` 起一个极小的 HTTP 服务
 只接管 `http/https`：`blob:` / `data:` 交给浏览器，VeloxGrab 拿不到内容。
 弹窗里的「接管浏览器下载」开关可以整体关掉（存在 `chrome.storage.sync`）。
 
+### 桌面端没在运行：自动拉起
+
+拦截/发送时如果本地桥连不通（VeloxGrab 没在跑），扩展会通过 MV3 的
+**offscreen document** 导航到 `veloxgrab://launch`——offscreen 页面是真实的
+扩展页面，`location.href` 触发的系统协议分发不会被 Chrome 拦（被拦的只是
+`tabs.update/create` 对自定义协议的导航写法）。桌面端起来后用户重试一次即可；
+任务不随 launch 重发（桌面端可能还没监听桥，避免时序竞态）。
+
+前提是协议注册存在——桌面端安装后首次启动会写 `HKCU\...\veloxgrab`。
+便携版没注册协议时 offscreen 导航静默无效，退回「只提示用户手动启动」。
+
 ### 任务监视面板：`/tasks` 与 `/task-action`
 
 弹窗顶部的面板就是下载监视器（GD3 插件的同款体验）：桌面端正在进行的每个
@@ -124,7 +135,10 @@ VeloxGrab 启动时在 `127.0.0.1:58943` 起一个极小的 HTTP 服务
 
 ## 点了没反应？按这个顺序查
 
-1. **先确认 VeloxGrab 在跑**：托盘里有它的图标。桥只在程序运行时存在。
+1. **VeloxGrab 没在跑时会自动拉起**：拦截/发送失败时扩展会通过
+   `veloxgrab://launch` 启动桌面端（通知栏也会提示）。如果拉起没发生，
+   先检查协议注册：`reg query HKCU\Software\Classes\veloxgrab`——
+   便携版没有这条。
 2. **确认桥通不通**：浏览器地址栏输入
    `http://127.0.0.1:58943/add?url=https%3A%2F%2Fexample.com%2Fx.zip` 回车。
    - 返回 `{"ok":true}` → 桥正常，问题在扩展侧（看下一步）；
