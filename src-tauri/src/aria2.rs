@@ -176,16 +176,18 @@ impl RpcError {
     }
 }
 
-/// methods 子集（`system.listMethods` 的返回）。
+/// methods 子集（`system.listMethods` 的返回、也是 `dispatch` 实际实现的全集）。
+///
+/// 只列真正实现的方法：`listMethods` 是对客户端的能力承诺，列了却回
+/// `-32601` 会让「探测能力→按能力调用」的脚本直接失败。aria2 的
+/// `remove` / `pause` / `unpause` 等控制方法暂未实现，因此不在此表中
+/// （调用时明确回 method not found，而不是假装支持）。
 pub const METHODS: &[&str] = &[
     "aria2.addUri",
     "aria2.getVersion",
     "aria2.getGlobalOption",
     "aria2.getGlobalStat",
     "aria2.tellStatus",
-    "aria2.remove",
-    "aria2.pause",
-    "aria2.unpause",
     "system.listMethods",
 ];
 
@@ -691,6 +693,30 @@ mod tests {
         // params 缺席 → 空数组
         let c = parse_call(r#"{"id":1,"method":"system.listMethods"}"#).unwrap();
         assert!(c.params.is_empty());
+    }
+
+    /// `listMethods` 与实际 dispatch 必须一致：列出的每个方法都要能路由，
+    /// 未实现的方法不能出现在能力承诺里（脚本会按它做能力探测）。
+    #[test]
+    fn advertised_methods_match_dispatch() {
+        // dispatch 能处理的方法（与 match 分支一一对应，新增分支时要同步这里）
+        const IMPLEMENTED: &[&str] = &[
+            "aria2.getVersion",
+            "aria2.getGlobalOption",
+            "aria2.getGlobalStat",
+            "system.listMethods",
+            "aria2.addUri",
+            "aria2.tellStatus",
+        ];
+        for m in METHODS {
+            assert!(IMPLEMENTED.contains(m), "listMethods 列了未实现的方法: {m}");
+        }
+        for m in IMPLEMENTED {
+            assert!(METHODS.contains(m), "已实现的方法未在 listMethods 中列出: {m}");
+        }
+        // 明确不支持的控制类方法不在表里
+        assert!(!METHODS.contains(&"aria2.remove"));
+        assert!(!METHODS.contains(&"aria2.pause"));
     }
 
     #[test]
