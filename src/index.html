@@ -398,28 +398,18 @@
             </select>
           </label>
 
-          <label class="fld">
-            <span data-i18n="monitorSize">下载监视窗大小</span>
-            <select id="setMonitorSize">
-              <option value="s" data-i18n="monitorSizeS">小（196×92，只看数字）</option>
-              <option value="m" data-i18n="monitorSizeM">中（236×128，默认）</option>
-              <option value="l" data-i18n="monitorSizeL">大（288×168，全内容）</option>
-            </select>
+          <label class="fld checkbox">
+            <input id="setMonitorAlwaysOn" type="checkbox" />
+            <span><span data-i18n="monitorAlwaysOn">下载监视窗始终置顶</span> <em class="dim" data-i18n="monitorAlwaysOnHint">(关掉后会被其他窗口盖住)</em></span>
           </label>
-          <div class="nd-grid">
-            <label class="fld checkbox">
-              <input id="setMonName" type="checkbox" />
-              <span data-i18n="monName">监视窗显示任务名</span>
-            </label>
-            <label class="fld checkbox">
-              <input id="setMonSub" type="checkbox" />
-              <span data-i18n="monSub">监视窗显示副行（速度/总量说明）</span>
-            </label>
-            <label class="fld checkbox">
-              <input id="setMonBar" type="checkbox" />
-              <span data-i18n="monBar">监视窗显示进度条</span>
-            </label>
-          </div>
+          <label class="fld">
+            <span><span data-i18n="monitorOpacity">下载监视窗不透明度</span> <em class="dim" data-i18n="monitorOpacityHint">(50%–100%)</em></span>
+            <div class="slider-row">
+              <input id="setMonitorOpacity" type="range" min="50" max="100" step="5" />
+              <output id="setMonitorOpacityVal" class="slider-val"></output>
+            </div>
+          </label>
+          <small class="dim" data-i18n="monitorNote">监视窗列出每个任务（进度、速度、暂停/继续、打开文件）；大小与位置可以直接拖动调整，会记住。</small>
           </section>
 
           <section class="set-card">

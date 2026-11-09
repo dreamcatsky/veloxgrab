@@ -9,6 +9,11 @@ fn default_true() -> bool {
     true
 }
 
+/// 监视窗默认不透明度。
+fn default_monitor_opacity() -> f64 {
+    1.0
+}
+
 /// 一条「按扩展名分目录」规则。
 ///
 /// 只允许单层目录名（`Video`、`压缩包`），不允许 `..`、路径分隔符或盘符：
@@ -165,22 +170,16 @@ pub struct Settings {
     pub notify_on_complete: bool,
     /// 点窗口「×」的行为：background（最小化到托盘）| ask（询问）| quit（退出）
     pub close_mode: String,
-    /// 监视窗尺寸档位：s（196×92）| m（236×128，默认）| l（288×168）。
+    /// 监视窗是否保持置顶。
     ///
-    /// 小窗常驻桌面的核心诉求是「不碍事」，尺寸交给用户。档位而不是自由
-    /// 拖拽缩放：无框小窗做 resize 手柄的成本（命中区与拖拽区打架）配不上
-    /// 收益，三档覆盖「只看数字 / 看数字+副行 / 全都要」。
-    /// serde(default)：旧配置文件没有这个字段时回 m，与升级前行为一致。
-    #[serde(default)]
-    pub monitor_size: String,
-    /// 监视窗显示哪些内容行：名称行、数值副行（"下载速度"/"已下/总量"）、
-    /// 进度条。三档独立开关；全关 = 只剩一个大数字。
-    #[serde(default)]
-    pub monitor_show_name: bool,
+    /// 列表版监视窗默认置顶（这样才能挂在别的窗口旁边盯进度）；关掉后它
+    /// 会被普通窗口盖住，适合把它当成「需要时切过去看一眼」的用户。
     #[serde(default = "default_true")]
-    pub monitor_show_sub: bool,
-    #[serde(default = "default_true")]
-    pub monitor_show_bar: bool,
+    pub monitor_always_on: bool,
+    /// 监视窗不透明度（0.5–1.0）。默认 1.0：列表里有文字与进度条，
+    /// 半透明会降低可读性；想要「透出桌面」的用户可以自己调低。
+    #[serde(default = "default_monitor_opacity")]
+    pub monitor_opacity: f64,
     /// 点窗口「×」的行为：background（最小化到托盘）| ask（询问）| quit（退出）
     /// 外观主题：system（跟随系统）| dark | light
     pub theme: String,
@@ -237,10 +236,8 @@ impl Default for Settings {
             clipboard_watch: false,
             notify_on_complete: true,
             close_mode: "background".into(),
-            monitor_size: "m".into(),
-            monitor_show_name: true,
-            monitor_show_sub: true,
-            monitor_show_bar: true,
+            monitor_always_on: true,
+            monitor_opacity: 1.0,
             proxy_enabled: false,
             proxy_type: "http".into(),
             proxy_host: String::new(),

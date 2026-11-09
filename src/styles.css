@@ -1645,14 +1645,19 @@ input[type="number"]:focus {
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--dim); background-clip: padding-box; }
 
-/* ---------- 下载监视框（无框小方窗） ----------
-   窗口本体 transparent + decorations(false)，圆角和描边由 .monitor 画。
-   整体 data-tauri-drag-region 可拖动；速度 / 进度每 2.5 秒轮流显示。
-   材质与主窗口同一套 Frost 设计系统：玻璃底 + 噪点颗粒 + 顶部 accent
-   高光带，让悬浮的小窗看起来是主程序的延伸而不是一块普通灰板。 */
+
+/* ---------- 下载监视框（逐任务列表） ----------
+   窗口本体 transparent + decorations(false)，圆角/描边/材质由 .monitor 画。
+   顶栏与空白处可拖动；右下角 .m-resize 是视觉提示（窗口 resizable）。
+   每个任务一行：图标、名称、状态徽标、进度条、速度、行内操作。
+
+   材质与主窗口同源（Frost：玻璃 + 噪点），--m-opacity 由 monitor.rs
+   按设置注入到 body 的 inline style 上。 */
 body.monitor-body {
   background: transparent;
   overflow: hidden;
+  /* 整窗不透明度：默认 1，设置里可调低到 0.5 */
+  opacity: var(--m-opacity, 1);
 }
 .monitor {
   width: 100vw;
@@ -1661,13 +1666,12 @@ body.monitor-body {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 12px 14px 13px;
+  padding: 0;
   background: var(--glass);
   border: 1px solid var(--glass-line);
   border-radius: 14px;
   box-shadow:
-    0 16px 44px var(--shadow-strong),
+    0 18px 48px var(--shadow-strong),
     0 2px 8px var(--shadow-soft),
     inset 0 1px 0 var(--glass-edge);
   backdrop-filter: blur(var(--blur)) saturate(150%);
@@ -1675,110 +1679,242 @@ body.monitor-body {
   overflow: hidden;
   user-select: none;
 }
-/* 噪点颗粒 + 顶部渐变光带：与主窗口的 Frost 材质同源。
-   ::before 铺颗粒，::after 是 2px 的 accent 渐变顶带（speed/progress
-   主题色在窗口顶端露一条，材质立刻有了「同一设计系统」的辨识度）。 */
+/* 噪点颗粒与主窗口同一张纹理 */
 .monitor::before {
   content: "";
   position: absolute;
   inset: 0;
   background: var(--grain);
-  opacity: .5;
+  opacity: .45;
   pointer-events: none;
+  border-radius: inherit;
 }
-.monitor::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 10%;
-  right: 10%;
-  height: 2px;
-  border-radius: 99px;
-  background: var(--grad);
-  opacity: .85;
-  pointer-events: none;
+
+/* ---- 顶栏 ---- */
+.m-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px 8px 12px;
+  position: relative;
+  flex: 0 0 auto;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
 }
-.m-top { display: flex; align-items: center; gap: 6px; min-width: 0; position: relative; }
-.m-name {
+/* 状态点：有活跃下载时亮起（呼吸），否则是中性灰点 */
+.m-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+  flex: 0 0 auto;
+  transition: background .2s, box-shadow .2s;
+}
+.m-dot.on {
+  background: var(--accent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 60%, transparent);
+  animation: m-pulse 1.8s ease-in-out infinite;
+}
+@keyframes m-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .45; }
+}
+.m-title {
   flex: 1;
-  font-size: 11px;
-  color: var(--dim);
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.m-agg {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
 }
 .m-close {
   border: 0;
   background: transparent;
   color: var(--faint);
-  font-size: 14px;
+  font-size: 15px;
   line-height: 1;
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   padding: 0;
   display: grid;
   place-items: center;
   border-radius: 6px;
   cursor: default;
+  flex: 0 0 auto;
   transition: background .12s, color .12s;
 }
 .m-close:hover { color: var(--text); background: var(--hover); }
-/* 数值：等宽 + tabular-nums，轮播切换时数字不跳宽。
-   active 任务存在时数值染 accent——静止灰、活动亮，扫一眼就知道状态。 */
-.monitor.live .m-value { color: var(--accent); }
-.m-value {
-  font-family: var(--mono);
-  font-size: 27px;
-  font-weight: 650;
-  letter-spacing: -.02em;
+
+/* ---- 列表 ---- */
+.m-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative;
+}
+.m-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 8px 9px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--bg) 42%, transparent);
+  border: 1px solid color-mix(in srgb, var(--line) 65%, transparent);
+  transition: background .12s, border-color .12s;
+}
+.m-row:hover {
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg) 40%);
+  border-color: color-mix(in srgb, var(--accent) 26%, var(--line));
+}
+.m-ic {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--dim);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  margin-top: 1px;
+}
+.m-ic.v { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.m-ic.m { color: #b07cf0; background: rgba(176, 124, 240, .14); }
+.m-ic.p { color: #4aa8c8; background: rgba(74, 168, 200, .14); }
+.m-ic.a { color: #d09a4a; background: rgba(208, 154, 74, .14); }
+.m-ic.d { color: #7aa86a; background: rgba(122, 168, 106, .14); }
+
+.m-rbody { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.m-r1 { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.m-rname {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 500;
   color: var(--text);
-  line-height: 1.08;
-  font-variant-numeric: tabular-nums;
-  position: relative;
-  text-shadow: 0 0 18px color-mix(in srgb, var(--accent) 22%, transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.m-sub {
-  font-size: 10.5px;
-  color: var(--faint);
-  min-height: 14px;
-  line-height: 14px;
-  position: relative;
-  letter-spacing: .01em;
+.m-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 99px;
+  color: var(--dim);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
 }
-/* 内容行开关：设置里的 monitor_show_* 落到 body 的 data 属性，
-   progress.js 首帧与 monitor.rs 每次浮出时都会写。1 = 显示。 */
-body[data-mon-sub="0"] .m-sub { display: none; }
-body[data-mon-bar="0"] .m-bar { display: none; }
-body[data-mon-name="0"] .m-name { visibility: hidden; }
-/* 名称行藏掉但关闭钮保留：拖拽区在 .m-top 上，行可隐、窗得能拖能关。 */
-body[data-mon-name="0"] .m-top { min-height: 18px; }
-.m-bar {
-  height: 6px;
+.m-row.st-downloading .m-badge { color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, transparent); }
+.m-row.st-merging .m-badge { color: #b07cf0; background: rgba(176, 124, 240, .16); }
+.m-row.st-done .m-badge { color: #7aa86a; background: rgba(122, 168, 106, .16); }
+.m-row.st-failed .m-badge { color: var(--err); background: color-mix(in srgb, var(--err) 15%, transparent); }
+
+/* 行内操作：默认淡出，悬停整行时浮现——列表本身已经够密，
+   常驻一排按钮会让每一行都在抢注意力。 */
+.m-acts { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; opacity: 0; transition: opacity .12s; }
+.m-row:hover .m-acts, .m-row:focus-within .m-acts { opacity: 1; }
+.m-btn {
+  border: 0;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--dim);
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 6px;
+  font-size: 10px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  cursor: default;
+  transition: background .12s, color .12s;
+}
+.m-btn:hover { color: var(--text); background: color-mix(in srgb, var(--accent) 26%, transparent); }
+.m-btn:disabled { opacity: .5; }
+
+/* 进度条：与主窗口任务表同一套（细、圆角、渐变填充） */
+.m-rbar {
+  height: 4px;
   border-radius: 99px;
   background: color-mix(in srgb, var(--text) 9%, transparent);
-  box-shadow: inset 0 1px 1px rgba(0, 0, 0, .18);
   overflow: hidden;
-  position: relative;
 }
-.m-fill {
+.m-rfill {
   height: 100%;
   width: 0%;
   border-radius: 99px;
   background: var(--grad);
   transition: width .25s;
-  position: relative;
 }
-/* 进度条头部高光：渐变填充上再叠一道顶部反光，厚度感来自这 1px。 */
-.m-fill::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 1px;
-  right: 1px;
-  height: 1px;
-  background: rgba(255, 255, 255, .28);
-  border-radius: 99px;
+.m-row.st-done .m-rfill { background: #7aa86a; }
+.m-row.st-failed .m-rfill { background: var(--err); }
+.m-row.st-paused .m-rfill { opacity: .55; }
+
+.m-r2 { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.m-rmeta {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
 }
-/* 待机态（无活跃任务）：去掉 accent 光带与数值辉光，安静。 */
-.monitor:not(.live) .m-value { text-shadow: none; }
-.monitor:not(.live)::after { opacity: .35; }
+.m-rmeta.bad { color: var(--err); font-family: inherit; }
+.m-rpct {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 空态与页脚 ---- */
+.m-empty {
+  flex: 1 1 auto;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  color: var(--faint);
+  padding: 20px;
+}
+.m-foot {
+  flex: 0 0 auto;
+  padding: 6px 12px 8px;
+  font-size: 11px;
+  color: var(--dim);
+  border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+}
+.m-foot.bad { color: var(--err); }
+
+/* ---- 缩放手柄视觉提示 ----
+   无框窗口在 Windows 上仍有系统边缘热区，但深色玻璃上看不见；
+   这里画一个右下角提示，实际缩放交给系统。 */
+.m-resize {
+  position: fixed;
+  right: 2px;
+  bottom: 2px;
+  width: 12px;
+  height: 12px;
+  cursor: nwse-resize;
+  opacity: .5;
+  background:
+    linear-gradient(135deg, transparent 45%, var(--faint) 45%, var(--faint) 55%, transparent 55%),
+    linear-gradient(135deg, transparent 70%, var(--faint) 70%, var(--faint) 78%, transparent 78%);
+  border-bottom-right-radius: 12px;
+  pointer-events: none;
+}

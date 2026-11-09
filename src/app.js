@@ -325,13 +325,11 @@
     editRate: "Speed limit for this task (KB/s)",
     editSha: "Expected SHA-256 (optional)",
     searchPh: "Search name / URL / path…",
-    monitorSize: "Monitor window size",
-    monitorSizeS: "Small (196×92, numbers only)",
-    monitorSizeM: "Medium (236×128, default)",
-    monitorSizeL: "Large (288×168, full content)",
-    monName: "Monitor: show task name",
-    monSub: "Monitor: show sub line (speed/total)",
-    monBar: "Monitor: show progress bar",
+    monitorAlwaysOn: "Keep the download monitor on top",
+    monitorAlwaysOnHint: "(off: other windows may cover it)",
+    monitorOpacity: "Download monitor opacity",
+    monitorOpacityHint: "(50%–100%)",
+    monitorNote: "The monitor lists every task (progress, speed, pause/resume, open file); drag its edges to resize, and the size and position are remembered.",
     ndStartAt: "Start at",
     ndStartAtHint: "(optional; empty = start now)",
     ndSha: "Expected SHA-256",
@@ -1809,11 +1807,12 @@
     $("setClipboardWatch").checked = s.clipboard_watch ?? false;
     $("setNotifyComplete").checked = s.notify_on_complete ?? true;
     $("setCloseMode").value = s.close_mode || "background";
-    // 监视窗偏好：尺寸 + 内容行（旧配置没有这些字段时回落到默认档）
-    $("setMonitorSize").value = s.monitor_size || "m";
-    $("setMonName").checked = s.monitor_show_name ?? true;
-    $("setMonSub").checked = s.monitor_show_sub ?? true;
-    $("setMonBar").checked = s.monitor_show_bar ?? true;
+    // 监视窗偏好：置顶 + 不透明度（尺寸与位置由监视窗自己持久化）
+    $("setMonitorAlwaysOn").checked = s.monitor_always_on ?? true;
+    const op = Math.round((s.monitor_opacity ?? 1) * 100);
+    $("setMonitorOpacity").value = op;
+    $("setMonitorOpacityVal").textContent = op + "%";
+    syncRangeFill($("setMonitorOpacity"));
     $("setBrowser").value = s.cookies_from_browser || "none";
     $("setCookiesFile").value = s.cookies_file || "";
     $("setProxyEnabled").checked = !!s.proxy_enabled;
@@ -1883,10 +1882,8 @@
       clipboard_watch: $("setClipboardWatch").checked,
       notify_on_complete: $("setNotifyComplete").checked,
       close_mode: $("setCloseMode").value,
-      monitor_size: $("setMonitorSize").value || "m",
-      monitor_show_name: $("setMonName").checked,
-      monitor_show_sub: $("setMonSub").checked,
-      monitor_show_bar: $("setMonBar").checked,
+      monitor_always_on: $("setMonitorAlwaysOn").checked,
+      monitor_opacity: (Number($("setMonitorOpacity").value) || 100) / 100,
       proxy_enabled: $("setProxyEnabled").checked,
       proxy_type: $("setProxyType").value,
       proxy_host: $("setProxyHost").value.trim(),
@@ -2905,6 +2902,10 @@
   });
   $("setDefaultThreads").addEventListener("input", (e) => {
     $("setDefaultThreadsVal").textContent = e.target.value;
+    syncRangeFill(e.target);
+  });
+  $("setMonitorOpacity").addEventListener("input", (e) => {
+    $("setMonitorOpacityVal").textContent = e.target.value + "%";
     syncRangeFill(e.target);
   });
 
