@@ -148,6 +148,11 @@ pub struct Task {
     /// 历史回灌同样生效——「下错了」比「下不了」更该被拦下。
     #[serde(default)]
     pub sha256: Option<String>,
+    /// 页面地址（Referer）。浏览器扩展拦截下载时带来，防盗链直链必须原样
+    /// 带上；直链请求经 `NetCfg` 注入，视频任务映射为 yt-dlp `--referer`。
+    /// 历史回灌同样生效（否则续传会 403）。
+    #[serde(default)]
+    pub referer: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -881,6 +886,10 @@ async fn run_download_inner(
     // 与 probe 保持一致：浏览器加密导致读不到 Cookie 时，
     // 不带 Cookie 反而更容易成功。
     push_common_args(&mut cmd, &settings, with_cookies, &task.url);
+    // 任务自带的页面 Referer（浏览器扩展投递）：yt-dlp 的 --referer
+    if let Some(r) = task.referer.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        cmd.arg("--referer").arg(r);
+    }
     // 不传 --no-part：中断时保留 `.part`，不会留下一个「看起来完整、实际残缺」
     // 的最终文件。临时文件按「清晰度 + URL 哈希」分目录存放：
     // 换清晰度不会把新流续写到旧文件尾部；不同 URL 即使标题相同也互不干扰。
@@ -1386,6 +1395,11 @@ pub async fn run_direct_download(
     // 按目标 host 决定是否带上 HuggingFace token：直链请求走的是 reqwest，
     // 不经过 yt-dlp 的参数拼装，凭证作用域必须在这一层同样成立。
     let mut net = crate::settings::NetCfg::for_url(&settings, &task.url);
+    // 任务自带 Referer（浏览器扩展/深链带来）：防盗链直链必须原样带上，
+    // 否则 403；它比设置里的预设更具体，直接覆盖。
+    if let Some(r) = task.referer.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        net.referer = Some(r.to_string());
+    }
     // 任务级限速覆盖全局：Some(v) 时以任务为准（Some(0) = 本任务不限速，
     // 即使全局开了限速——「这个任务要抢速度」是明确意图）。
     if let Some(kb) = task.rate_kb {
@@ -1773,6 +1787,7 @@ mod tests {
         start_at: None,
         rate_kb: None,
         sha256: None,
+        referer: None,
         }
     }
 
@@ -1941,6 +1956,7 @@ mod tests {
             expected_ext: None,
         start_at: None,
         rate_kb: None,
+        referer: None,
         sha256: None,
         }
     }

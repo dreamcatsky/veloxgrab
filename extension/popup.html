@@ -34,8 +34,16 @@
     <div id="mediaList" class="media"></div>
   </div>
 
+  <div class="row" id="sniffWrap" style="display:none">
+    <label>嗅探到的流媒体 <span class="dim">（HLS / DASH 清单，点一条直接发送）</span></label>
+    <div id="sniffList" class="media"></div>
+  </div>
+
   <div class="row">
     <label class="chk"><input id="intercept" type="checkbox" checked /> 接管浏览器下载（点下载链接自动转给 VeloxGrab）</label>
+  </div>
+  <div class="row">
+    <label class="chk"><input id="sniff" type="checkbox" checked /> 嗅探页面里的流媒体（m3u8 / mpd）</label>
   </div>
 
   <div class="row">

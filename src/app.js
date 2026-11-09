@@ -129,6 +129,7 @@
   // ---------- 状态 ----------
   let currentMedia = null;
   let currentDirect = null;
+  let currentPlaylist = null;
   let taskMap = new Map();
   let appSettings = null;
 
@@ -205,6 +206,12 @@
     hfTokenHint: "(optional, hf_xxx)",
     rateLimit: "Global speed limit",
     rateLimitHint: "(KB/s, 0 = off)",
+    mirrorPrefix: "Download mirror prefix",
+    mirrorPrefixHint: "(GitHub / HuggingFace only; empty = direct)",
+    githubToken: "GitHub Token",
+    githubTokenHint: "(optional, raises Release API rate limit)",
+    mirrorNote: "A mirror is a third-party relay that can see your requests and file contents; credentialed requests and task SHA-256 checks are unaffected.",
+    releaseTag: "Release",
     categoriesEnabled: "Sort downloads into subfolders by extension",
     categoriesHint: "(only when no save folder is chosen for the task)",
     catFolder: "Subfolder",
@@ -253,6 +260,10 @@
     optionalHint: "(optional)",
     proxyHint: "SOCKS5 uses socks5h (remote DNS); works with v2rayN port 10808",
     browserInt: "Browser integration",
+    aria2Enable: "aria2 JSON-RPC compatible service",
+    aria2Hint: "(127.0.0.1:6800, token required; turning it off needs a restart)",
+    aria2TokenLabel: "RPC Token",
+    aria2Usage: "Point third-party tools at http://127.0.0.1:6800/jsonrpc with the token above. Supports addUri / tellStatus / getVersion and more.",
     openExtDir: "Open extension folder",
     browserIntHint: "Load the veloxgrab-extension folder there into Chrome / Edge extensions",
     browserIntHint2: 'Then right-click a page → "Download with VeloxGrab" sends the link to this app (veloxgrab:// protocol).',
@@ -325,11 +336,16 @@
     ndStartAtHint: "(optional; empty = start now)",
     ndSha: "Expected SHA-256",
     ndShaHint: "(optional, 64 hex chars)",
+    plSelectAll: "All",
+    plDownload: "Download selected",
+    plHint: "Each entry downloads at yt-dlp's best quality",
     cxRemove: "Remove task",
     cxRemoveFile: "Delete task and file",
     editTitle: "Edit task",
     editHint: "Only queued, paused or failed tasks can be edited; changing the file name, folder or thread count does not move existing partial data.",
     editSaveBtn: "Save",
+    editUrl: "Download URL",
+    editUrlHint: "(changing it restarts the download from scratch)",
     upInstall: "Update now",
     upLater: "Later",
     upAvailable: "New version available",
@@ -427,7 +443,8 @@
   function syncStartButtons() {
     const resolved =
       !$("mediaCard").classList.contains("hidden") ||
-      !$("directCard").classList.contains("hidden");
+      !$("directCard").classList.contains("hidden") ||
+      !$("playlistCard").classList.contains("hidden");
 
     const nd = $("newDownload");
     const ndStart = $("ndStart");
@@ -452,8 +469,10 @@
   function preferManualEntry() {
     $("mediaCard").classList.add("hidden");
     $("directCard").classList.add("hidden");
+    $("playlistCard").classList.add("hidden");
     currentMedia = null;
     currentDirect = null;
+    currentPlaylist = null;
     syncStartButtons();
   }
 
@@ -526,8 +545,10 @@
     showError("");
     $("mediaCard").classList.add("hidden");
     $("directCard").classList.add("hidden");
+    $("playlistCard").classList.add("hidden");
     currentMedia = null;
     currentDirect = null;
+    currentPlaylist = null;
     syncStartButtons();
 
     const btn = $("parseBtn");
@@ -537,6 +558,23 @@
     if (btnLabel) btnLabel.textContent = "识别中…";
 
     try {
+      // 播放列表优先：合集/频道地址走 yt-dlp 的扁平解析，一次拿到全部条目。
+      // 不是列表时返回错误（或条目过少），静默回落到单条解析——对单条视频
+      // 地址来说这是一次多余但无害的推断。
+      let pl = null;
+      if (looksLikePlaylistSource(url)) {
+        try {
+          pl = await invoke("probe_playlist", { url });
+        } catch (e) {
+          pl = null;
+        }
+      }
+      if (pl && pl.entries && pl.entries.length > 1) {
+        currentPlaylist = pl;
+        renderPlaylist(pl);
+        return;
+      }
+
       const r = await invoke("probe_auto", { url });
 
       if (r.kind === "video") {
@@ -545,6 +583,9 @@
       } else if (r.kind === "direct") {
         currentDirect = r.direct;
         currentDirect.sourceUrl = url;
+        // GitHub 仓库地址被翻译成了 release 资产：把来源标签带上，
+        // 让用户看清「下的不是这个页面，而是最新版里的某个文件」。
+        currentDirect.release = r.release || null;
         renderDirect(r.direct);
       } else {
         showError(r.message || "无法识别该链接");
@@ -556,6 +597,107 @@
       // 只改 span：直接 btn.textContent 会抹掉 data-i18n 标记节点
       if (btnLabel) btnLabel.textContent =
         ((appSettings && appSettings.language) === "en" && I18N_EN.parse) ? I18N_EN.parse : "解析";
+    }
+  }
+
+  // ---------- 播放列表 ----------
+  //
+  // 「先猜是不是列表，不是就回落到单条解析」：判断只看 URL 形状（list=、
+  // /playlist、/sets/、@频道、/channel/ 等常见形态），猜错只是多花一次
+  // 扁平解析（单条视频上它会很快失败或用一条 entry 表示），不会误把单条
+  // 视频当成列表——真正的判据是解析结果里条目数 > 1。
+  function looksLikePlaylistSource(url) {
+    try {
+      const u = new URL(url);
+      const p = u.pathname.toLowerCase();
+      const q = u.searchParams;
+      if (q.get("list")) return true;
+      return (
+        /\/playlist(\/|$)/.test(p) ||
+        /\/sets?\//.test(p) ||
+        /\/channel\//.test(p) ||
+        /\/user\//.test(p) ||
+        /^\/@[^/]+\/?$/.test(p)
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function renderPlaylist(pl) {
+    $("plTitle").textContent = pl.title || "播放列表";
+    $("plUploader").textContent = pl.uploader || "";
+    $("plCount").textContent = `${pl.count} 个条目`;
+    $("plSelectAll").checked = true;
+    $("plDir").value = $("ndDir").value.trim() || "";
+
+    const host = $("plList");
+    host.innerHTML = "";
+    pl.entries.forEach((e) => {
+      const row = el("label", "pl-row");
+      const cb = el("input");
+      cb.type = "checkbox";
+      cb.checked = true;
+      cb.dataset.idx = String(e.index);
+      cb.onchange = updatePlSelected;
+      row.appendChild(cb);
+      row.appendChild(el("span", "pl-idx", String(e.index)));
+      const name = el("span", "pl-name", e.title || e.url);
+      name.title = e.url;
+      row.appendChild(name);
+      row.appendChild(el("span", "pl-dur", fmtDuration(e.duration)));
+      host.appendChild(row);
+    });
+    updatePlSelected();
+    $("playlistCard").classList.remove("hidden");
+    syncStartButtons();
+  }
+
+  function updatePlSelected() {
+    const boxes = [...$("plList").querySelectorAll('input[type="checkbox"]')];
+    const n = boxes.filter((b) => b.checked).length;
+    $("plSelected").textContent = `已选 ${n} / ${boxes.length}`;
+    $("plSelectAll").checked = n > 0 && n === boxes.length;
+    $("plSelectAll").indeterminate = n > 0 && n < boxes.length;
+    $("plDownloadBtn").disabled = n === 0;
+  }
+
+  async function doPlaylistDownload() {
+    if (!currentPlaylist) return;
+    const picked = new Set(
+      [...$("plList").querySelectorAll('input[type="checkbox"]')]
+        .filter((b) => b.checked)
+        .map((b) => Number(b.dataset.idx))
+    );
+    const entries = currentPlaylist.entries
+      .filter((e) => picked.has(e.index))
+      .map((e) => ({
+        url: e.url,
+        title: e.title,
+        thumbnail: e.thumbnail || null,
+        duration: e.duration || null,
+      }));
+    if (!entries.length) return toast("请先勾选要下载的条目", true);
+
+    const btn = $("plDownloadBtn");
+    btn.disabled = true;
+    try {
+      const r = await invoke("enqueue_playlist", {
+        args: { entries, save_dir: $("plDir").value.trim() || null },
+      });
+      const created = (r && r.created) || 0;
+      const errors = (r && r.errors) || [];
+      toast(
+        errors.length
+          ? `已加入 ${created} 个任务，${errors.length} 条被跳过：${errors[0]}`
+          : `已加入 ${created} 个任务`,
+        errors.length > 0
+      );
+      onDownloadAccepted();
+    } catch (e) {
+      toast(String(e), true);
+    } finally {
+      btn.disabled = false;
     }
   }
 
@@ -577,6 +719,12 @@
     $("dMime").textContent = d.content_type || "未知类型";
 
     const parts = [];
+    if (d.release) {
+      // GitHub Release 资产：来源标签代替「未知类型」，并给出体积
+      const rel = d.release;
+      parts.push(`GitHub Release ${rel.repo}${rel.tag ? " " + rel.tag : ""}`);
+      $("dMime").textContent = "release";
+    }
     if (d.total_bytes) parts.push(`大小: ${fmtBytes(d.total_bytes)}`);
     parts.push(describeRange(d));
     $("dDetail").textContent = parts.join("   ·   ");
@@ -606,9 +754,15 @@
     try {
       const threads = Number($("dThreads").value || 1);
       const nameOverride = $("dFilenameInput").value.trim();
+      // GitHub Release 资产：任务地址要用**资产下载地址**，不是仓库页面；
+      // 否则重下/续传会再去解析一遍 release，而且断点 URL 对不上。
+      const taskUrl =
+        (currentDirect.release && currentDirect.release.download_url) ||
+        currentDirect.final_url ||
+        currentDirect.sourceUrl;
       await invoke("enqueue_download", {
         args: {
-          url: currentDirect.sourceUrl,
+          url: taskUrl,
           title: nameOverride || currentDirect.filename || "文件",
           thumbnail: null,
           duration: null,
@@ -859,6 +1013,7 @@
   function openEditDialog(task) {
     if (!task) return;
     editTargetId = task.id;
+    $("editUrl").value = task.url || "";
     $("editName").value = task.title || "";
     $("editDir").value = task.save_dir || "";
     $("editDir").placeholder =
@@ -887,6 +1042,11 @@
   async function saveEditDialog() {
     const task = editTargetId ? taskMap.get(editTargetId) : null;
     if (!task) return;
+    const url = $("editUrl").value.trim();
+    if (!url) return toast("下载地址不能为空", true);
+    if (!/^(https?|ftp):\/\//i.test(url)) {
+      return toast("地址必须以 http://、https:// 或 ftp:// 开头", true);
+    }
     const title = $("editName").value.trim();
     if (!title) return toast("文件名不能为空", true);
     const dir = $("editDir").value.trim();
@@ -901,10 +1061,19 @@
     // 「最终路径」和 .veloxgrab-meta 上，换任何一个都只能从头重下。
     // 限速与校验预期是元数据，不影响断点。
     const dirChanged = dir !== (task.save_dir || "").trim();
+    const urlChanged = url !== (task.url || "").trim();
+    if (urlChanged) {
+      const ok = await askConfirm(
+        "换了下载地址后，已有的全部进度和断点都会作废，任务会从头重新下载。\n\n继续吗？"
+      );
+      if (!ok) return;
+    }
     const titleChanged = title !== (task.title || "").trim();
     const threadsChanged =
       task.kind === "direct" && Number($("editThreads").value) !== task.threads;
-    if ((dirChanged || titleChanged || threadsChanged) && task.downloaded_bytes > 0) {
+    // 换 URL 时进度本来就会归零，不再重复提示断点问题
+    const otherChange = dirChanged || titleChanged || threadsChanged;
+    if (!urlChanged && otherChange && task.downloaded_bytes > 0) {
       const what = [
         dirChanged ? "保存目录" : null,
         titleChanged ? "文件名" : null,
@@ -918,6 +1087,7 @@
       if (!ok) return;
     }
     const args = { id: task.id, title, save_dir: dir, rate_kb: rateKb, sha256: sha || null };
+    if (urlChanged) args.url = url;
     if (task.kind === "direct") {
       args.threads = Number($("editThreads").value) || 0;
     }
@@ -1622,6 +1792,10 @@
     $("setHfCap").value = s.hf_thread_cap ?? 4;
     $("setHfToken").value = s.hf_token || "";
     $("setRateLimit").value = s.rate_limit_kb ?? 0;
+    $("setMirrorPrefix").value = s.mirror_prefix || "";
+    $("setGithubToken").value = s.github_token || "";
+    $("setAria2").checked = !!s.aria2_enabled;
+    syncAria2Detail();
     $("setCategoriesEnabled").checked = !!s.categories_enabled;
     renderCategoryRules(s.categories || []);
     syncCategoryDetail();
@@ -1657,6 +1831,20 @@
     $("proxyDetail").classList.toggle("hidden", !$("setProxyEnabled").checked);
   }
 
+  /** aria2 RPC 的详情区：开启时显示 token 与用法。 */
+  async function syncAria2Detail() {
+    const box = $("aria2Detail");
+    const on = $("setAria2").checked;
+    box.classList.toggle("hidden", !on);
+    if (!on) return;
+    try {
+      const info = await invoke("aria2_info");
+      $("aria2Token").value = (info && info.token) || "";
+    } catch (e) {
+      $("aria2Token").value = "";
+    }
+  }
+
   async function loadSettings() {
     try {
       const s = await invoke("get_settings");
@@ -1683,6 +1871,9 @@
       popup_quality: $("setPopupQuality").checked,
       popup_save_as: $("setPopupSaveAs").checked,
       rate_limit_kb: Number($("setRateLimit").value) || 0,
+      mirror_prefix: $("setMirrorPrefix").value.trim(),
+      github_token: $("setGithubToken").value.trim(),
+      aria2_enabled: $("setAria2").checked,
       categories_enabled: $("setCategoriesEnabled").checked,
       categories: collectCategories(),
       name_conflict: $("setNameConflict").value,
@@ -2630,6 +2821,21 @@
   });
   $("downloadBtn").onclick = doDownload;
   $("dDownloadBtn").onclick = doDirectDownload;
+  $("plDownloadBtn").onclick = doPlaylistDownload;
+  $("plSelectAll").addEventListener("change", (e) => {
+    const on = e.target.checked;
+    $("plList")
+      .querySelectorAll('input[type="checkbox"]')
+      .forEach((b) => (b.checked = on));
+    updatePlSelected();
+  });
+  $("plPickDir").onclick = () => {
+    invoke("plugin:dialog|open", {
+      options: { directory: true, multiple: false, title: "选择保存目录" },
+    })
+      .then((v) => { if (v) $("plDir").value = v; })
+      .catch((e) => toast("选择目录失败：" + String(e), true));
+  };
   $("ndStart").onclick = doNewDownload;
   $("ndPickDir").onclick = pickNewDir;
   $("addClose").onclick = closeAddUrl;
@@ -2667,6 +2873,7 @@
     showView("all");
   };
   $("setProxyEnabled").addEventListener("change", syncProxyDetail);
+  $("setAria2").addEventListener("change", syncAria2Detail);
   $("setCategoriesEnabled").addEventListener("change", syncCategoryDetail);
   $("addCategoryRule").onclick = () => addCategoryRow(null);
   $("addHeaderPreset").onclick = () => addHeaderPresetRow(null);
@@ -2861,6 +3068,7 @@
           filename: p.filename || null,
           threads: p.threads || null,
           save_dir: p.save_dir || s.download_dir || null,
+          referer: p.referer || null,
         },
       });
       toast("已从浏览器接收下载：" + (p.filename || p.url));
@@ -3061,6 +3269,8 @@
             save_dir: dir,
             expected_ext: f.ext || null,
             expected_bytes: f.filesize || null,
+            // 页面 Referer：防盗链站点解析/下载都可能需要
+            referer: p.referer || null,
           },
         });
       } else {
@@ -3070,6 +3280,8 @@
             filename: name,
             threads: Number($("saThreads").value || 1),
             save_dir: dir,
+            // 防盗链直链：扩展带来的页面 Referer 必须继续往下传
+            referer: p.referer || null,
           },
         });
       }

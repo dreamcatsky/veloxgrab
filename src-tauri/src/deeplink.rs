@@ -86,6 +86,7 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
             filename: None,
             save_dir: None,
             threads: None,
+            referer: None,
         });
     }
 
@@ -112,6 +113,7 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
     let mut filename = None;
     let mut save_dir = None;
     let mut threads = None;
+    let mut referer = None;
 
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -132,6 +134,10 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
             "name" | "filename" | "f" => filename = Some(v),
             "dir" | "d" => save_dir = Some(v),
             "threads" | "t" => threads = v.trim().parse::<usize>().ok(),
+            // 浏览器页面地址：防盗链直链需要它作为 Referer。
+            // 只接受 http(s) 字面量，其它（file:/javascript:）一律丢弃——
+            // 它会直接变成发往目标服务器的请求头值。
+            "referer" | "ref" | "r" => referer = Some(v),
             _ => {}
         }
     }
@@ -155,6 +161,12 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
         filename: filename.filter(|f| !f.trim().is_empty()),
         save_dir: save_dir.filter(|d| !d.trim().is_empty()),
         threads: threads.map(|t| t.min(64)),
+        referer: referer
+            .map(|r| r.trim().to_string())
+            .filter(|r| {
+                let lower = r.to_ascii_lowercase();
+                lower.starts_with("http://") || lower.starts_with("https://")
+            }),
     })
 }
 
@@ -165,6 +177,9 @@ pub struct LinkRequest {
     pub filename: Option<String>,
     pub save_dir: Option<String>,
     pub threads: Option<usize>,
+    /// 页面地址，作为 Referer 附加到直链请求（防盗链直链需要）。
+    #[serde(default)]
+    pub referer: Option<String>,
 }
 
 /// 确保 HKCR\veloxgrab 指向当前可执行文件。
@@ -340,9 +355,37 @@ mod tests {
         assert_eq!(r.url, "https://a.com/f?id=2&x=1");
     }
 
+    /// Referer 参数（浏览器扩展带来的页面地址）：只接受 http(s)，其它丢弃。
     #[test]
-    fn normalize_path_ignores_case_and_slashes() {
-        assert_eq!(
+    fn referer_is_parsed_and_gated() {
+        let r = parse_deep_link(
+            "veloxgrab://add?url=https%3A%2F%2Fcdn.example.com%2Fa.zip&referer=https%3A%2F%2Fexample.com%2Fpage",
+        )
+        .unwrap();
+        assert_eq!(r.referer.as_deref(), Some("https://example.com/page"));
+
+        // 非 http(s) 的 Referer（file/javascript）必须丢弃：它会变成请求头值
+        for bad in ["file:///C:/x", "javascript:alert(1)", "ftp://x/y"] {
+            let link = format!(
+                "veloxgrab://add?url=https%3A%2F%2Fa.com%2Fx&referer={}",
+                urlencoding::encode(bad)
+            );
+            let r = parse_deep_link(&link).unwrap();
+            assert!(r.referer.is_none(), "非法 Referer 必须丢弃: {bad}");
+        }
+        // 缺省 / 空串都不带
+        assert!(parse_deep_link("veloxgrab://add?url=https%3A%2F%2Fa.com%2Fx")
+            .unwrap()
+            .referer
+            .is_none());
+        assert!(parse_deep_link("veloxgrab://add?url=https%3A%2F%2Fa.com%2Fx&referer=")
+            .unwrap()
+            .referer
+            .is_none());
+    }
+
+    #[test]
+    fn normalize_path_ignores_case_and_slashes() {        assert_eq!(
             normalize_path("\"C:\\Users\\A\\veloxgrab.exe\""),
             normalize_path("c:/users/a/veloxgrab.exe")
         );

@@ -23,7 +23,84 @@
 const BRIDGE = "http://127.0.0.1:58943";
 
 /** 默认配置。`intercept` 是「接管浏览器下载」总开关。 */
-const DEFAULTS = { threads: 4, dir: "", intercept: true, notify: true };
+const DEFAULTS = { threads: 4, dir: "", intercept: true, notify: true, sniff: true };
+
+// ---------- 深度嗅探 ----------
+//
+// ## 为什么需要它
+//
+// 只看 DOM 的 `<video src>` 抓不到真正在播的流：B 站 / 抖音 / YouTube 的
+// 播放器都用 MSE（Media Source Extensions），`src` 是 `blob:`，
+// `<video>` 的地址在页面内存里，任何"读页面"的方式都拿不到。但这些站点的
+// **网络请求**里一定有真正的分片清单：`.m3u8`（HLS）或 `.mpd`（DASH）。
+//
+// 监听 `webRequest.onResponseStarted` 而不是 onCompleted：流媒体请求往往
+// 是长连接 / 分片轮询，onCompleted 可能等到用户关掉页面才来；响应头一到
+// 就能判定类型了。
+//
+// 存量按 tabId 记账、只留最近的若干条：用户可能开几十个标签页，每个页面
+// 几十个分片请求，不设上限就是内存泄漏。
+const SNIFF_MAX_PER_TAB = 40;
+/** tabId -> [{url, kind, at}]，最近的在前 */
+const sniffed = new Map();
+
+/** 从响应 URL + content-type 判定是否是流媒体清单。 */
+function classifyStream(url, contentType) {
+  const u = url.split("?")[0].toLowerCase();
+  const ct = (contentType || "").toLowerCase();
+  if (u.endsWith(".m3u8") || ct.includes("mpegurl") || ct.includes("vnd.apple.mpegurl")) {
+    return "hls";
+  }
+  if (u.endsWith(".mpd") || ct.includes("dash+xml")) {
+    return "dash";
+  }
+  // 明确的分片（.ts/.m4s）不单列为候选：它们只是清单的下属分片，
+  // 单独下载没有意义，交给 yt-dlp 按清单拉。
+  return null;
+}
+
+/**
+ * 嗅探开关。存在 storage.sync（跟账号走），默认开。
+ * 读失败时按开处理——嗅探只是"多看到几个候选"，误开不会造成下载。
+ */
+async function sniffEnabled() {
+  try {
+    const s = await chrome.storage.sync.get(["sniff"]);
+    return s.sniff !== false;
+  } catch {
+    return true;
+  }
+}
+
+chrome.webRequest.onResponseStarted.addListener(
+  (details) => {
+    if (!details.tabId || details.tabId < 0) return;
+    const kind = classifyStream(details.url, "");
+    if (!kind) return;
+    const list = sniffed.get(details.tabId) || [];
+    // 同一条流会重复请求（分片轮询 / 重试）：只按「同 URL」去重，
+    // 不同清晰度/不同码流的清单地址不同，都会保留。
+    if (list.some((x) => x.url === details.url)) return;
+    list.unshift({ url: details.url, kind, at: Date.now() });
+    if (list.length > SNIFF_MAX_PER_TAB) list.length = SNIFF_MAX_PER_TAB;
+    sniffed.set(details.tabId, list);
+    // 通知 popup（如果开着）刷新候选列表
+    chrome.runtime
+      .sendMessage({ type: "veloxgrab-sniff-update", tabId: details.tabId })
+      .catch(() => {
+        // popup 没开时没有接收方，正常
+      });
+  },
+  { urls: ["http://*/*", "https://*/*"], types: ["xmlhttprequest", "media", "other", "object"] }
+);
+
+/** 标签页关闭/导航时清掉它的嗅探记录。 */
+chrome.tabs.onRemoved.addListener((tabId) => sniffed.delete(tabId));
+// webNavigation 需要额外权限，这里没有申请：改用 tabs.onUpdated 的
+// 「URL 变化」近似「顶层导航」——对清理嗅探记录这个用途已经足够。
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url) sniffed.delete(tabId);
+});
 
 // ---------- 安装 / 启动 ----------
 
@@ -127,6 +204,13 @@ function setupMenus() {
       title: "直接下载此媒体文件",
       contexts: ["image", "audio"],
     });
+    // 深度嗅探：页面用 MSE 播放时 <video src> 是 blob:，只能从网络请求
+    // 里拿到真正的流媒体清单（.m3u8 / .mpd）。嗅探开启时给一条显式入口。
+    chrome.contextMenus.create({
+      id: "veloxgrab-sniff-open",
+      title: "下载嗅探到的流媒体（HLS/DASH）",
+      contexts: ["page", "video"],
+    });
   });
 }
 
@@ -188,7 +272,14 @@ chrome.downloads.onCreated.addListener(async (item) => {
     // 用浏览器已经解析出的文件名：它比我们从 URL 猜的准得多
     // （Content-Disposition 里的名字只有浏览器知道）。
     const filename = pickFilename(item);
-    const ok = await send({ url: item.url, filename, dir: cfg.dir, threads: cfg.threads });
+    const referer = referrerFor(item, "");
+    const ok = await send({
+      url: item.url,
+      filename,
+      dir: cfg.dir,
+      threads: cfg.threads,
+      referer,
+    });
 
     if (ok === false) {
       // VeloxGrab 没接住：浏览器那条已经被取消并抹掉了，这里不还回去的话
@@ -225,6 +316,28 @@ function pickFilename(item) {
   // filename 是完整路径，取最后一段
   const base = raw.split(/[\\/]/).filter(Boolean).pop();
   return base || guessName(item.url);
+}
+
+/**
+ * 给浏览器下载补上 Referer。
+ *
+ * 浏览器自己发起下载时天然带页面 Referer；我们取消后转给 VeloxGrab，
+ * 那条请求由桌面端重发——很多防盗链站点（尤其是对象存储的签名直链）
+ * 只认「Referer 在白名单里」。`item.referrer` 是 Chrome 从
+ * `chrome.downloads.DownloadItem` 给出的下载来源页，MS 直链下载
+ * 必须原样带上。
+ */
+function referrerFor(item, fallbackPageUrl) {
+  const r = (item && item.referrer) || "";
+  if (/^https?:/i.test(r)) return r;
+  return /^https?:/i.test(fallbackPageUrl || "") ? fallbackPageUrl : "";
+}
+
+/** 嗅探到的流媒体候选（按 tabId 取，最近的在前）。 */
+async function sniffedFor(tabId) {
+  if (!tabId || tabId < 0) return [];
+  if (!(await sniffEnabled())) return [];
+  return sniffed.get(tabId) || [];
 }
 
 // ---------- 配置 ----------
@@ -302,6 +415,8 @@ async function send(target) {
         name: target.filename || "",
         dir: target.dir || "",
         threads: target.threads || 0,
+        // 防盗链直链需要页面 Referer；空串由桌面端忽略
+        referer: target.referer || "",
       }),
       signal: ctrl.signal,
     });
@@ -377,6 +492,15 @@ async function handleMenuClick(info, tab) {
     if (pageUrl) {
       target = { ...base, url: pageUrl, filename: "" };
     }
+  } else if (info.menuItemId === "veloxgrab-sniff-open") {
+    const list = await sniffedFor(tab && tab.id);
+    if (!list.length) {
+      notify("没有嗅探到流媒体", "打开页面并开始播放后再试一次");
+      return;
+    }
+    // 最近的优先；把清单地址发给桌面端「另存为」走一轮确认
+    const first = list[0];
+    target = { ...base, url: first.url, filename: guessName(first.url) };
   } else if (info.menuItemId === "veloxgrab-media-direct" && info.srcUrl) {
     // 只接受可直接下载的 http/https 地址；blob:/data: 明确拒绝并告诉用户
     if (/^https?:/i.test(info.srcUrl)) {
@@ -420,7 +544,13 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 // ---------- popup 消息 ----------
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!msg || msg.type !== "veloxgrab-send") return;
+  if (!msg) return;
+  // popup 查询当前页签嗅探到的流媒体候选
+  if (msg.type === "veloxgrab-sniff-query") {
+    sniffedFor(msg.tabId).then((list) => sendResponse({ list }));
+    return true;
+  }
+  if (msg.type !== "veloxgrab-send") return;
   // 只认自家 popup 的消息。当前 manifest 没有 externally_connectable /
   // content_scripts，网页与第三方扩展本就触不到这里；这行是纵深——
   // 日后放开任何一条通道时，这个「URL → 本地下载器」的投递口不该裸奔。
@@ -433,6 +563,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       filename: msg.filename || guessName(msg.url),
       threads: cfg.threads,
       dir: cfg.dir,
+      referer: msg.referer || "",
     });
     sendResponse({ ok });
   })();

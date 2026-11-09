@@ -68,3 +68,25 @@ if (problems.length) {
   process.exit(1);
 }
 console.log(`一致性校验通过：版本 ${expected}（4 处），桥端口 ${portFromJs}（2 处）`);
+
+// ---- i18n / DOM 接线 ----
+// HTML 里每个 data-i18n 键都必须在 I18N_EN 里给英文；app.js 里每个
+// $("id") 都必须能在 index.html 里找到对应元素。这两类断裂都不会报错，
+// 只会让界面出现中文原文或静默失效的功能。
+const app = read("src/app.js");
+const dictStart = app.indexOf("const I18N_EN = {");
+const dictEnd = app.indexOf("\n  };", dictStart);
+const dict = dictStart >= 0 && dictEnd > dictStart ? app.slice(dictStart, dictEnd) : "";
+const i18nKeys = [...new Set([...index.matchAll(/data-i18n(?:-ph)?="([^"]+)"/g)].map((m) => m[1]))];
+const missingEn = i18nKeys.filter((k) => !new RegExp(`^\\s*${k}:`, "m").test(dict));
+const ids = new Set([...index.matchAll(/id="([A-Za-z0-9_]+)"/g)].map((m) => m[1]));
+const usedIds = [...new Set([...app.matchAll(/\$\("([A-Za-z0-9_]+)"\)/g)].map((m) => m[1]))];
+const missingIds = usedIds.filter((i) => !ids.has(i));
+
+if (missingEn.length || missingIds.length) {
+  console.error("i18n / DOM 接线校验失败：");
+  if (missingEn.length) console.error(`  - 缺少英文文案: ${missingEn.join(", ")}`);
+  if (missingIds.length) console.error(`  - app.js 引用了 HTML 里不存在的 id: ${missingIds.join(", ")}`);
+  process.exit(1);
+}
+console.log(`i18n 校验通过：${i18nKeys.length} 个键均有英文，${usedIds.length} 个 DOM id 均存在`);

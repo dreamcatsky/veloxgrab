@@ -376,6 +376,157 @@ pub struct EnqueueArgs {
     /// 不匹配任务落 Failed（带「校验失败」文案），文件保留供人工比对。
     #[serde(default)]
     pub sha256: Option<String>,
+    /// 页面地址（Referer）：浏览器扩展经「另存为」投递视频/直链时带上。
+    #[serde(default)]
+    pub referer: Option<String>,
+}
+
+/// 播放列表探测（合集/频道/多文件页）。
+#[tauri::command]
+pub async fn probe_playlist(
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<ytdlp::PlaylistInfo, String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("请输入链接".into());
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("链接必须以 http:// 或 https:// 开头".into());
+    }
+    let settings = load_settings(&state);
+    ytdlp::probe_playlist(&url, &settings).await
+}
+
+/// 批量入队的单条入参（前端从播放列表解析结果里逐条提交）。
+#[derive(Debug, Deserialize)]
+pub struct BatchEntryArgs {
+    pub url: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub thumbnail: Option<String>,
+    #[serde(default)]
+    pub duration: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchArgs {
+    pub entries: Vec<BatchEntryArgs>,
+    /// 统一保存目录（None = 用全局默认/分类规则）
+    #[serde(default)]
+    pub save_dir: Option<String>,
+    /// 统一开始时间（Unix 毫秒，None = 立即）
+    #[serde(default)]
+    pub start_at: Option<i64>,
+    /// 统一格式表达式。扁平播放列表没有逐条清晰度，固定 "best"：
+    /// yt-dlp 自己按 bestvideo+bestaudio 组合，兼容性最好。
+    #[serde(default)]
+    pub format_id: Option<String>,
+}
+
+/// 批量建任务：一次解析出的播放列表逐条入队。
+///
+/// 与前端「循环调 enqueue_download」的区别：
+/// - 目录闸门只弹**一次**（批量 200 条时逐条弹原生框会把用户逼疯）；
+/// - 磁盘预检只做一次目录检查（每条的大小未知，逐条预检没有意义）；
+/// - 返回成功数与被拒原因，前端据此提示。
+#[tauri::command]
+pub async fn enqueue_playlist(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    args: BatchArgs,
+) -> Result<serde_json::Value, String> {
+    use tauri::Emitter;
+    if args.entries.is_empty() {
+        return Err("播放列表里没有条目".into());
+    }
+    let save_dir = admit_save_dir(&app, &state, args.save_dir).await?;
+    {
+        let settings = load_settings(&state);
+        let dir = save_dir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(&settings.download_dir));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
+    }
+
+    let format_id = args
+        .format_id
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty())
+        .unwrap_or_else(|| "best".to_string());
+    let start_at = args.start_at.filter(|&t| t > now_ms());
+
+    let mut created = Vec::with_capacity(args.entries.len());
+    let mut errors: Vec<String> = Vec::new();
+    for entry in &args.entries {
+        let url = entry.url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            errors.push(format!("{}：地址无效", entry.title.clone().unwrap_or_else(|| url.to_string())));
+            continue;
+        }
+        let n = state.counter.fetch_add(1, Ordering::SeqCst);
+        let id = format!("t{}_{}", now_ms(), n);
+        let title = entry
+            .title
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                url.rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("未命名下载")
+                    .to_string()
+            });
+        let task = Task {
+            id: id.clone(),
+            url: url.to_string(),
+            title,
+            thumbnail: entry.thumbnail.clone(),
+            duration: entry.duration,
+            format_id: format_id.clone(),
+            quality_label: "播放列表".into(),
+            has_audio: true,
+            best_audio_format: None,
+            state: TaskState::Queued,
+            progress: 0.0,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            speed: None,
+            eta: None,
+            output_path: None,
+            error: None,
+            file_missing: false,
+            created_at: now_ms(),
+            kind: "video".into(),
+            threads: 0,
+            save_dir: save_dir.clone(),
+            // 扁平解析拿不到逐条扩展名；留空不参与分类（落回默认根）。
+            expected_ext: None,
+            start_at,
+            rate_kb: None,
+            sha256: None,
+            // 播放列表条目来自解析结果，没有页面 Referer
+            referer: None,
+        };
+        {
+            let mut guard = state.tasks.lock().await;
+            guard.insert(id.clone(), task.clone());
+            crate::history::upsert_entry(&task);
+        }
+        state.queue.lock().await.push_back(id.clone());
+        created.push(task);
+    }
+
+    let ctx = PumpCtx::from_state(&state);
+    tauri::async_runtime::spawn(pump_queue(app.clone(), ctx));
+    let _ = app.emit("tasks-changed", ());
+    Ok(serde_json::json!({
+        "created": created.len(),
+        "errors": errors,
+        "tasks": created,
+    }))
 }
 
 /// 探测直链：返回是否支持 Range、总大小、文件名与建议线程数
@@ -412,6 +563,55 @@ pub async fn probe_auto(
     }
 
     let settings = load_settings(&state);
+
+    // GitHub 仓库地址：翻译成「最新 release 里最合适的资产」再走直链探测。
+    // 放在 FTP / 媒体站判定之前：github.com 不是媒体站，直链探测只会拿到
+    // 一页 HTML（看起来像"不支持"），而这个地址的真实意图通常是下最新版。
+    if let Some((owner, repo)) = crate::github::parse_repo_url(&url) {
+        match crate::github::fetch_latest_asset(
+            &owner,
+            &repo,
+            settings.github_token_trimmed(),
+            settings.proxy_url().as_deref(),
+        )
+        .await
+        {
+            Ok(asset) => {
+                let net = crate::settings::NetCfg::for_url(&settings, &asset.download_url);
+                return match direct::probe_direct(&asset.download_url, None, &net).await {
+                    Ok(mut p) => {
+                        // 资产名比探测（下载 URL 末段）更可靠
+                        p.filename = crate::util::sanitize_filename(&asset.filename);
+                        Ok(serde_json::json!({
+                            "kind": "direct",
+                            "direct": p,
+                            "release": asset,
+                        }))
+                    }
+                    Err(e) => Ok(serde_json::json!({
+                        "kind": "error",
+                        "message": format!(
+                            "找到 {}/{} 的 release「{}」资产 {}，但探测下载地址失败：{e}",
+                            owner, repo, asset.tag, asset.filename
+                        )
+                    })),
+                };
+            }
+            Err(e) => {
+                // 仓库地址但 release 拉不到：继续走普通探测（也许用户其实
+                // 想要的是这个页面本身），错误只在两条路径都失败时才合并上报。
+                let net = crate::settings::NetCfg::for_url(&settings, &url);
+                let gh_err = e;
+                if let Ok(p) = direct::probe_direct(&url, None, &net).await {
+                    return Ok(serde_json::json!({ "kind": "direct", "direct": p }));
+                }
+                return Ok(serde_json::json!({
+                    "kind": "error",
+                    "message": format!("GitHub Releases 解析失败：{gh_err}")
+                }));
+            }
+        }
+    }
 
     // FTP：独立的探测通道（SIZE/LIST），前端按直链界面展示
     if url.to_ascii_lowercase().starts_with("ftp://") {
@@ -574,6 +774,8 @@ pub async fn enqueue_download(
             .map(str::trim)
             .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
             .map(|s| s.to_ascii_lowercase()),
+        // 视频任务同样可能来自浏览器扩展（页面地址 → yt-dlp --referer）
+        referer: args.referer,
     };
 
     {
@@ -1321,6 +1523,13 @@ pub struct EditTaskArgs {
     /// 预期 SHA-256：None = 不改；Some("") = 清除；Some(hex) = 设置
     #[serde(default)]
     pub sha256: Option<String>,
+    /// 新的下载地址：None = 不改；Some(url) = 换源重下。
+    ///
+    /// 改 URL 会让旧断点失去意义（`.veloxgrab-part` 里记的是旧 URL 与旧 ETag，
+    /// 续传判定必然拒绝），所以变更时同步清掉临时产物并归零进度——用户看到的是
+    /// 「换了个地址从头下」，而不是「进度莫名跳回 0 却还在续传」。
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[tauri::command]
@@ -1366,6 +1575,35 @@ pub async fn edit_task(
     };
     let new_threads = args.threads.map(|t| t.min(64));
 
+    // 换源：先校验形状与安全闸（与所有建任务入口同一套），再过一次
+    // 「URL 变了就清断点」的重置。这一步放在锁外：cleanup 是磁盘 IO。
+    let new_url = match args.url {
+        Some(raw) => {
+            let u = raw.trim().to_string();
+            if u.is_empty() {
+                return Err("下载地址不能为空".into());
+            }
+            if !(u.starts_with("http://") || u.starts_with("https://") || u.starts_with("ftp://")) {
+                return Err("地址必须以 http://、https:// 或 ftp:// 开头".into());
+            }
+            crate::direct::url_target_guarded(&u)?;
+            if u == task.url {
+                None
+            } else {
+                Some(u)
+            }
+        }
+        None => None,
+    };
+    if new_url.is_some() {
+        // 旧 URL 的断点与临时文件对新地址毫无意义，而且留着会占盘；
+        // 清掉之后从零开始，与「重新下载」的语义一致。
+        let settings = load_settings(&state);
+        let dir = engine::resolve_task_dir(&settings, &task)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&settings.download_dir));
+        engine::cleanup_task_artifacts(&dir, &task);
+    }
+
     let updated = {
         let mut guard = state.tasks.lock().await;
         let running_now = state.tokens.lock().await.contains_key(&args.id);
@@ -1374,6 +1612,20 @@ pub async fn edit_task(
         };
         if running_now || !t.state.is_editable() {
             return Err("任务状态已变化，请刷新后重试".into());
+        }
+        if let Some(u) = new_url {
+            t.url = u;
+            // 地址换了，之前声明的摘要/预期字节都不可信，进度必须归零
+            t.progress = 0.0;
+            t.downloaded_bytes = 0;
+            t.total_bytes = None;
+            t.speed = None;
+            t.eta = None;
+            // 重下时旧的"文件已删除"标记也要清
+            t.file_missing = false;
+            t.output_path = None;
+            // 扩展名可能随新地址变化：清空后让探测阶段重新推导
+            t.expected_ext = crate::util::ext_of_name(&t.url);
         }
         if let Some(title) = new_title {
             t.title = title;
@@ -1470,6 +1722,7 @@ pub async fn new_download(
             start_at: args.start_at.filter(|&t| t > now_ms()),
             rate_kb: args.rate_kb,
             sha256: sha,
+            referer: None,
         },
     )
     .await
@@ -1490,6 +1743,7 @@ pub(crate) struct DirectTaskArgs {
     pub start_at: Option<i64>,
     pub rate_kb: Option<u64>,
     pub sha256: Option<String>,
+    pub referer: Option<String>,
 }
 
 pub(crate) async fn create_direct_task(
@@ -1505,13 +1759,43 @@ pub(crate) async fn create_direct_task(
         start_at,
         rate_kb,
         sha256,
+        referer,
     } = args;
-    let url = url.trim().to_string();
+    let mut url = url.trim().to_string();
     if url.is_empty() {
         return Err("请输入下载地址".into());
     }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("地址必须以 http:// 或 https:// 开头".into());
+    }
+
+    // GitHub 仓库地址：翻译成最新 release 的资产下载地址。
+    //
+    // 这条入口（手动新建 / 扩展静默投递 / aria2 addUri）不经过 probe_auto，
+    // 不翻译的话会把仓库页面的 HTML 当成文件下下来。解析失败不阻断建任务：
+    // 也许用户想要的真是那个页面，照原地址继续。
+    let mut filename = filename;
+    if let Some((owner, repo)) = crate::github::parse_repo_url(&url) {
+        let settings = load_settings(state);
+        match crate::github::fetch_latest_asset(
+            &owner,
+            &repo,
+            settings.github_token_trimmed(),
+            settings.proxy_url().as_deref(),
+        )
+        .await
+        {
+            Ok(asset) => {
+                // 用户显式给了文件名时不覆盖它的选择
+                if filename.is_none() {
+                    filename = Some(crate::util::sanitize_filename(&asset.filename));
+                }
+                url = asset.download_url;
+            }
+            Err(e) => {
+                eprintln!("[github] {owner}/{repo} release 解析失败，按原地址继续: {e}");
+            }
+        }
     }
 
     // 文件名：给了就用（去路径分隔符，防止写穿到别处），否则留空让引擎推导。
@@ -1582,6 +1866,12 @@ pub(crate) async fn create_direct_task(
         start_at: start_at.filter(|&t| t > now_ms()),
         rate_kb,
         sha256: sha256.map(|s| s.to_ascii_lowercase()),
+        referer: referer
+            .map(|r| r.trim().to_string())
+            .filter(|r| {
+                let l = r.to_ascii_lowercase();
+                !r.is_empty() && r.len() <= 2048 && (l.starts_with("http://") || l.starts_with("https://"))
+            }),
     };
 
     {
@@ -2737,6 +3027,7 @@ mod tests {
         start_at: None,
         rate_kb: None,
         sha256: None,
+        referer: None,
         }
     }
 

@@ -64,6 +64,9 @@ pub struct HistoryEntry {
     /// 预期 SHA-256（小写 hex）；旧版本历史没有，按 None 处理
     #[serde(default)]
     pub sha256: Option<String>,
+    /// 页面 Referer（防盗链直链续传需要）；旧版本历史没有
+    #[serde(default)]
+    pub referer: Option<String>,
     pub total_bytes: Option<u64>,
     pub error: Option<String>,
     pub created_at: i64,
@@ -118,6 +121,7 @@ impl HistoryEntry {
             start_at: task.start_at,
             rate_kb: task.rate_kb,
             sha256: task.sha256.clone(),
+            referer: task.referer.clone(),
             total_bytes: task.total_bytes,
             error: task.error.clone(),
             created_at: task.created_at,
@@ -204,6 +208,15 @@ impl HistoryEntry {
             // 限速/校验预期随任务落盘：续传重试后仍然生效
             rate_kb: self.rate_kb,
             sha256: self.sha256.clone(),
+            // history.json 是不可信输入：Referer 回灌前再校验一次（只放行 http(s)）
+            referer: self.referer.as_deref().and_then(|r| {
+                let t = r.trim();
+                let l = t.to_ascii_lowercase();
+                (!t.is_empty()
+                    && t.len() <= 2048
+                    && (l.starts_with("http://") || l.starts_with("https://")))
+                .then(|| t.to_string())
+            }),
             // 历史文件是不可信输入：扩展名回灌前再收敛一次
             expected_ext: self
                 .expected_ext
@@ -650,6 +663,7 @@ mod tests {
         start_at: None,
         rate_kb: None,
         sha256: None,
+        referer: None,
         }
     }
 

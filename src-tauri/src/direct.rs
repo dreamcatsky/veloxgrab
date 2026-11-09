@@ -8,18 +8,31 @@
 //! - 临时文件带任务 id：同名任务并发时互不覆盖，清理也只删自己那一份
 //! - 取消通过共享 AtomicBool 实现，不依赖 reqwest 的取消机制
 
-use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::settings::NetCfg;
 use crate::util::host_of;
 
-/// 分块时每段的最小字节数：太小会让连接数虚高，收益被请求开销吃掉
+/// 分块时每段的最小字节数：太小会让连接数虚高，收益被请求开销吃掉。
+/// 分块计划已改为与线程数无关的 `chunk_plan`，这个常量只剩单测还在用。
+#[cfg(test)]
 const MIN_CHUNK_SIZE: u64 = 1024 * 1024; // 1 MiB
+/// 分块计划的目标块大小。
+///
+/// 计划**只由文件总大小决定**（见 `chunk_plan`）：并发数可以在下载过程中
+/// 动态增减，而分块边界必须保持稳定——边界跟着线程数走的话，改一次并发
+/// 就让旧断点全部作废。
+const CHUNK_TARGET: u64 = 1024 * 1024; // 1 MiB
+/// 分块计划的最大块数。按 1 MiB 切 100 GB 会是 10 万块，断点元数据与
+/// 每块的调度开销都会失控；超过上限时块变大，续传仍成立。
+const MAX_CHUNKS: usize = 4096;
 /// 低于这个大小不值得分块
 const MIN_MULTI_THREAD_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
 /// 并发分块数硬上限（对齐 TDM Fast 的「默认下载线程数 1-64」）。
@@ -140,9 +153,17 @@ fn client_with(proxy: Option<&str>, block_cross_host: bool) -> Result<reqwest::C
 /// `NetCfg.auth` 可能出现在任何直链任务里，但只有 URL 的 host 命中作用域时
 /// 才真正带上——这是「token 跟着设置走」与「token 跟着请求走」的分界线。
 fn apply_net(rb: reqwest::RequestBuilder, url: &str, net: &NetCfg) -> reqwest::RequestBuilder {
-    use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, REFERER};
 
-    if net.custom.is_empty() && net.auth.is_none() {
+    // 任务自带 Referer 优先于（绝不会）被预设覆盖：它来自浏览器真实页面。
+    let referer = net
+        .referer
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .and_then(|r| HeaderValue::from_str(r).ok());
+
+    if net.custom.is_empty() && net.auth.is_none() && referer.is_none() {
         return rb;
     }
     let mut map = HeaderMap::new();
@@ -160,6 +181,9 @@ fn apply_net(rb: reqwest::RequestBuilder, url: &str, net: &NetCfg) -> reqwest::R
         if let Ok(v) = HeaderValue::from_str(v) {
             map.insert(AUTHORIZATION, v);
         }
+    }
+    if let Some(v) = referer {
+        map.insert(REFERER, v);
     }
     rb.headers(map)
 }
@@ -438,6 +462,8 @@ fn probe_cache_key(url: &str, net: &NetCfg) -> String {
         fp.push('=');
         fp.push_str(v);
     }
+    fp.push('\u{2}');
+    fp.push_str(net.referer.as_deref().unwrap_or(""));
     format!(
         "{url}\u{1}{}\u{1}{}",
         net.auth.is_some(),
@@ -500,9 +526,10 @@ async fn probe_uncached(url: &str, net: &NetCfg) -> Result<DirectProbe, String> 
     // HEAD 只是“锦上添花”的元信息，给它 3 秒上限，超时就算了。
     // 不能让一个可选的探测请求把主流程卡住。
     let head_fut = async {
+        let req_url = net.request_url(url);
         match tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            apply_net(c.head(url), url, net).send(),
+            apply_net(c.head(req_url.as_ref()), url, net).send(),
         )
         .await
         {
@@ -511,7 +538,8 @@ async fn probe_uncached(url: &str, net: &NetCfg) -> Result<DirectProbe, String> 
         }
     };
     let range_fut = async {
-        apply_net(c.get(url), url, net)
+        let req_url = net.request_url(url);
+        apply_net(c.get(req_url.as_ref()), url, net)
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send()
             .await
@@ -666,14 +694,16 @@ impl PartMeta {
     }
 }
 
-/// 把总长度切成若干段，返回闭区间列表
-fn split_ranges(total: u64, threads: usize) -> Vec<(u64, u64)> {
+/// 把总长度切成尽量等长的 `n` 段，返回闭区间列表。
+fn split_equal(total: u64, n: usize) -> Vec<(u64, u64)> {
     if total == 0 {
         return vec![(0, 0)];
     }
-    let max_by_size = (total / MIN_CHUNK_SIZE).max(1) as usize;
-    let n = threads.clamp(1, MAX_THREADS).min(max_by_size);
+    let n = n.max(1);
     let per = total / n as u64;
+    if per == 0 {
+        return vec![(0, total - 1)];
+    }
     let mut out = Vec::with_capacity(n);
     let mut start = 0u64;
     for i in 0..n {
@@ -687,6 +717,122 @@ fn split_ranges(total: u64, threads: usize) -> Vec<(u64, u64)> {
     }
     out
 }
+
+/// 按线程数切段（旧接口，仅测试使用——生产路径已改为 `chunk_plan`）。
+#[cfg(test)]
+fn split_ranges(total: u64, threads: usize) -> Vec<(u64, u64)> {
+    if total == 0 {
+        return vec![(0, 0)];
+    }
+    let max_by_size = (total / MIN_CHUNK_SIZE).max(1) as usize;
+    let n = threads.clamp(1, MAX_THREADS).min(max_by_size);
+    split_equal(total, n)
+}
+
+/// 下载分块计划：**只依赖文件总大小**，与线程数无关。
+///
+/// 动态线程调节要求并发数可以随时增减，而分块边界必须稳定：
+/// 旧实现按 `threads` 切段，用户把线程数从 8 改成 16（或调速器自动加连接）
+/// 就会让段长全部漂移、续传判定失败。固定计划之后，线程数只决定
+/// 「同时下几块」，断点布局在任务整个生命周期里不变。
+fn chunk_plan(total: u64) -> Vec<(u64, u64)> {
+    if total == 0 {
+        return vec![(0, 0)];
+    }
+    let n = total.div_ceil(CHUNK_TARGET).clamp(1, MAX_CHUNKS as u64) as usize;
+    split_equal(total, n)
+}
+
+/// 从断点元数据还原分块布局（续传用）。
+///
+/// 只验证它构成一个无缝覆盖 `[0, total)` 的合法划分：旧版本按线程数切的
+/// 断点同样能原样认领。块数上限防伪造：`.veloxgrab-part` 是威胁模型里的
+/// 不可信输入，几十万个小段会让逐段校验与调度退化。
+fn plan_from_meta(m: &PartMeta, total: u64) -> Option<Vec<(u64, u64)>> {
+    let n = m.segments_total.len();
+    if n == 0 || n > MAX_CHUNKS || m.segments_done.len() != n {
+        return None;
+    }
+    if total == 0 {
+        return (n == 1).then(|| vec![(0, 0)]);
+    }
+    let mut start = 0u64;
+    let mut out = Vec::with_capacity(n);
+    for &len in &m.segments_total {
+        if len == 0 || len > total.saturating_sub(start) {
+            return None;
+        }
+        out.push((start, start + len - 1));
+        start += len;
+    }
+    (start == total).then_some(out)
+}
+
+/// 动态线程调节的纯决策器（自动提速）。
+///
+/// 策略是「加法探测、无效回退」：
+/// - 拿到一个正的速度样本后先加一半连接（至少 +1），观察一个周期；
+/// - 提速后速度提升 ≥5% 就保留，并在下一周期继续试探（最多 [`MAX_BOOSTS`] 次）；
+/// - 没提升就回退到提速前的连接数并停止再试——反复试探只会让速度抖动。
+///
+/// 时钟与字节增量都由调用方传入，决策本身不碰真实时间，便于用合成速度单测。
+#[derive(Debug)]
+struct ThreadTuner {
+    workers: usize,
+    max: usize,
+    boosts_left: u8,
+    probing: bool,
+    pre_workers: usize,
+    pre_speed: f64,
+}
+
+/// 最多提速几次。每提速一次要观察一个周期，太多轮会把短下载的尾巴拖长。
+const MAX_BOOSTS: u8 = 3;
+
+impl ThreadTuner {
+    fn new(base: usize, max: usize) -> Self {
+        let base = base.max(1).min(max.max(1));
+        Self {
+            workers: base,
+            max: max.max(base),
+            boosts_left: MAX_BOOSTS,
+            probing: false,
+            pre_workers: base,
+            pre_speed: 0.0,
+        }
+    }
+
+    /// 喂一个窗口的增量与时长，返回新的目标并发数。
+    fn observe(&mut self, delta_bytes: u64, elapsed: Duration) -> usize {
+        let secs = elapsed.as_secs_f64();
+        if secs <= 0.0 {
+            return self.workers;
+        }
+        let speed = delta_bytes as f64 / secs;
+        if self.probing {
+            if speed >= self.pre_speed * 1.05 {
+                // 提速有效：保留，下一个窗口继续试探（若还有次数）。
+                self.probing = false;
+            } else {
+                // 提速无效：回退并停止试探。
+                self.workers = self.pre_workers;
+                self.probing = false;
+                self.boosts_left = 0;
+            }
+        } else if self.boosts_left > 0 && self.workers < self.max && speed > 0.0 {
+            self.pre_workers = self.workers;
+            self.pre_speed = speed;
+            let step = (self.workers / 2).max(1);
+            self.workers = (self.workers + step).min(self.max);
+            self.boosts_left -= 1;
+            self.probing = true;
+        }
+        self.workers
+    }
+}
+
+/// 动态调节的评估周期。太短会被分块落盘的脉冲带偏，太长则提速来得太晚。
+const TUNE_INTERVAL: Duration = Duration::from_millis(2500);
 
 fn human_speed(bytes_per_sec: f64) -> String {
     const K: f64 = 1024.0;
@@ -784,9 +930,11 @@ async fn download_segment(
     // 作用域认证头在这里一并带上。之前只有探测和单流走 apply_net，分块请求
     // 裸奔——防盗链站点探测 206、分块 403，表现为「一开多线程就失败」。
     // apply_net 内部同样按 URL 判定 auth 作用域，语义与旧的独立 auth 参数一致。
+    // 镜像前缀只改实际请求地址，鉴权作用域仍按**原始 URL** 判定。
     // without_url：错误串会进任务表和历史，reqwest 的 Display 默认带完整 URL，
     // 签名直链的 query 里有会话凭证，不往外带。
-    let rb = apply_net(c.get(&url), &url, &net)
+    let req_url = net.request_url(&url);
+    let rb = apply_net(c.get(req_url.as_ref()), &url, &net)
         .header(reqwest::header::RANGE, format!("bytes={from}-{end}"));
     let resp = rb
         .send()
@@ -1283,8 +1431,6 @@ pub async fn download_direct(
     // 升级后的第一次续传：把旧版本的「按标题命名」临时文件认领过来
     adopt_legacy_temp(&final_target, &target, task_id);
 
-    let ranges = split_ranges(total, threads);
-
     // 断点续传：元数据与磁盘文件必须互相印证才复用。
     //
     // 只看 url / 总大小是不够的。三种盘上损坏都要能拦住（threat：history.json
@@ -1292,25 +1438,38 @@ pub async fn download_direct(
     //  - 文件被删/被截短——旧偏移跳过已写段，set_len 把短文件补回 total，
     //    产出「长度正确、中间是空洞」的损坏文件，末尾校验发现不了；
     //  - 某段进度谎报超过段长本身——该段被整体跳过却计入完成度；
-    //  - 分块数变了导致分段边界漂移——旧 done 套在新 ranges 上。
+    //  - 分块布局被改得拼不回去——旧 done 套在新段上。
     // 「同长度换内容」仍然拦不住（要靠哈希重下），注释不再声称能拦。
+    //
+    // 分块布局优先从断点元数据还原（旧版本按线程数切的断点也能承认），
+    // 没有可用断点时按 `chunk_plan` 固定切分。
     let mut resume = PartMeta::load(&target);
+    let mut plan: Vec<(u64, u64)> = Vec::new();
     if let Some(m) = &resume {
         let file_len = std::fs::metadata(&target).map(|md| md.len()).unwrap_or(0);
-        if !target.is_file()
-            || !resume_is_consistent(
-                m,
-                url,
-                total,
-                &ranges,
-                file_len,
-                info.etag.as_deref(),
-                info.last_modified.as_deref(),
-            )
-        {
-            resume = None;
-            PartMeta::remove(&target);
+        match plan_from_meta(m, total) {
+            Some(p)
+                if target.is_file()
+                    && resume_is_consistent(
+                        m,
+                        url,
+                        total,
+                        &p,
+                        file_len,
+                        info.etag.as_deref(),
+                        info.last_modified.as_deref(),
+                    ) =>
+            {
+                plan = p;
+            }
+            _ => {
+                resume = None;
+                PartMeta::remove(&target);
+            }
         }
+    }
+    if plan.is_empty() {
+        plan = chunk_plan(total);
     }
 
     // 新建或复用目标文件，预分配长度避免写入碎片化
@@ -1338,16 +1497,25 @@ pub async fn download_direct(
         }
     }
 
-    let ranges = split_ranges(total, threads);
     let (done_vec, totals_vec) = match &resume {
-        Some(m) if m.segments_total.len() == ranges.len() => {
+        Some(m) if m.segments_total.len() == plan.len() => {
             (m.segments_done.clone(), m.segments_total.clone())
         }
         _ => (
-            vec![0u64; ranges.len()],
-            ranges.iter().map(|(s, e)| e - s + 1).collect(),
+            vec![0u64; plan.len()],
+            plan.iter().map(|(s, e)| e - s + 1).collect(),
         ),
     };
+
+    // 动态并发：基础数 = 用户/设置选的线程数（不超过块数），上限为基础数的
+    // 两倍（硬上限 MAX_THREADS）——提速能带来多少收益取决于对端，翻倍封顶。
+    let base_workers = threads.clamp(1, MAX_THREADS).min(plan.len().max(1));
+    let max_workers = base_workers
+        .saturating_mul(2)
+        .min(MAX_THREADS)
+        .min(plan.len().max(1))
+        .max(base_workers);
+    let target_workers = Arc::new(AtomicUsize::new(base_workers));
 
     // 续传时进度要从已有字节起算，否则第一个采样点的速度会虚高
     let initial_sum: u64 = done_vec.iter().sum();
@@ -1368,6 +1536,10 @@ pub async fn download_direct(
         let etag_owned = info.etag.clone();
         let lm_owned = info.last_modified.clone();
         let totals_for_task = totals_vec.clone();
+        // 动态线程调节器与目标并发：进度线程是唯一的「全局速度观测点」，
+        // 决策在这里做，工作池每轮读 target_workers 决定补不补新连接。
+        let tuner = Arc::new(Mutex::new(ThreadTuner::new(base_workers, max_workers)));
+        let target_workers_c = target_workers.clone();
         tauri::async_runtime::spawn(async move {
             // 速度用真正的滑动窗口算：保留最近约 1.2 秒内每次采样的
             // (时刻, 累计字节)，速度 = 窗口首尾差值 / 窗口实际时长。
@@ -1381,6 +1553,8 @@ pub async fn download_direct(
                 std::collections::VecDeque::with_capacity(16);
             samples.push_back((Instant::now(), initial_sum));
             let mut last_save = Instant::now();
+            let mut last_tune = Instant::now();
+            let mut last_tune_bytes = initial_sum;
             loop {
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 if stop.load(Ordering::SeqCst) {
@@ -1395,6 +1569,20 @@ pub async fn download_direct(
                     .map(|a| a.load(Ordering::Relaxed))
                     .collect();
                 let sum: u64 = snapshot.iter().sum();
+
+                // 动态线程调节：每 ~2.5 秒把本窗口的增量喂给调速器，
+                // 成功提速就保留并在下一窗口继续试探，无效则回退原并发。
+                // 决策全在纯函数 ThreadTuner 里，这里只负责观测与下发。
+                if last_tune.elapsed() >= TUNE_INTERVAL {
+                    let delta = sum.saturating_sub(last_tune_bytes);
+                    let next = {
+                        let mut t = tuner.lock().unwrap_or_else(|e| e.into_inner());
+                        t.observe(delta, last_tune.elapsed())
+                    };
+                    target_workers_c.store(next, Ordering::Relaxed);
+                    last_tune = Instant::now();
+                    last_tune_bytes = sum;
+                }
 
                 // 断点元数据每 500ms 落盘一次：取消/崩溃后能接着下
                 if last_save.elapsed() >= Duration::from_millis(500) {
@@ -1451,74 +1639,117 @@ pub async fn download_direct(
         })
     };
 
-    let mut handles = Vec::with_capacity(ranges.len());
-    for (i, (s, e)) in ranges.iter().enumerate() {
-        let start = *s;
-        let end = *e;
-        let c2 = c.clone();
-        let url2 = url.to_string();
-        // 请求头跟着 net 走（自定义头 + host 作用域认证头，作用域判定按本段
-        // 共用的同一个 URL 做），每个分块一份克隆。
-        let net2 = net.clone();
-        let path2 = target.clone();
-        let counters2 = counters.clone();
-        let cancel2 = cancel.clone();
-        handles.push(tauri::async_runtime::spawn(async move {
-            // 段级重试：长任务撞上一次连接抖动/瞬断就整任务失败（有断点，但
-            // 要用户手动点继续），64 连接下概率不低。重试从该段**最新已落盘**
-            // 字节数续传；已取消就立即退出不重试。
-            let mut attempt_err: Option<String> = None;
-            for attempt in 0..3u32 {
-                if cancel2.load(Ordering::SeqCst) {
-                    break;
-                }
-                let done_now = counters2.bytes[i].load(Ordering::Relaxed);
-                match download_segment(
-                    c2.clone(),
-                    url2.clone(),
-                    net2.clone(),
-                    start,
-                    end,
-                    total,
-                    path2.clone(),
-                    done_now,
-                    counters2.clone(),
-                    i,
-                    cancel2.clone(),
-                )
-                .await
-                {
-                    Ok(_) => {
-                        attempt_err = None;
-                        break;
-                    }
-                    Err(e) => {
+    // 分块工作池：固定分块计划 + 动态并发。
+    //
+    // 不再「一块一个常驻 task」：并发数由调速器实时调整，工作池每轮按
+    // target_workers 补齐在飞任务；任何一块完成都立刻接走下一块——慢连接
+    // 不会拖住其它连接，旧实现里「慢段拖尾时一半连接早就闲着」的问题
+    // 在结构上消失了。
+    let mut pending_queue: std::collections::VecDeque<usize> = (0..plan.len())
+        .filter(|&i| {
+            let seg_len = plan[i].1 - plan[i].0 + 1;
+            done_vec.get(i).copied().unwrap_or(0) < seg_len
+        })
+        .collect();
+
+    let mut in_flight: FuturesUnordered<BoxFuture<'static, (usize, Result<u64, String>)>> =
+        FuturesUnordered::new();
+    let mut results: Vec<Option<Result<u64, String>>> = (0..plan.len()).map(|_| None).collect();
+
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        let want = target_workers.load(Ordering::Relaxed).max(1);
+        while in_flight.len() < want {
+            let Some(i) = pending_queue.pop_front() else {
+                break;
+            };
+            let (start, end) = plan[i];
+            let c2 = c.clone();
+            let url2 = url.to_string();
+            // 请求头跟着 net 走（自定义头 + host 作用域认证头，作用域判定按
+            // 本段共用的同一个 URL 做），每个分块一份克隆。
+            let net2 = net.clone();
+            let path2 = target.clone();
+            let counters2 = counters.clone();
+            let cancel2 = cancel.clone();
+            in_flight.push(
+                async move {
+                    // 段级重试：长任务撞上一次连接抖动/瞬断就整任务失败（有断点，
+                    // 但要用户手动点继续），64 连接下概率不低。重试从该段**最新
+                    // 已落盘**字节数续传；已取消就立即退出不重试。
+                    let mut attempt_err: Option<String> = None;
+                    for attempt in 0..3u32 {
                         if cancel2.load(Ordering::SeqCst) {
                             break;
                         }
-                        attempt_err = Some(e);
-                        // 退避间隔递增，避免撞上还没恢复的对端
-                        tokio::time::sleep(Duration::from_millis(500 * (u64::from(attempt) + 1)))
-                            .await;
+                        let done_now = counters2.bytes[i].load(Ordering::Relaxed);
+                        match download_segment(
+                            c2.clone(),
+                            url2.clone(),
+                            net2.clone(),
+                            start,
+                            end,
+                            total,
+                            path2.clone(),
+                            done_now,
+                            counters2.clone(),
+                            i,
+                            cancel2.clone(),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                attempt_err = None;
+                                break;
+                            }
+                            Err(e) => {
+                                if cancel2.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                attempt_err = Some(e);
+                                // 退避间隔递增，避免撞上还没恢复的对端
+                                tokio::time::sleep(Duration::from_millis(
+                                    500 * (u64::from(attempt) + 1),
+                                ))
+                                .await;
+                            }
+                        }
                     }
+                    let out = match attempt_err {
+                        Some(e) => Err(e),
+                        // 取消中断时也按 Ok 返回已写字节：外层按 cancel 标志
+                        // 统一落断点，与旧的单轮语义一致。
+                        None => Ok(counters2.bytes[i].load(Ordering::Relaxed)),
+                    };
+                    (i, out)
+                }
+                .boxed(),
+            );
+        }
+        if in_flight.is_empty() {
+            // 队列已空且没有在飞的块：全部完成（或取消已在循环头处理）。
+            break;
+        }
+        tokio::select! {
+            item = in_flight.next() => {
+                if let Some((i, r)) = item {
+                    results[i] = Some(r);
                 }
             }
-            match attempt_err {
-                Some(e) => Err(e),
-                // 取消中断时也按 Ok 返回已写字节：外层按 cancel 标志统一落断点，
-                // 与旧的单轮语义一致。
-                None => Ok(counters2.bytes[i].load(Ordering::Relaxed)),
-            }
-        }));
-    }
-
-    let mut results = Vec::with_capacity(handles.len());
-    for h in handles {
-        match h.await {
-            Ok(r) => results.push(r),
-            Err(e) => results.push(Err(format!("分块任务异常: {e}"))),
+            // 120ms 检查点：调速器可能提高了目标并发，但恰好没有块完成来
+            // 唤醒 select；顺带让取消响应保持在一百多毫秒内。
+            _ = tokio::time::sleep(Duration::from_millis(120)) => {}
         }
     }
+
+    // 取消时在飞 future 被丢弃（文件句柄随之关闭）。已 flush 的字节都已计入
+    // counters；最多丢一个未落盘的 256 KiB 缓冲，续传会重下并覆盖那一小段。
+    //
+    // 段失败（非取消）时不提前掐断在飞块：与旧实现一致，让它把手里这段跑完，
+    // 已下的字节都进断点；错误在下方统一上报，用户点「继续」时几乎只剩失败段。
+    drop(in_flight);
 
     // 用独立信号让进度线程退出，绝不复用调用方的 cancel 标志，
     // 否则正常下载完成会被误判成「已取消」。
@@ -1529,7 +1760,7 @@ pub async fn download_direct(
     // `segments_done` 只在段正常结束时更新。只读后者会把进度线程 500ms 前
     // 写好的快照覆盖掉，导致断网时整段进度归零、重试白下。
     // 同时按段长截断：meta 被改坏时不能让 already_done >= seg_len 蒙混过关。
-    let final_done: Vec<u64> = ranges
+    let final_done: Vec<u64> = plan
         .iter()
         .enumerate()
         .map(|(i, (s, e))| {
@@ -1549,7 +1780,7 @@ pub async fn download_direct(
         last_modified: info.last_modified.clone(),
     };
     for (i, r) in results.iter().enumerate() {
-        if let Ok(written) = r {
+        if let Some(Ok(written)) = r {
             // 只能取 max。取消恰好发生在分块循环入口时，written 会小于
             // 进度线程已经记录的值，直接赋值会把续传进度回退。
             //
@@ -1565,7 +1796,7 @@ pub async fn download_direct(
         }
     }
 
-    if let Some(Err(e)) = results.iter().find(|r| r.is_err()) {
+    if let Some(e) = results.iter().flatten().find_map(|r| r.as_ref().err()) {
         meta.save(&target);
         return Err(e.clone());
     }
@@ -1577,7 +1808,7 @@ pub async fn download_direct(
     // 完成度只能按每段自己写了多少来判断。
     // 文件在开头就被 set_len(total) 预分配过，长度恒等于 total，
     // 用 metadata().len() 做校验等于什么都没校验——少写一段也照样通过。
-    let missing: u64 = ranges
+    let missing: u64 = plan
         .iter()
         .enumerate()
         .map(|(i, (s, e))| {
@@ -1613,7 +1844,8 @@ async fn download_single(
     use tokio::io::AsyncWriteExt;
     let rate_kb = net.rate_kb;
 
-    let resp = apply_net(c.get(url), url, net)
+    let req_url = net.request_url(url);
+    let resp = apply_net(c.get(req_url.as_ref()), url, net)
         .send()
         .await
         .map_err(|e| format!("请求失败: {}", e.without_url()))?;
@@ -1951,6 +2183,119 @@ mod tests {
         for (s, e) in ranges {
             assert!(e - s + 1 >= MIN_CHUNK_SIZE);
         }
+    }
+
+    /// 动态线程调节的前提：**分块布局只由文件大小决定**，与线程数无关。
+    /// 旧实现按 threads 切段——改一次并发（用户改设置或调速器加连接）就会让
+    /// 段长漂移、断点全废。这条锁住「计划稳定」这个不变量。
+    #[test]
+    fn chunk_plan_is_independent_of_thread_count() {
+        let total = 37 * 1024 * 1024 + 12345u64;
+        let a = chunk_plan(total);
+        let b = chunk_plan(total);
+        assert_eq!(a, b, "同一大小必须给出同一份计划");
+        assert_eq!(a[0].0, 0);
+        assert_eq!(a.last().unwrap().1, total - 1);
+        for w in a.windows(2) {
+            assert_eq!(w[0].1 + 1, w[1].0, "块之间不能有缝隙或重叠");
+        }
+        let sum: u64 = a.iter().map(|(s, e)| e - s + 1).sum();
+        assert_eq!(sum, total);
+        // 块数受上限约束（100 GB 也不会切出十万块）
+        let huge = chunk_plan(100 * 1024 * 1024 * 1024);
+        assert!(huge.len() <= MAX_CHUNKS, "块数上限必须生效: {}", huge.len());
+        assert_eq!(huge.last().unwrap().1, 100 * 1024 * 1024 * 1024 - 1);
+    }
+
+    /// 断点元数据里的分块布局要能被原样认领（旧版本按线程数切的也算），
+    /// 但拼不回去 / 段数离谱的伪造元数据必须拒绝。
+    #[test]
+    fn plan_from_meta_accepts_exact_split_and_rejects_garbage() {
+        let total = 8 * 1024 * 1024u64;
+        let by_size = chunk_plan(total);
+        let by_threads = split_ranges(total, 3);
+        for ranges in [&by_size, &by_threads] {
+            let m = PartMeta {
+                url: "https://e.com/f.bin".into(),
+                total,
+                segments_total: ranges.iter().map(|(s, e)| e - s + 1).collect(),
+                segments_done: vec![0; ranges.len()],
+                etag: None,
+                last_modified: None,
+            };
+            assert_eq!(plan_from_meta(&m, total).as_deref(), Some(ranges.as_slice()));
+        }
+        // 段长拼不满总长 / 段长溢出一段 / 空段 / 空数组
+        let mut m = PartMeta {
+            url: String::new(),
+            total,
+            segments_total: vec![total / 2, total / 2 - 1],
+            segments_done: vec![0, 0],
+            etag: None,
+            last_modified: None,
+        };
+        assert!(plan_from_meta(&m, total).is_none(), "总和不足必须拒绝");
+        m.segments_total = vec![total, 1];
+        m.segments_done = vec![0, 0];
+        assert!(plan_from_meta(&m, total).is_none(), "溢出一段必须拒绝");
+        m.segments_total = vec![0, total];
+        assert!(plan_from_meta(&m, total).is_none(), "零长段必须拒绝");
+        m.segments_total = vec![];
+        m.segments_done = vec![];
+        assert!(plan_from_meta(&m, total).is_none(), "空布局必须拒绝");
+        // done 与 total 长度不一致（被手改坏）
+        m.segments_total = vec![total];
+        m.segments_done = vec![];
+        assert!(plan_from_meta(&m, total).is_none());
+    }
+
+    /// 调速器的决策语义：每次观测至多一个动作——探测提速，或确认/否定上一轮。
+    /// 有效提速保留、下一窗口继续试探；无效则回退且停止试探。
+    #[test]
+    fn thread_tuner_boosts_only_when_speed_improves() {
+        let mut t = ThreadTuner::new(4, 16);
+        assert_eq!(t.workers, 4);
+        let w = Duration::from_secs(1);
+
+        // 窗口 1：提出提速（4 → 6），进入探测
+        assert_eq!(t.observe(1_000_000, w), 6);
+        // 窗口 2：速度 +20%，确认提速有效 → 保留 6（本窗口不再叠加）
+        assert_eq!(t.observe(1_200_000, w), 6);
+        // 窗口 3：继续试探（6 → 9）
+        assert_eq!(t.observe(1_200_000, w), 9);
+        // 窗口 4：速度没提升 → 回退到 6，并停止再试
+        assert_eq!(t.observe(1_000_000, w), 6);
+        // 之后的速度波动都不再改变并发
+        assert_eq!(t.observe(5_000_000, w), 6);
+        assert_eq!(t.observe(10, w), 6);
+    }
+
+    /// 上限与退化输入：永不超过 max，零时长/零速度不触发提速。
+    #[test]
+    fn thread_tuner_respects_cap_and_ignores_degenerate_samples() {
+        let mut t = ThreadTuner::new(8, 10);
+        let w = Duration::from_secs(1);
+        // 零增量不算有效观测
+        assert_eq!(t.observe(0, w), 8);
+        // 零时长直接原样返回
+        assert_eq!(t.observe(1_000_000, Duration::ZERO), 8);
+        // 有数据后提速，但被上限夹住
+        assert_eq!(t.observe(1_000_000, w), 10);
+        assert_eq!(t.workers, 10);
+        // 已达上限后无论速度多好都不再加
+        assert_eq!(t.observe(9_000_000, w), 10);
+    }
+
+    /// base 大于 max / 为零等构造输入都要收敛到合法区间。
+    #[test]
+    fn thread_tuner_new_clamps_starting_point() {
+        let t = ThreadTuner::new(0, 8);
+        assert_eq!(t.workers, 1);
+        let t = ThreadTuner::new(32, 4);
+        assert_eq!(t.workers, 4);
+        let t = ThreadTuner::new(8, 8);
+        assert_eq!(t.workers, 8);
+        assert_eq!(t.max, 8);
     }
 
     /// 回归：媒体站判定必须按 host 后缀匹配
@@ -2437,9 +2782,47 @@ mod tests {
         assert!(url_target_guarded("https://[fe80::1]/x").is_err());
     }
 
+    /// 任务自带的 Referer（浏览器扩展投递）必须注入到请求头。
+    /// apply_net 是探测 / 分块 / 单流三条路径共用的唯一注入点。
     #[test]
-    fn redirect_rejects_https_downgrade_and_bad_targets() {
-        assert!(redirect_is_allowed("https://a.com/f", "https://cdn.b.com/f").is_ok());
+    fn apply_net_injects_task_referer() {
+        let c = reqwest::Client::new();
+        let net = NetCfg {
+            referer: Some("https://site.example/watch".into()),
+            ..NetCfg::default()
+        };
+        let req = apply_net(c.get("https://cdn.example/a.zip"), "https://cdn.example/a.zip", &net)
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get(reqwest::header::REFERER).unwrap(),
+            "https://site.example/watch"
+        );
+
+        // 没有 referer 时不带该头
+        let req = apply_net(
+            c.get("https://cdn.example/a.zip"),
+            "https://cdn.example/a.zip",
+            &NetCfg::default(),
+        )
+        .build()
+        .unwrap();
+        assert!(req.headers().get(reqwest::header::REFERER).is_none());
+
+        // 含 CR/LF 的病态值不能被接受成头（HeaderValue::from_str 会拒绝），
+        // 走的是「忽略 referer」而不是 panic
+        let bad = NetCfg {
+            referer: Some("https://x/\r\nX-Evil: 1".into()),
+            ..NetCfg::default()
+        };
+        let req = apply_net(c.get("https://cdn.example/a.zip"), "https://cdn.example/a.zip", &bad)
+            .build()
+            .unwrap();
+        assert!(req.headers().get(reqwest::header::REFERER).is_none());
+    }
+
+    #[test]
+    fn redirect_rejects_https_downgrade_and_bad_targets() {        assert!(redirect_is_allowed("https://a.com/f", "https://cdn.b.com/f").is_ok());
         // https → http 降级拦；http → https 升级放
         assert!(redirect_is_allowed("https://a.com/f", "http://cdn.b.com/f").is_err());
         assert!(redirect_is_allowed("http://a.com/f", "https://cdn.b.com/f").is_ok());

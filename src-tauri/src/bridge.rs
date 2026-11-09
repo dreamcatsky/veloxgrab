@@ -673,6 +673,18 @@ fn build_link_from_json(body: &str) -> Result<String, String> {
     if let Some(t) = v.get("threads").and_then(|x| x.as_u64()) {
         parts.push(format!("threads={t}"));
     }
+    // 页面地址（Referer）：扩展从浏览器下载的 item.referrer / 当前页 URL 带来。
+    // 只放行 http(s)——它会成为发往目标服务器的请求头值。
+    if let Some(r) = v.get("referer").and_then(|x| x.as_str()) {
+        let r = r.trim();
+        let lower = r.to_ascii_lowercase();
+        if !r.is_empty()
+            && r.len() <= 2048
+            && (lower.starts_with("http://") || lower.starts_with("https://"))
+        {
+            parts.push(format!("referer={}", urlencoding::encode(r)));
+        }
+    }
     Ok(format!("veloxgrab://add?{}", parts.join("&")))
 }
 
@@ -874,6 +886,23 @@ mod tests {
         assert_eq!(ok.status, 200);
         let parsed = crate::deeplink::parse_deep_link(&ok.dispatched_link.unwrap()).unwrap();
         assert_eq!(parsed.threads, Some(8));
+    }
+
+    /// 扩展 POST 的 body 支持 referer 字段（防盗链直链）。
+    #[test]
+    fn body_referer_is_forwarded_but_gated() {
+        let link = build_link_from_json(
+            r#"{"url":"https://cdn.e.com/a.zip","referer":"https://e.com/page"}"#,
+        )
+        .unwrap();
+        let parsed = crate::deeplink::parse_deep_link(&link).unwrap();
+        assert_eq!(parsed.referer.as_deref(), Some("https://e.com/page"));
+
+        // 非 http(s) 的 referer 不进入链接
+        let link = build_link_from_json(r#"{"url":"https://cdn.e.com/a.zip","referer":"file:///C:/x"}"#)
+            .unwrap();
+        let parsed = crate::deeplink::parse_deep_link(&link).unwrap();
+        assert!(parsed.referer.is_none());
     }
 
     /// token 门禁（bridge_token() 为 Some 的环境下）。测试环境 token 可能

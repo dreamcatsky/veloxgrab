@@ -154,8 +154,25 @@ fn resolve_ffmpeg_uncached() -> Option<PathBuf> {
 ///
 /// 所以正确姿势是按需降级：先不带 Cookie 试，失败了再带上。
 pub fn push_common_args(cmd: &mut Command, settings: &Settings, with_cookies: bool, url: &str) {
+    push_common_args_opt(cmd, settings, with_cookies, url, true);
+}
+
+/// `push_common_args` 的可选版本：`no_playlist` 单独控制。
+///
+/// 播放列表解析必须**放开** `--no-playlist`（否则 yt-dlp 只返回合集里的第一个
+/// 条目），而单条下载仍要禁止它——不禁止的话，用户粘一个带 `&list=` 的视频
+/// 地址，点一次下载会把整个合集都拽下来。
+pub fn push_common_args_opt(
+    cmd: &mut Command,
+    settings: &Settings,
+    with_cookies: bool,
+    url: &str,
+    no_playlist: bool,
+) {
     cmd.arg("--no-warnings");
-    cmd.arg("--no-playlist");
+    if no_playlist {
+        cmd.arg("--no-playlist");
+    }
     // 尽力让 yt-dlp 用 UTF-8 输出。**它不是可靠防线**，实测（v2026.08.19 的
     // PyInstaller 独立 exe，简中系统）设了这两个变量仍然吐 cp936 字节：
     //   UTF-8 解 → "N��֡������35% ..."
@@ -637,8 +654,204 @@ pub async fn probe(url: &str, settings: &Settings) -> Result<MediaInfo, String> 
     })
 }
 
-/// 从 `resolution` 字符串里取高度，仅作为 `height` 字段缺失时的兜底。
+/// 播放列表里的一个条目（扁平解析的结果，不含清晰度列表）。
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaylistEntry {
+    /// 序号（从 1 开始，按 yt-dlp 给出的顺序）
+    pub index: usize,
+    pub url: String,
+    pub title: String,
+    pub duration: Option<f64>,
+    pub thumbnail: Option<String>,
+}
+
+/// 播放列表解析结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaylistInfo {
+    pub id: String,
+    pub title: String,
+    pub uploader: Option<String>,
+    pub count: usize,
+    pub entries: Vec<PlaylistEntry>,
+}
+
+/// 批量解析的上限。几百条的合集是常态，但十万条会让前端列表与
+/// 入队循环都变得不可用；超出部分截断并如实告知。
+pub const MAX_PLAYLIST_ENTRIES: usize = 500;
+
+/// 用 `yt-dlp -J --flat-playlist` 解析播放列表/合集。
 ///
+/// 扁平模式只拿元数据（标题、时长、条目地址），不发 N 次完整解析——一个
+/// 200 条的视频合集完整解析要几十分钟，扁平解析几秒。代价是条目没有
+/// 清晰度列表，入队时固定用 `best`（yt-dlp 自己会挑最好的）。
+///
+/// 不是列表的链接返回 Err：调用方（`probe_auto`/命令层）据此回落到单条解析。
+pub async fn probe_playlist(url: &str, settings: &Settings) -> Result<PlaylistInfo, String> {
+    crate::direct::url_target_guarded(url)?;
+    let ytdlp = resolve_ytdlp()?;
+
+    // 先不带 Cookie，失败且配置了 Cookie 源时再带（与 probe 同一策略）
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    let first = run_playlist_probe(&ytdlp, url, settings, false, PROBE_TIMEOUT).await;
+    let output = match first {
+        Ok(o) => o,
+        Err(plain_err) => {
+            if has_cookie_source(settings) {
+                let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                let second_budget = remain.max(Duration::from_secs(30));
+                match run_playlist_probe(&ytdlp, url, settings, true, second_budget).await {
+                    Ok(o) => o,
+                    Err(cookie_err) => {
+                        return Err(format!(
+                            "播放列表解析失败（不带 Cookie）：\n{plain_err}\n\n播放列表解析失败（带 Cookie）：\n{cookie_err}"
+                        ))
+                    }
+                }
+            } else {
+                return Err(format!("播放列表解析失败：\n{plain_err}"));
+            }
+        }
+    };
+
+    let raw: serde_json::Value =
+        serde_json::from_slice(&output).map_err(|e| format!("解析 JSON 失败: {e}"))?;
+    parse_playlist_json(&raw)
+}
+
+/// 纯函数：从 `-J --flat-playlist` 的 JSON 里构造 PlaylistInfo。
+fn parse_playlist_json(raw: &serde_json::Value) -> Result<PlaylistInfo, String> {
+    let entries_val = raw.get("entries").and_then(|x| x.as_array());
+    let Some(entries_val) = entries_val.filter(|a| !a.is_empty()) else {
+        return Err("这不是播放列表（或列表为空）".into());
+    };
+
+    let title = raw
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or("播放列表")
+        .to_string();
+    let id = raw
+        .get("id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("playlist")
+        .to_string();
+    let uploader = raw
+        .get("uploader")
+        .or_else(|| raw.get("channel"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+
+    let mut entries = Vec::new();
+    for (i, e) in entries_val.iter().enumerate() {
+        if entries.len() >= MAX_PLAYLIST_ENTRIES {
+            break;
+        }
+        // 条目可能因为私享/被删而缺 url：跳过而不是让整份解析失败
+        let Some(url) = entry_url(e) else { continue };
+        let title = e
+            .get("title")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("条目 {}", i + 1));
+        let duration = e.get("duration").and_then(|x| {
+            x.as_f64()
+                .or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        });
+        let thumbnail = e
+            .get("thumbnails")
+            .and_then(|x| x.as_array())
+            .and_then(|a| a.last())
+            .and_then(|t| t.get("url"))
+            .and_then(|x| x.as_str())
+            .or_else(|| e.get("thumbnail").and_then(|x| x.as_str()))
+            .map(|s| s.to_string());
+        entries.push(PlaylistEntry {
+            index: entries.len() + 1,
+            url,
+            title,
+            duration,
+            thumbnail,
+        });
+    }
+    if entries.is_empty() {
+        return Err("播放列表里没有可下载的条目（可能需要登录或已下架）".into());
+    }
+    Ok(PlaylistInfo {
+        id,
+        title,
+        uploader,
+        count: entries.len(),
+        entries,
+    })
+}
+
+/// 取一个条目的可下载地址。扁平条目里有 `url`（可能是完整地址或纯 id）、
+/// 或 `webpage_url`；`ie_key` 不为空时 `url` 可能只是 id，需要自己拼。
+fn entry_url(e: &serde_json::Value) -> Option<String> {
+    if let Some(u) = e.get("webpage_url").and_then(|x| x.as_str()) {
+        if u.starts_with("http://") || u.starts_with("https://") {
+            return Some(u.to_string());
+        }
+    }
+    let raw = e.get("url").and_then(|x| x.as_str())?;
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Some(raw.to_string());
+    }
+    // YouTube 的扁平条目给的是 11 位视频 id
+    if !raw.is_empty()
+        && raw.len() <= 32
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Some(format!("https://www.youtube.com/watch?v={raw}"));
+    }
+    None
+}
+
+async fn run_playlist_probe(
+    ytdlp: &std::path::Path,
+    url: &str,
+    settings: &Settings,
+    with_cookies: bool,
+    budget: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut cmd = Command::new(ytdlp);
+    cmd.arg("-J").arg("--flat-playlist");
+    push_common_args_opt(&mut cmd, settings, with_cookies, url, false);
+    cmd.arg("--").arg(url);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.kill_on_drop(true);
+
+    let output = tokio::time::timeout(budget, cmd.output())
+        .await
+        .map_err(|_| {
+            format!(
+                "播放列表解析超时（{} 秒）：条目过多或站点无响应",
+                budget.as_secs()
+            )
+        })?
+        .map_err(|e| format!("启动 yt-dlp 失败: {e}"))?;
+    if !output.status.success() {
+        let tail = summarize_err(&output.stderr);
+        return Err(if tail.is_empty() {
+            "yt-dlp 未返回有效信息".into()
+        } else {
+            tail
+        });
+    }
+    Ok(output.stdout)
+}
+
+/// 从 `resolution` 字符串里取高度，仅作为 `height` 字段缺失时的兜底。///
 /// yt-dlp 对视频格式给的是 `"1920x1080"`（WxH），不是 `"1080p"`。
 /// 早期实现只 `trim_end_matches('p')` 再 parse，对 `"1920x1080"` 恒返回 0，
 /// 导致分辨率排序和「推荐」选项全部失效。
@@ -676,6 +889,93 @@ mod tests {
             .build()
             .unwrap()
             .block_on(fut)
+    }
+
+    #[test]
+    fn playlist_json_parses_entries() {
+        let v = serde_json::json!({
+            "_type": "playlist",
+            "id": "PL123",
+            "title": "我的合集",
+            "uploader": "某人",
+            "entries": [
+                { "id": "abc12345678", "url": "abc12345678", "title": "第一集", "duration": 61.5,
+                  "thumbnails": [{ "url": "https://t/1.jpg" }, { "url": "https://t/2.jpg" }] },
+                { "id": "def12345678", "webpage_url": "https://www.youtube.com/watch?v=def12345678",
+                  "title": "第二集", "duration": "120" },
+                // 缺 url 的条目（私享/已删）必须跳过而不是整份失败
+                { "id": "gone", "title": "私有视频" },
+                { "url": "https://example.com/direct.mp4" }
+            ]
+        });
+        let p = parse_playlist_json(&v).expect("合法播放列表必须解析成功");
+        assert_eq!(p.title, "我的合集");
+        assert_eq!(p.uploader.as_deref(), Some("某人"));
+        assert_eq!(p.count, 3, "缺 url 的条目跳过");
+        assert_eq!(p.entries[0].url, "https://www.youtube.com/watch?v=abc12345678");
+        assert_eq!(p.entries[0].thumbnail.as_deref(), Some("https://t/2.jpg"));
+        assert_eq!(p.entries[1].url, "https://www.youtube.com/watch?v=def12345678");
+        assert_eq!(p.entries[1].duration, Some(120.0));
+        // 无标题条目用序号兜底
+        assert_eq!(p.entries[2].title, "条目 4");
+        // 序号连续
+        assert_eq!(
+            p.entries.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn playlist_json_rejects_non_playlist_shapes() {
+        // 单条视频的 -J 输出没有 entries
+        let single = serde_json::json!({ "id": "x", "title": "单条" });
+        assert!(parse_playlist_json(&single).is_err());
+        // 空列表
+        assert!(parse_playlist_json(&serde_json::json!({ "entries": [] })).is_err());
+        // 条目全都没有可用地址
+        let dead = serde_json::json!({ "entries": [{ "title": "a" }, { "title": "b" }] });
+        assert!(parse_playlist_json(&dead).is_err());
+        // 条目超过上限时截断而不是无限膨胀
+        let many: Vec<serde_json::Value> = (0..(MAX_PLAYLIST_ENTRIES + 80))
+            .map(|i| serde_json::json!({ "url": format!("https://e.com/{i}"), "title": format!("t{i}") }))
+            .collect();
+        let big = serde_json::json!({ "entries": many });
+        let p = parse_playlist_json(&big).unwrap();
+        assert_eq!(p.count, MAX_PLAYLIST_ENTRIES);
+    }
+
+    #[test]
+    fn playlist_probe_rejects_unsafe_targets_before_spawning() {
+        // 与 probe 同一道闸：云元数据地址不得交给 yt-dlp
+        let err = tokio_test_block_on(probe_playlist(
+            "http://169.254.169.254/latest/meta-data/",
+            &Settings::default(),
+        ))
+        .unwrap_err();
+        assert!(err.contains("链路本地/保留地址"), "实际错误: {err}");
+    }
+
+    #[test]
+    fn no_playlist_flag_is_optional() {
+        // 单条路径仍要 --no-playlist；播放列表解析必须放开它
+        let s = Settings::default();
+        let mut one = Command::new("yt-dlp");
+        push_common_args(&mut one, &s, false, "https://e.com/v");
+        let args: Vec<String> = one
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.iter().any(|a| a == "--no-playlist"));
+
+        let mut pl = Command::new("yt-dlp");
+        push_common_args_opt(&mut pl, &s, false, "https://e.com/playlist", false);
+        let args: Vec<String> = pl
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(!args.iter().any(|a| a == "--no-playlist"));
     }
 
     #[test]

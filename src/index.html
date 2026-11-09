@@ -296,6 +296,18 @@
             <input id="setRateLimit" type="number" min="0" step="50" />
           </label>
 
+          <div class="nd-grid">
+            <label class="fld">
+              <span><span data-i18n="mirrorPrefix">下载镜像前缀</span> <em class="dim" data-i18n="mirrorPrefixHint">(仅 GitHub / HuggingFace；留空 = 直连)</em></span>
+              <input id="setMirrorPrefix" type="text" placeholder="https://ghproxy.net/" spellcheck="false" />
+            </label>
+            <label class="fld">
+              <span><span data-i18n="githubToken">GitHub Token</span> <em class="dim" data-i18n="githubTokenHint">(可选，解析 Release 提高限流额度)</em></span>
+              <input id="setGithubToken" type="password" placeholder="ghp_..." spellcheck="false" autocomplete="off" />
+            </label>
+          </div>
+          <small class="dim" data-i18n="mirrorNote">镜像是一个第三方中转，能看到你的请求与文件内容；带登录凭证的请求与任务声明的 SHA-256 校验不受影响。</small>
+
           <label class="fld checkbox">
             <input id="setCategoriesEnabled" type="checkbox" />
             <span><span data-i18n="categoriesEnabled">按扩展名分类到子目录</span> <em class="dim" data-i18n="categoriesHint">(仅对未手选保存目录的任务生效)</em></span>
@@ -473,9 +485,20 @@
           <section class="set-card">
           <h3 class="sec-title" data-i18n="secMisc">集成与界面</h3>
 
-          <div class="fld">
-            <span data-i18n="browserInt">浏览器集成</span>
+          <label class="fld checkbox">
+            <input id="setAria2" type="checkbox" />
+            <span><span data-i18n="aria2Enable">aria2 JSON-RPC 兼容服务</span> <em class="dim" data-i18n="aria2Hint">(127.0.0.1:6800，需 token；关闭需重启程序)</em></span>
+          </label>
+          <div id="aria2Detail" class="aria2-detail hidden">
             <div class="inline">
+              <span class="dim" data-i18n="aria2TokenLabel">RPC Token</span>
+              <input id="aria2Token" type="text" readonly spellcheck="false" />
+            </div>
+            <small class="dim" data-i18n="aria2Usage">第三方工具填 RPC 地址 http://127.0.0.1:6800/jsonrpc，密钥填上面的 Token。支持 addUri / tellStatus / getVersion 等方法。</small>
+          </div>
+
+          <div class="fld">
+            <span data-i18n="browserInt">浏览器集成</span>            <div class="inline">
               <button id="openExtDir" class="ghost"><span data-i18n="openExtDir">打开扩展目录</span></button>
               <span class="dim" data-i18n="browserIntHint">把里面的 veloxgrab-extension 文件夹加载到 Chrome / Edge 扩展页面即可</span>
             </div>
@@ -590,8 +613,42 @@
         </div>
       </details>
 
-      <div id="mediaCard" class="media-card hidden">
+      <!-- 播放列表卡片：解析出合集时显示，逐条勾选后批量入队 -->
+      <div id="playlistCard" class="media-card hidden">
         <div class="media-head">
+          <div class="media-meta">
+            <h2 id="plTitle"></h2>
+            <div class="sub">
+              <span id="plKind" class="chip">播放列表</span>
+              <span id="plUploader" class="dim"></span>
+              <span id="plCount" class="dim"></span>
+            </div>
+          </div>
+        </div>
+        <div class="pl-toolbar">
+          <label class="fld checkbox">
+            <input id="plSelectAll" type="checkbox" checked />
+            <span data-i18n="plSelectAll">全选</span>
+          </label>
+          <span id="plSelected" class="dim"></span>
+        </div>
+        <div id="plList" class="pl-list"></div>
+        <div class="nd-grid">
+          <div class="fmt-head nd-row">
+            <label data-i18n="saveToLabel">保存到</label>
+            <div class="inline">
+              <input id="plDir" type="text" data-i18n-ph="ndDirPlaceholder" placeholder="留空 = 使用设置里的默认目录" spellcheck="false" />
+              <button id="plPickDir" class="ghost"><span data-i18n="pickDirBtn">选择…</span></button>
+            </div>
+          </div>
+        </div>
+        <div class="actions">
+          <button id="plDownloadBtn" class="primary"><span data-i18n="plDownload">下载选中条目</span></button>
+          <span class="dim" data-i18n="plHint">使用 yt-dlp 最佳画质逐条下载</span>
+        </div>
+      </div>
+
+      <div id="mediaCard" class="media-card hidden">        <div class="media-head">
           <img id="mediaThumb" class="thumb" alt="" referrerpolicy="no-referrer" />
           <div class="media-meta">
             <h2 id="mediaTitle"></h2>
@@ -718,6 +775,10 @@
         <h3 data-i18n="editTitle">编辑任务</h3>
       </div>
       <div class="dialog-body">
+        <label class="fld">
+          <span><span data-i18n="editUrl">下载地址</span> <em class="dim" data-i18n="editUrlHint">（改了会从头重新下载）</em></span>
+          <input id="editUrl" type="text" spellcheck="false" />
+        </label>
         <label class="fld">
           <span data-i18n="filenameLabel">保存文件名</span>
           <input id="editName" type="text" spellcheck="false" />

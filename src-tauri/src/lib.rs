@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod aria2;
 pub mod clipboard;
 pub mod monitor;
 pub mod commands;
@@ -9,6 +10,7 @@ pub mod direct;
 pub mod disk;
 pub mod engine;
 pub mod ftp;
+pub mod github;
 pub mod hash;
 pub mod history;
 pub mod notify;
@@ -215,6 +217,8 @@ pub fn run() {
 
             // 历史模块要能触达用户（损坏重置等事件经它 emit），启动时把句柄给它
             crate::history::set_app_handle(app.handle().clone());
+            // 设置保存时可能即开 aria2 RPC，句柄给它
+            crate::settings::set_app_handle(app.handle().clone());
 
             // 定时开始观察者：到点唤醒队列泵（无定时任务时是 30 秒一次的轻心跳）
             commands::spawn_start_at_watcher(app.handle().clone());
@@ -226,6 +230,18 @@ pub fn run() {
             // 扩展拉不起 veloxgrab://（Chrome 静默拦截自定义协议导航），
             // 这条回环 HTTP 是真正能用的那条路。失败不阻断启动。
             bridge::spawn(app.handle().clone());
+
+            // aria2 JSON-RPC 兼容层（127.0.0.1:6800）：默认关闭，设置里开启。
+            // 开启状态在设置保存时也会同步（见 settings::apply_aria2_toggle）。
+            {
+                let enabled = app
+                    .try_state::<AppState>()
+                    .map(|s| crate::settings::load_settings(s.inner()).aria2_enabled)
+                    .unwrap_or(false);
+                if enabled {
+                    aria2::spawn(app.handle().clone());
+                }
+            }
 
             // 剪贴板监听：复制到链接时在窗口内提示（只提示，不自动入队）。
             // 是否启用由设置决定，线程内部每轮现读，开关改完立即生效。
@@ -303,6 +319,8 @@ pub fn run() {
             commands::probe_url,
             commands::probe_direct_url,
             commands::probe_auto,
+            commands::probe_playlist,
+            commands::enqueue_playlist,
             commands::enqueue_download,
             commands::new_download,
             commands::list_tasks,
@@ -348,6 +366,7 @@ pub fn run() {
             settings::default_settings,
             update::check_update,
             update::update_now,
+            aria2::aria2_info,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

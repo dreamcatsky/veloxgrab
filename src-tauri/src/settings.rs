@@ -125,6 +125,21 @@ pub struct Settings {
     pub hf_thread_cap: usize,
     /// HuggingFace Access Token（hf_xxx）
     pub hf_token: String,
+    /// GitHub Personal Access Token（可选）。GitHub API 匿名限流 60 次/小时，
+    /// 带 token 提到 5000 次/小时；只用于 Releases 解析，不参与下载请求。
+    #[serde(default)]
+    pub github_token: String,
+    /// 下载镜像前缀（GitHub / HuggingFace 反代），如 `https://ghproxy.net/`。
+    ///
+    /// 只对 github.com、*.githubusercontent.com、huggingface.co、*.huggingface.co
+    /// 的下载请求生效，且必须自带 `http(s)://`。空 = 不用镜像。
+    /// 注意：镜像是一个第三方中转，能看到你的请求与文件内容——界面上有说明；
+    /// 任务声明的 SHA-256 校验仍然照常生效。
+    #[serde(default)]
+    pub mirror_prefix: String,
+    /// aria2 JSON-RPC 兼容服务（127.0.0.1:6800）。默认关闭，需 token。
+    #[serde(default)]
+    pub aria2_enabled: bool,
     /// 嗅探到视频时弹出清晰度选择（否则自动最高画质）
     pub popup_quality: bool,
     /// 浏览器 veloxgrab:// 链接先弹「另存为」（目录/文件名/线程 → 开始下载/取消）；
@@ -211,6 +226,9 @@ impl Default for Settings {
             default_threads: 8,
             hf_thread_cap: 4,
             hf_token: String::new(),
+            github_token: String::new(),
+            mirror_prefix: String::new(),
+            aria2_enabled: false,
             popup_quality: true,
             popup_save_as: true,
             rate_limit_kb: 0,
@@ -690,10 +708,12 @@ pub fn read_settings_from_disk() -> Settings {
             // 前端表单回填）都不必知道加密这件事。旧明文字段不带前缀，
             // unseal 原样返回，新老世代一次读盘兼容。
             s.hf_token = crate::dpapi::unseal(&s.hf_token);
+            s.github_token = crate::dpapi::unseal(&s.github_token);
             s.proxy_pass = crate::dpapi::unseal(&s.proxy_pass);
             // 设置文件同样按不可信输入处理：旧版本/手改的规则可能带 `..` 或
             // 分隔符，进内存前先清洗，避免它绕过 save_settings 的归一化。
             s.normalize_categories();
+            s.mirror_prefix = normalize_mirror_prefix(&s.mirror_prefix).unwrap_or_default();
             s.name_conflict = normalize_name_conflict(&s.name_conflict).to_string();
             // 请求头预设同样按不可信输入处理：手改的 settings.json 可能带
             // CRLF 头值或 `Host` 覆盖，进内存前先过一遍白名单。
@@ -787,6 +807,16 @@ impl Settings {
             Some(t)
         }
     }
+
+    /// 去空白后的 GitHub token，空则 None。
+    pub fn github_token_trimmed(&self) -> Option<&str> {
+        let t = self.github_token.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    }
 }
 
 /// 一个「只在指定 host（含子域）上附加」的请求头。
@@ -829,6 +859,57 @@ pub struct NetCfg {
     pub auth: Option<HostAuth>,
     /// 命中当前 host 作用域的自定义请求头（已通过白名单校验）
     pub custom: Vec<(String, String)>,
+    /// 下载镜像前缀（已校验、带尾斜杠）；None = 直连
+    pub mirror_prefix: Option<String>,
+    /// 任务页面的 Referer（浏览器扩展 / 深链带来）。None = 不带。
+    pub referer: Option<String>,
+}
+
+/// 镜像前缀是否适用于该 URL。
+///
+/// 只对「被屏蔽/慢速」的几个主域生效（GitHub、HuggingFace）。镜像服务商都按
+/// `https://ghproxy/…/<完整原始 URL>` 的形式转发，所以前缀必须能识别源站——
+/// 对不认识的站点套镜像只会把请求发给一个无关的第三方，等于把任意 URL
+/// 交给镜像运营者。返回值附带**是否属于需要保密的源**（HF gated 仓库）：
+/// 这类请求绝不走镜像，token 与仓库名都不能交给第三方。
+pub(crate) fn mirror_eligible(url: &str) -> bool {
+    let Some(host) = crate::util::host_of(url) else {
+        return false;
+    };
+    let h = host.to_ascii_lowercase();
+    let github = h == "github.com"
+        || h.ends_with(".github.com")
+        || h == "githubusercontent.com"
+        || h.ends_with(".githubusercontent.com");
+    let hf = h == "huggingface.co" || h.ends_with(".huggingface.co");
+    github || hf
+}
+
+/// 清洗镜像前缀：必须 http(s)，去掉多余空白，补齐尾部斜杠。
+/// 非法输入返回 None（比报错更合适：设置里填错的镜像不该挡住下载本身，
+/// 静默退回直连并让前端给出提示）。
+pub(crate) fn normalize_mirror_prefix(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return None;
+    }
+    if t.len() > 300 || t.contains([' ', '\t', '\r', '\n']) {
+        return None;
+    }
+    // 只保留 host + 路径；query/fragment 对前缀没有意义且容易拼出歧义
+    let base = t.split(['?', '#']).next().unwrap_or(t);
+    if base.starts_with("http://") && base == "http://" || base.ends_with("://") {
+        return None;
+    }
+    Some(if base.ends_with('/') {
+        base.to_string()
+    } else {
+        format!("{base}/")
+    })
 }
 
 impl NetCfg {
@@ -838,6 +919,8 @@ impl NetCfg {
             rate_kb: s.rate_limit_kb,
             auth: None,
             custom: Vec::new(),
+            mirror_prefix: None,
+            referer: None,
         }
     }
 
@@ -847,16 +930,40 @@ impl NetCfg {
     /// 地方（更新检查等）只能用 `from_settings`，以免把凭证带进无关请求。
     pub fn for_url(s: &Settings, url: &str) -> Self {
         let mut net = Self::from_settings(s);
+        let mut has_auth = false;
         if let Some(tok) = s.hf_token_trimmed() {
             if crate::util::is_huggingface_url(url) {
                 net.auth = Some(HostAuth {
                     host: "huggingface.co".into(),
                     value: format!("Bearer {tok}"),
                 });
+                has_auth = true;
             }
         }
         net.custom = s.headers_for_url(url);
+        // 镜像：只对 GitHub / HuggingFace 生效，且**带身份凭证的请求一律不走**
+        // ——镜像是一个第三方中继，token 与受限仓库名都不该交给它。
+        let wants_mirror = !s.mirror_prefix.trim().is_empty();
+        if wants_mirror
+            && !has_auth
+            && net.auth.is_none()
+            && mirror_eligible(url)
+            && !net.custom.iter().any(|(n, _)| is_sensitive_header(n))
+        {
+            net.mirror_prefix = normalize_mirror_prefix(&s.mirror_prefix);
+        }
         net
+    }
+
+    /// 实际请求地址：配置了镜像且源站适用时换成镜像前缀形式。
+    ///
+    /// 镜像服务的通用形态是 `<prefix><完整原始 URL>`（含原 scheme），
+    /// 因此这里不做 URL 重写，只做字符串拼接。
+    pub fn request_url<'a>(&'a self, url: &'a str) -> std::borrow::Cow<'a, str> {
+        match &self.mirror_prefix {
+            Some(p) => std::borrow::Cow::Owned(format!("{p}{url}")),
+            None => std::borrow::Cow::Borrowed(url),
+        }
     }
 
     /// 这批自定义头里是否含有不能跟着跨站重定向跑的身份凭证。
@@ -928,6 +1035,7 @@ pub(crate) fn default_download_dir() -> String {
 fn sealed_for_disk(s: &Settings) -> Settings {
     let mut d = s.clone();
     d.hf_token = crate::dpapi::seal(&d.hf_token);
+    d.github_token = crate::dpapi::seal(&d.github_token);
     d.proxy_pass = crate::dpapi::seal(&d.proxy_pass);
     d
 }
@@ -1049,6 +1157,8 @@ pub fn save_settings(
     settings.normalize_categories();
     // 请求头预设：头名/头值白名单、危险头过滤、条数上限。
     settings.normalize_header_presets();
+    // 镜像前缀：只接受 http(s)，缺尾斜杠补齐；非法值清空（退回直连）
+    settings.mirror_prefix = normalize_mirror_prefix(&settings.mirror_prefix).unwrap_or_default();
 
     // 信任集只允许两个来源：原生确认框的同意（remember_trusted_dir）、以及
     // 「用户把默认目录从 A 改到 B」时旧值 A 的自动继承。**前端表单里带来的
@@ -1084,7 +1194,22 @@ pub fn save_settings(
     if let Err(e) = apply_autostart(settings.autostart) {
         eprintln!("[settings] 开机自启设置失败: {e}");
     }
+    // aria2 RPC：只能「开」，关掉要重启进程（监听线程没有干净停机路径）。
+    // 前端会提示用户这一点。
+    if settings.aria2_enabled {
+        if let Some(app) = ARIA2_APP.get() {
+            crate::aria2::spawn(app.clone());
+        }
+    }
     Ok(settings)
+}
+
+/// save_settings 需要 AppHandle 才能即开即起 aria2 RPC，但命令签名里只有
+/// State。启动时记一份句柄（与 history::APP 同款 OnceLock 模式）。
+static ARIA2_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+pub fn set_app_handle(h: tauri::AppHandle) {
+    let _ = ARIA2_APP.set(h);
 }
 
 /// 把主题值收敛到三个合法取值之一，认不出的按「跟随系统」处理。
@@ -1401,6 +1526,69 @@ mod tests {
         assert_eq!(normalize_header_host("https://example.com"), None);
         assert_eq!(normalize_header_host("bad host"), None);
         assert_eq!(normalize_header_host(".."), None);
+    }
+
+    #[test]
+    fn mirror_prefix_is_normalized_and_scoped() {
+        // 清洗：补齐尾斜杠、去 query、非 http(s) 拒绝
+        assert_eq!(
+            normalize_mirror_prefix(" https://ghproxy.net ").as_deref(),
+            Some("https://ghproxy.net/")
+        );
+        assert_eq!(
+            normalize_mirror_prefix("https://ghproxy.net/gh/").as_deref(),
+            Some("https://ghproxy.net/gh/")
+        );
+        assert_eq!(
+            normalize_mirror_prefix("https://x.test/p?y=1").as_deref(),
+            Some("https://x.test/p/")
+        );
+        assert!(normalize_mirror_prefix("ghproxy.net").is_none());
+        assert!(normalize_mirror_prefix("ftp://x/").is_none());
+        assert!(normalize_mirror_prefix("https://").is_none());
+        assert!(normalize_mirror_prefix("   ").is_none());
+
+        // 适用域：GitHub / HuggingFace（含子域）
+        assert!(mirror_eligible("https://github.com/o/r/releases/download/v1/a.exe"));
+        assert!(mirror_eligible("https://objects.githubusercontent.com/x/y"));
+        assert!(mirror_eligible("https://huggingface.co/o/r/resolve/main/x.bin"));
+        assert!(!mirror_eligible("https://example.com/a.zip"));
+        assert!(!mirror_eligible("https://github.com.evil.test/x"));
+
+        let mut s = Settings {
+            mirror_prefix: "https://ghproxy.net".into(),
+            ..Settings::default()
+        };
+        // 普通 GitHub 链接 → 加镜像前缀
+        let net = NetCfg::for_url(&s, "https://github.com/o/r/releases/download/v1/a.exe");
+        assert_eq!(
+            net.request_url("https://github.com/o/r/releases/download/v1/a.exe"),
+            "https://ghproxy.net/https://github.com/o/r/releases/download/v1/a.exe"
+        );
+        // 非适用域 → 原样
+        let net = NetCfg::for_url(&s, "https://example.com/a.zip");
+        assert_eq!(net.request_url("https://example.com/a.zip"), "https://example.com/a.zip");
+
+        // 带 HF token 的请求绝不走镜像（token 与私有仓库名不外泄）
+        s.hf_token = "hf_secret".into();
+        let net = NetCfg::for_url(&s, "https://huggingface.co/o/r/resolve/main/x.bin");
+        assert_eq!(
+            net.request_url("https://huggingface.co/o/r/resolve/main/x.bin"),
+            "https://huggingface.co/o/r/resolve/main/x.bin"
+        );
+
+        // 带敏感自定义头的请求同样不走镜像
+        s.hf_token.clear();
+        s.header_presets = vec![HeaderPreset {
+            name: "api".into(),
+            host: "github.com".into(),
+            headers: vec![HeaderKV {
+                name: "Authorization".into(),
+                value: "Bearer t".into(),
+            }],
+        }];
+        let net = NetCfg::for_url(&s, "https://github.com/o/r/releases/download/v1/a.exe");
+        assert!(net.mirror_prefix.is_none());
     }
 
     #[test]

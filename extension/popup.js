@@ -10,17 +10,52 @@
 
 const $ = (id) => document.getElementById(id);
 
+/** 当前页面的地址（作为 Referer 交给桌面端）。 */
+let currentPageUrl = "";
+let currentTabId = null;
+
 function msg(text, isErr) {
   const m = $("msg");
   m.textContent = text || "";
   m.className = isErr ? "err" : "";
 }
 
+/** 渲染嗅探到的流媒体清单。 */
+async function refreshSniff() {
+  if (!currentTabId || currentTabId < 0) return;
+  let list = [];
+  try {
+    const r = await chrome.runtime.sendMessage({
+      type: "veloxgrab-sniff-query",
+      tabId: currentTabId,
+    });
+    list = (r && r.list) || [];
+  } catch {
+    list = [];
+  }
+  const wrap = $("sniffWrap");
+  const host = $("sniffList");
+  host.innerHTML = "";
+  if (!list.length) {
+    wrap.style.display = "none";
+    return;
+  }
+  wrap.style.display = "";
+  list.forEach((it) => {
+    const row = document.createElement("div");
+    const tag = it.kind === "dash" ? "DASH" : "HLS";
+    row.textContent = `[${tag}] ${it.url.length > 84 ? it.url.slice(0, 84) + "…" : it.url}`;
+    row.title = it.url;
+    row.onclick = () => send(it.url);
+    host.appendChild(row);
+  });
+}
+
 async function init() {
   // 恢复上次的目录/线程/接管开关。dir 存 storage.local（本机路径不上云），
   // threads/intercept 存 storage.sync。
   const [cfgSync, cfgLocal] = await Promise.all([
-    chrome.storage.sync.get(["threads", "intercept"]),
+    chrome.storage.sync.get(["threads", "intercept", "sniff"]),
     chrome.storage.local.get(["dir"]),
   ]);
   if (cfgLocal.dir) $("dir").value = cfgLocal.dir;
@@ -31,9 +66,27 @@ async function init() {
     chrome.storage.sync.set({ intercept: $("intercept").checked });
     msg($("intercept").checked ? "已开启：网页下载将转给 VeloxGrab" : "已关闭：网页下载走浏览器");
   };
+  // 深度嗅探开关（默认开）：拦截网络请求里的 .m3u8/.mpd 清单
+  $("sniff").checked = cfgSync.sniff !== false;
+  $("sniff").onchange = () => {
+    chrome.storage.sync.set({ sniff: $("sniff").checked });
+    msg($("sniff").checked ? "已开启流媒体嗅探" : "已关闭流媒体嗅探");
+    if (!$("sniff").checked) $("sniffWrap").style.display = "none";
+    else refreshSniff();
+  };
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tab && tab.url) $("url").value = tab.url;
+  // 记住当前页面的地址作为 Referer：防盗链直链必须带它
+  currentPageUrl = (tab && tab.url) || "";
+  currentTabId = tab && tab.id;
+
+  // 嗅探到的流媒体清单（HLS/DASH）：优先用这一栏，它看不到 DOM 的 blob: 流
+  refreshSniff();
+  // 页面播起来之后清单才会出现：popup 开着时跟着后台推送刷新
+  chrome.runtime.onMessage?.addListener?.((m) => {
+    if (m && m.type === "veloxgrab-sniff-update") refreshSniff();
+  });
 
   // 媒体列表：需要 scripting 权限之外的折中——用 executeScript 在页面上下文里抓
   if (tab && tab.id && /^https?:/.test(tab.url || "")) {
@@ -97,6 +150,8 @@ async function send(url) {
       url: url || target,
       dir,
       threads,
+      // 防盗链直链必须带页面 Referer；用户点的是本页里的链接/流
+      referer: currentPageUrl,
     });
     if (res && res.ok === true) {
       msg("已发送给 VeloxGrab");
