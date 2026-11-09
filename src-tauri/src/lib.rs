@@ -1,7 +1,6 @@
 pub mod bridge;
 pub mod aria2;
 pub mod clipboard;
-pub mod monitor;
 pub mod commands;
 pub mod decode;
 pub mod deeplink;
@@ -358,7 +357,6 @@ pub fn run() {
             commands::reveal_task_file,
             commands::open_download_dir,
             commands::app_version,
-            commands::open_progress_window,
             settings::get_settings,
             settings::save_settings,
             settings::set_theme,

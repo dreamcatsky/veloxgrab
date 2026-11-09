@@ -550,6 +550,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sniffedFor(msg.tabId).then((list) => sendResponse({ list }));
     return true;
   }
+  // popup 监视面板的「打开文件」：桌面端 open_task_file 是 Tauri 命令，
+  // 扩展页面拿不到 invoke，只能经后台转一个专用桥请求。桌面端没有直接
+  // 暴露这条 REST——用 /task-action 之外的路径会 404，所以走 add 的
+  // JSON 通道之外新开一条 /open-file（见 bridge.rs）。失败静默：面板是顺带功能。
+  if (msg.type === "veloxgrab-open") {
+    (async () => {
+      try {
+        await fetch("http://127.0.0.1:58943/open-file", {
+          method: "POST",
+          headers: await bridgeHeaders(),
+          body: JSON.stringify({ path: msg.path }),
+          cache: "no-store",
+        });
+      } catch {
+        // 桌面端没起：面板下次轮询会显示占位
+      }
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
   if (msg.type !== "veloxgrab-send") return;
   // 只认自家 popup 的消息。当前 manifest 没有 externally_connectable /
   // content_scripts，网页与第三方扩展本就触不到这里；这行是纵深——

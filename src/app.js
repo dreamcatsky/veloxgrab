@@ -308,7 +308,6 @@
     planSave: "Save",
     miOptions: "Options",
     miRefresh: "Refresh",
-    miProgress: "Open progress window",
     miUsage: "How to use",
     miSetupExt: "Enable browser extension…",
     miCheckUpdate: "Check for updates…",
@@ -325,11 +324,7 @@
     editRate: "Speed limit for this task (KB/s)",
     editSha: "Expected SHA-256 (optional)",
     searchPh: "Search name / URL / path…",
-    monitorAlwaysOn: "Keep the download monitor on top",
-    monitorAlwaysOnHint: "(off: other windows may cover it)",
-    monitorOpacity: "Download monitor opacity",
-    monitorOpacityHint: "(50%–100%)",
-    monitorNote: "The monitor lists every task (progress, speed, pause/resume, open file); drag its edges to resize, and the size and position are remembered.",
+    monitorNote: "The task monitor now lives in the browser extension popup: click the VeloxGrab toolbar icon to see each task's progress and pause/resume it.",
     ndStartAt: "Start at",
     ndStartAtHint: "(optional; empty = start now)",
     ndSha: "Expected SHA-256",
@@ -1807,12 +1802,6 @@
     $("setClipboardWatch").checked = s.clipboard_watch ?? false;
     $("setNotifyComplete").checked = s.notify_on_complete ?? true;
     $("setCloseMode").value = s.close_mode || "background";
-    // 监视窗偏好：置顶 + 不透明度（尺寸与位置由监视窗自己持久化）
-    $("setMonitorAlwaysOn").checked = s.monitor_always_on ?? true;
-    const op = Math.round((s.monitor_opacity ?? 1) * 100);
-    $("setMonitorOpacity").value = op;
-    $("setMonitorOpacityVal").textContent = op + "%";
-    syncRangeFill($("setMonitorOpacity"));
     $("setBrowser").value = s.cookies_from_browser || "none";
     $("setCookiesFile").value = s.cookies_file || "";
     $("setProxyEnabled").checked = !!s.proxy_enabled;
@@ -1882,8 +1871,6 @@
       clipboard_watch: $("setClipboardWatch").checked,
       notify_on_complete: $("setNotifyComplete").checked,
       close_mode: $("setCloseMode").value,
-      monitor_always_on: $("setMonitorAlwaysOn").checked,
-      monitor_opacity: (Number($("setMonitorOpacity").value) || 100) / 100,
       proxy_enabled: $("setProxyEnabled").checked,
       proxy_type: $("setProxyType").value,
       proxy_host: $("setProxyHost").value.trim(),
@@ -2288,14 +2275,6 @@
       case "refresh":
         refreshTasks();
         toast("已刷新");
-        break;
-
-      case "openProgress":
-        try {
-          await invoke("open_progress_window");
-        } catch (e) {
-          toast(String(e), true);
-        }
         break;
 
       case "usage":
@@ -2902,10 +2881,6 @@
   });
   $("setDefaultThreads").addEventListener("input", (e) => {
     $("setDefaultThreadsVal").textContent = e.target.value;
-    syncRangeFill(e.target);
-  });
-  $("setMonitorOpacity").addEventListener("input", (e) => {
-    $("setMonitorOpacityVal").textContent = e.target.value + "%";
     syncRangeFill(e.target);
   });
 

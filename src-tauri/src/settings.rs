@@ -172,13 +172,14 @@ pub struct Settings {
     pub close_mode: String,
     /// 监视窗是否保持置顶。
     ///
-    /// 列表版监视窗默认置顶（这样才能挂在别的窗口旁边盯进度）；关掉后它
-    /// 会被普通窗口盖住，适合把它当成「需要时切过去看一眼」的用户。
+    /// **已废弃**：监视窗不再是独立窗口（1.5.2 起改到浏览器扩展弹窗里）。
+    /// 字段保留是为了旧 settings.json 能原样读回，保存时原样写回、不再生效。
     #[serde(default = "default_true")]
+    #[deprecated(since = "1.5.2", note = "monitor moved into the browser extension popup")]
     pub monitor_always_on: bool,
-    /// 监视窗不透明度（0.5–1.0）。默认 1.0：列表里有文字与进度条，
-    /// 半透明会降低可读性；想要「透出桌面」的用户可以自己调低。
+    /// 监视窗不透明度。同样已废弃，保留原因同上。
     #[serde(default = "default_monitor_opacity")]
+    #[deprecated(since = "1.5.2", note = "monitor moved into the browser extension popup")]
     pub monitor_opacity: f64,
     /// 点窗口「×」的行为：background（最小化到托盘）| ask（询问）| quit（退出）
     /// 外观主题：system（跟随系统）| dark | light
@@ -236,7 +237,9 @@ impl Default for Settings {
             clipboard_watch: false,
             notify_on_complete: true,
             close_mode: "background".into(),
+            #[allow(deprecated)]
             monitor_always_on: true,
+            #[allow(deprecated)]
             monitor_opacity: 1.0,
             proxy_enabled: false,
             proxy_type: "http".into(),
@@ -1258,7 +1261,7 @@ pub fn set_window_theme(app: tauri::AppHandle, theme: String) {
         "dark" => Some(tauri::Theme::Dark),
         _ => None,
     };
-    for name in ["main", "progress"] {
+    for name in ["main"] {
         if let Some(w) = app.get_webview_window(name) {
             let _ = w.set_theme(t);
         }

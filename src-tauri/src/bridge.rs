@@ -477,7 +477,7 @@ fn route(req: BridgeReq) -> RouteOutcome {
         return static_outcome(403, "{\"ok\":false,\"error\":\"bad host\"}");
     }
 
-    if path != "/add" && path != "/ping" {
+    if path != "/add" && path != "/ping" && path != "/tasks" && path != "/task-action" && path != "/open-file" {
         return static_outcome(404, "{\"ok\":false,\"error\":\"unknown path\"}");
     }
 
@@ -524,6 +524,57 @@ fn route(req: BridgeReq) -> RouteOutcome {
         return static_outcome(200, "{\"ok\":true}");
     }
 
+    // /tasks 与 /task-action：扩展弹窗里的任务监视面板。这两个接口只读状态
+    // 与暂停/继续，**不经过** /add 的速率闸——弹窗每 2 秒轮询一次是正常节奏，
+    // 与「灌任务」完全是两回事；但 token/Origin 门禁一个不少（上面已过）。
+    if path == "/tasks" || path == "/task-action" {
+        return task_api(&path, &method, &body);
+    }
+
+    // /open-file：监视面板里「打开已完成文件」。扩展页面拿不到 Tauri 的
+    // invoke，只能经后台 SW 转一条 REST。校验与桌面 open_task_file 命令
+    // 相同（存在 + 是文件），执行走 opener——语义与主窗口「打开」一致。
+    if path == "/open-file" {
+        if method != "POST" {
+            return static_outcome(405, "{\"ok\":false,\"error\":\"POST required\"}");
+        }
+        let p = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("path")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+        let Some(p) = p else {
+            return static_outcome(400, "{\"ok\":false,\"error\":\"need path\"}");
+        };
+        let Some(app) = APP.get() else {
+            return static_outcome(503, "{\"ok\":false,\"error\":\"app not ready\"}");
+        };
+        use tauri_plugin_opener::OpenerExt;
+        let path = std::path::PathBuf::from(&p);
+        if !path.is_file() {
+            return RouteOutcome {
+                status: 409,
+                body: "{\"ok\":false,\"error\":\"file not found (may have been moved or deleted)\"}".into(),
+                dispatched_link: None,
+            };
+        }
+        let result = app
+            .opener()
+            .open_path(p, None::<&str>)
+            .map_err(|e| e.to_string());
+        return match result {
+            Ok(()) => static_outcome(200, "{\"ok\":true}"),
+            Err(e) => RouteOutcome {
+                status: 409,
+                body: format!("{{\"ok\":false,\"error\":{}}}", json_str(&e)),
+                dispatched_link: None,
+            },
+        };
+    }
+
     // 灌任务防护：正常用户（手点 + 批量抓取）到不了这个量级。
     if add_rate_limited() {
         return static_outcome(429, "{\"ok\":false,\"error\":\"too many requests; slow down\"}");
@@ -550,6 +601,7 @@ fn route(req: BridgeReq) -> RouteOutcome {
 }
 
 /// 一次解析完成的桥请求。字段含义见 `read_request`。
+#[derive(Clone)]
 struct BridgeReq {
     method: String,
     path: String,
@@ -793,6 +845,145 @@ fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+/// `/tasks` 与 `/task-action` 的实现：扩展弹窗里的任务监视面板。
+///
+/// `route` 是纯函数（没有 AppHandle），但这两个接口必须读任务表、改任务
+/// 状态——它们经由 spawn 时登记的 `APP` 句柄访问 AppState。句柄缺席（纯
+/// socket 测试）返回 503，而不是 panic。
+///
+/// 安全：进入本函数前已过 Host → Origin → token 三道门禁，与 /add 完全
+/// 一致；**不经过** /add 的速率闸（弹窗 2 秒轮询是正常节奏）。POST /tasks
+/// 与 GET /tasks 都收（扩展的 fetch 用 POST JSON 携带 token 最省事）。
+///
+/// 返回的任务条目只挑监视需要的字段：不把 url 原样带出去给 popup 渲染是
+/// 刻意的吗？不是——弹窗与桌面端同源信任（同一个用户装的扩展），完整 URL
+/// 显示来源域名反而有用。照给。
+fn task_api(path: &str, method: &str, body: &str) -> RouteOutcome {
+    // ---- /task-action 的形状校验（不依赖 AppState，放最前）----
+    // 顺序错了的话，测试环境（无 AppHandle）会把「参数错误」报成 503，
+    // 扩展侧无法区分「桌面端没起」与「自己发的请求有问题」。
+    let action_req = if path == "/task-action" {
+        if method != "POST" || body.is_empty() {
+            return static_outcome(405, "{\"ok\":false,\"error\":\"POST JSON required\"}");
+        }
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(body);
+        let Ok(v) = parsed else {
+            return static_outcome(400, "{\"ok\":false,\"error\":\"body is not valid JSON\"}");
+        };
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+        let action = v
+            .get("action")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if id.is_empty() || (action != "pause" && action != "resume") {
+            return static_outcome(
+                400,
+                "{\"ok\":false,\"error\":\"need id and action (pause|resume)\"}",
+            );
+        }
+        Some((id, action))
+    } else {
+        None
+    };
+
+    use tauri::Manager;
+
+    let Some(app) = APP.get() else {
+        return static_outcome(503, "{\"ok\":false,\"error\":\"app not ready\"}");
+    };
+    let Some(state) = app.try_state::<crate::commands::AppState>() else {
+        return static_outcome(503, "{\"ok\":false,\"error\":\"app not ready\"}");
+    };
+    let state = state.inner();
+
+    if path == "/tasks" {
+        // 阻塞 tasks 锁：任务表是 tokio Mutex，桥线程上不能 await。
+        // lock() 的阻塞窗口是微秒级（读快照），且桥是独立线程，不碰运行时。
+        let snapshot = tauri::async_runtime::block_on(async {
+            let guard = state.tasks.lock().await;
+            let mut v: Vec<serde_json::Value> = Vec::new();
+            for t in guard.values() {
+                // 弹窗监视的是「还没结束的事」+ 刚完成的（给打开入口）。
+                // 历史回灌的 done 不进列表——判据与桌面监视窗一致。
+                let recent_done = t.state == crate::engine::TaskState::Done
+                    && t.created_at >= crate::commands::now_ms() - 60_000;
+                let interesting = matches!(
+                    t.state,
+                    crate::engine::TaskState::Downloading
+                        | crate::engine::TaskState::Merging
+                        | crate::engine::TaskState::Paused
+                        | crate::engine::TaskState::Queued
+                        | crate::engine::TaskState::Failed
+                ) || recent_done;
+                if !interesting {
+                    continue;
+                }
+                v.push(serde_json::json!({
+                    "id": t.id,
+                    "title": t.title,
+                    "state": match t.state {
+                        crate::engine::TaskState::Downloading => "downloading",
+                        crate::engine::TaskState::Merging => "merging",
+                        crate::engine::TaskState::Paused => "paused",
+                        crate::engine::TaskState::Queued => "queued",
+                        crate::engine::TaskState::Failed => "failed",
+                        crate::engine::TaskState::Done => "done",
+                        crate::engine::TaskState::Canceled => "canceled",
+                    },
+                    "progress": t.progress,
+                    "downloaded_bytes": t.downloaded_bytes,
+                    "total_bytes": t.total_bytes,
+                    "speed": t.speed,
+                    "host": crate::util::host_of(&t.url).unwrap_or(""),
+                    "file_missing": t.file_missing,
+                    "output_path": t.output_path,
+                }));
+            }
+            v.sort_by_key(|t| {
+                let rank = |s: &str| match s {
+                    "downloading" => 0,
+                    "merging" => 1,
+                    "paused" => 2,
+                    "failed" => 3,
+                    "queued" => 4,
+                    _ => 5,
+                };
+                rank(t["state"].as_str().unwrap_or(""))
+            });
+            v
+        });
+        let body = serde_json::json!({ "ok": true, "tasks": snapshot }).to_string();
+        return RouteOutcome { status: 200, body, dispatched_link: None };
+    }
+
+    // ---- /task-action：执行 ----
+    let Some((id, action)) = action_req else {
+        unreachable!("/task-action 之外的路由不会进入 task_api");
+    };
+    // 复用命令层的单任务内核：它们自带状态校验（终态拒绝、令牌守卫、落历史），
+    // 桥这边不再抄一遍。block_on 阻塞的是桥线程，锁窗口微秒级。
+    let result = tauri::async_runtime::block_on(async {
+        match action.as_str() {
+            "pause" => crate::commands::bridge_pause_task(state, &id).await,
+            _ => crate::commands::bridge_resume_task(state, &id).await,
+        }
+    });
+    match result {
+        Ok(()) => RouteOutcome {
+            status: 200,
+            body: "{\"ok\":true}".to_string(),
+            dispatched_link: None,
+        },
+        Err(e) => RouteOutcome {
+            status: 409,
+            body: format!("{{\"ok\":false,\"error\":{}}}", json_str(&e)),
+            dispatched_link: None,
+        },
+    }
+}
+
 /// Origin 是否是「浏览器扩展」来源。None（请求里没有 Origin）同样拒绝：
 /// 恶意网页的 `<img>` / 顶层导航类请求恰恰是不带 Origin 的那批。
 /// 纯函数，便于单测这条门禁。
@@ -818,6 +1009,51 @@ mod tests {
             token: None,
             body: r#"{"url":"https://e.com/a.zip"}"#.into(),
         }
+    }
+
+    /// 监视接口的门禁与参数校验。/tasks 的成功路径需要真实 AppState（APP
+    /// 未登记的测试环境拿不到），那里由 socket 测试覆盖；这里锁的是「门禁
+    /// 链对两个新路径与 /add 完全一致」与「task-action 的参数校验在门禁
+    /// 之后、且不依赖 AppState」这两件事。
+    #[test]
+    fn task_api_gates_match_add_chain() {
+        let mut base = good_req();
+        base.path = "/tasks".into();
+        base.method = "GET".into();
+        base.body = String::new();
+
+        // Host / Origin / 预检门禁与 /add 一致
+        let mut r = base.clone();
+        r.host = Some("evil.example".into());
+        assert_eq!(route(r).status, 403);
+        let mut r = base.clone();
+        r.origin = Some("https://evil.test".into());
+        assert_eq!(route(r).status, 403);
+        let mut r = base.clone();
+        r.method = "OPTIONS".into();
+        assert_eq!(route(r).status, 204);
+
+        // task-action 的参数校验在 AppState **之前**也能工作（400/405 与
+        // AppHandle 无关——顺序错了测试环境会直接 503）
+        let mut r = base.clone();
+        r.path = "/task-action".into();
+        r.method = "GET".into();
+        assert_eq!(route(r).status, 405, "GET 到 task-action 必须 405");
+        let post = |body: &str| {
+            let mut r = base.clone();
+            r.path = "/task-action".into();
+            r.method = "POST".into();
+            r.body = body.into();
+            route(r).status
+        };
+        assert_eq!(post("not json"), 400, "坏 JSON 必须 400");
+        assert_eq!(post(r#"{"id":"t1"}"#), 400, "缺 action 必须 400");
+        assert_eq!(post(r#"{"id":"","action":"pause"}"#), 400, "空 id 必须 400");
+        assert_eq!(
+            post(r#"{"id":"t1","action":"delete"}"#),
+            400,
+            "未知 action 必须 400"
+        );
     }
 
     /// P3-8：route 门禁链的端到端判定——按 handle 的真实顺序逐门验证，

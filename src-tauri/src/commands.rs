@@ -1211,13 +1211,7 @@ pub fn pump_queue(
                 // 排队任务占走，「没有活跃任务」会被误判成「全下完了」。
                 crate::plan::check_and_fire(&app_c, &ctx_c.tasks, &ctx_c.queue, &ctx_c.running)
                     .await;
-
-                // 监视框跟随活跃下载：worker 收尾时同步（全部结束 → 自动隐藏）。
-                crate::monitor::sync(&app_c, &ctx_c.tasks).await;
             });
-
-            // 监视框跟随活跃下载：泵刚启动了新任务时同步（自动浮出，不抢焦点）。
-            crate::monitor::sync(&app, &ctx.tasks).await;
         }
     })
 }
@@ -2308,6 +2302,20 @@ pub async fn pause_tasks(
     Ok(ok)
 }
 
+/// 桥 `/task-action` 用的暂停/继续入口：与 `pause_task` / `resume_task`
+/// 走同一套单任务内核（pause_one / resume_one，含令牌守卫、状态校验、
+/// 落历史），但不经 emit "tasks-changed"——扩展弹窗自己会轮询 /tasks 刷新。
+///
+/// 单独封装而不是把 `tauri::State` 拆开传：这两个函数是桥线程上
+/// `block_on` 的目标，参数只需要 `&AppState`。
+pub async fn bridge_pause_task(state: &AppState, id: &str) -> Result<(), String> {
+    pause_one(state, id).await
+}
+
+pub async fn bridge_resume_task(state: &AppState, id: &str) -> Result<(), String> {
+    resume_one(state, id).await
+}
+
 /// 单个任务的暂停内核（`pause_task` 与 `pause_tasks` 共用）。
 async fn pause_one(state: &AppState, id: &str) -> Result<(), String> {
     // 排队中的：出队并落状态
@@ -2912,16 +2920,6 @@ pub async fn open_download_dir(
 #[tauri::command]
 pub async fn app_version(app: tauri::AppHandle) -> Result<String, String> {
     Ok(app.package_info().version.to_string())
-}
-
-/// 打开独立的进度窗口（菜单「查看 → 打开进度窗口」）。
-///
-/// 之所以做成独立窗口而不是切到任务页：IDM 的进度窗口是常驻小窗，
-/// 用户一边浏览网页一边看进度。窗口只创建一次，之后每次点击只是把它
-/// 提到前台——重复创建会让同一份下载显示成两个窗口，且事件监听翻倍。
-#[tauri::command]
-pub async fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
-    crate::monitor::ensure(&app, true).await
 }
 
 #[cfg(test)]

@@ -56,7 +56,6 @@
       <button class="menu-btn" data-i18n="menuView">查看(V)</button>
       <div class="menu-pop">
         <button class="menu-item" data-cmd="refresh"><span data-i18n="miRefresh">刷新</span><kbd>F5</kbd></button>
-        <button class="menu-item" data-cmd="openProgress"><span data-i18n="miProgress">打开进度窗口</span></button>
       </div>
     </div>
 
@@ -398,18 +397,7 @@
             </select>
           </label>
 
-          <label class="fld checkbox">
-            <input id="setMonitorAlwaysOn" type="checkbox" />
-            <span><span data-i18n="monitorAlwaysOn">下载监视窗始终置顶</span> <em class="dim" data-i18n="monitorAlwaysOnHint">(关掉后会被其他窗口盖住)</em></span>
-          </label>
-          <label class="fld">
-            <span><span data-i18n="monitorOpacity">下载监视窗不透明度</span> <em class="dim" data-i18n="monitorOpacityHint">(50%–100%)</em></span>
-            <div class="slider-row">
-              <input id="setMonitorOpacity" type="range" min="50" max="100" step="5" />
-              <output id="setMonitorOpacityVal" class="slider-val"></output>
-            </div>
-          </label>
-          <small class="dim" data-i18n="monitorNote">监视窗列出每个任务（进度、速度、暂停/继续、打开文件）；大小与位置可以直接拖动调整，会记住。</small>
+          <small class="dim" data-i18n="monitorNote">任务监视面板已移到浏览器扩展弹窗里：点工具栏的 VeloxGrab 图标即可查看每个任务的进度并暂停/继续。</small>
           </section>
 
           <section class="set-card">
