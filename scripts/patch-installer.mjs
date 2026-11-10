@@ -34,6 +34,7 @@ const EXT_FILES = [
   "icon48.png",
   "manifest.json",
   "offscreen-launch.html",
+  "offscreen-launch.js",
   "popup.html",
   "popup.js",
 ];
