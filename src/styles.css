@@ -1645,3 +1645,6 @@ input[type="number"]:focus {
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--dim); background-clip: padding-box; }
 
+
+/* 另存为弹窗的「识别失败但可直链下载」提示行：错误色但保留可读性 */
+#saStatus.err { color: var(--err); }

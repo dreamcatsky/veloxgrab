@@ -3010,6 +3010,14 @@
     });
   }
 
+  // 兜底轮询：emit 是「尽力送达」，主窗忙/未挂 listen 时事件会静默丢失，
+  // 链接从此卡在 pending_links（实测：点扩展下载后主窗闪到前台却没有任何
+  // 弹窗，正是事件丢失的形态）。3 秒一次的空队列 IPC 成本可忽略；
+  // take_pending_deep_links 取走即清空，天然幂等。
+  setInterval(() => {
+    drainExternalLinks();
+  }, 3000);
+
   async function acceptExternalLink(p) {
     if (!p || p.error) return;
     // launch 动作：扩展在桌面端未运行时发来的「只拉起」请求，不带任务。
@@ -3160,11 +3168,18 @@
       $("saBody").classList.remove("hidden");
       $("saStart").disabled = false;
     } else if (r && r.kind === "error") {
-      // 两边都识别不了：不弹一个必然失败的框，直接报错收场
-      $("saStatus").textContent = r.message || "无法识别该链接";
-      $("saveAsOverlay").classList.add("hidden");
-      saveAsCtx = null;
-      return;
+      // 两边都识别不了：不悄悄收场（弹窗一闪而过是「程序坏了」的观感），
+      // 保留弹窗让用户看错误原因，并仍可按直链下载——探测失败不代表
+      // 下载失败（动态生成的链接、需要 Referer 的直链都会探不出来）。
+      saveAsCtx.direct = { sourceUrl: p.url, fallback: true };
+      $("saKind").textContent = "直链";
+      $("saKind").classList.remove("hidden");
+      $("saStatus").textContent = "识别失败，可按直链尝试下载：" + (r.message || "未知原因");
+      $("saStatus").classList.add("err");
+      $("saThreadsRow").classList.remove("hidden");
+      $("saDetail").textContent = "服务器信息未知；若下载失败请检查链接是否需要登录";
+      $("saBody").classList.remove("hidden");
+      $("saStart").disabled = false;
     } else {
       // 探测抛异常：按直链兜底，让用户自己决定
       $("saThreadsRow").classList.remove("hidden");
