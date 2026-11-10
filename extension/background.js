@@ -273,7 +273,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
     // （Content-Disposition 里的名字只有浏览器知道）。
     const filename = pickFilename(item);
     const referer = referrerFor(item, "");
-    const ok = await send({
+    const result = await send({
       url: item.url,
       filename,
       dir: cfg.dir,
@@ -281,7 +281,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
       referer,
     });
 
-    if (ok === false) {
+    if (result.ok === false) {
       // VeloxGrab 彻底没接住（桌面端缺席且拉起失败/超时）：浏览器那条已经
       // 被取消并抹掉了，不还回去的话用户点一次下载会「什么都没发生」。
       // 重新交给浏览器下载。扩展发起的下载带 byExtensionId，上面的监听器
@@ -295,12 +295,13 @@ chrome.downloads.onCreated.addListener(async (item) => {
       }
     }
     if (cfg.notify) {
-      if (ok === true) {
+      if (result.ok === true) {
         notify("已转给 VeloxGrab", filename || item.url);
       } else {
+        // 诊断串跟通知走：用户截一张通知就能定位断在哪一环
         notify(
           "VeloxGrab 未响应，已交回浏览器下载",
-          "拉起或连接失败；可手动启动 VeloxGrab 后再试"
+          `${result.diag}；可手动启动 VeloxGrab 后再试`
         );
       }
     }
@@ -386,22 +387,27 @@ async function bridgeHeaders() {
 /**
  * 把一条下载请求交给 VeloxGrab。
  *
- * 返回值：
- * - `true`  桥确认送达，可以放心告诉用户「发出去了」；
- * - `false` VeloxGrab 没在运行（或桥不可用）。拦截路径会把下载交回浏览器，
- *   右键/弹窗路径如实提示——**绝不**开新标签页、不改当前页。
+ * 返回 `{ ok, diag }`：
+ * - `ok: true`  桥确认送达，可以放心告诉用户「发出去了」；
+ * - `ok: false` 没送达。拦截路径会把下载交回浏览器，右键/弹窗路径如实提示
+ *   ——**绝不**开新标签页、不改当前页。
+ * - `diag` 失败链路的一行诊断（空格分隔 token，如
+ *   `bridge:down launch:ok poll:never-up`）：bridge = 首次直发结果，
+ *   launch = offscreen 拉起结果，poll = 拉起后轮询补交结果。它同时进通知
+ *   与弹窗错误面板——「点了没反应」这类故障必须能从面板读出断在哪一环，
+ *   否则每轮排查都只能靠猜。
  *
  * 顺序很重要：**先桥后协议**。桥是同步返回成败的；协议只是兜底。
  */
 async function send(target) {
-  if (!target || !target.url) return false;
+  if (!target || !target.url) return { ok: false, diag: "no-url" };
 
   // 0. 拦在源头：VeloxGrab 只处理 http/https。
   //    blob: 是页面内存里的临时地址（MSE 播放），出不了浏览器进程；
   //    data: 同理。发过去只会得到一句「必须以 http 或 https 开头」的后端错误，
   //    而且用户还看不到（右键菜单是 fire-and-forget）。这里直接判否，
   //    交给调用方给出可操作的提示。
-  if (!/^https?:/i.test(target.url)) return false;
+  if (!/^https?:/i.test(target.url)) return { ok: false, diag: "scheme-not-http" };
 
   // 1. 本地桥
   try {
@@ -424,16 +430,21 @@ async function send(target) {
     clearTimeout(timer);
     if (res.ok) {
       const j = await res.json().catch(() => ({}));
-      if (j && j.ok) return true;
+      if (j && j.ok) return { ok: true, diag: "bridge:direct" };
       // 403 + token mismatch 说明桌面端比扩展新（要求共享 token），把原因
       // 带给用户，别让「点了没反应」重演。
       if (j && j.error && /token/i.test(String(j.error))) {
         notify("VeloxGrab 已更新", "请到 chrome://extensions 刷新 VeloxGrab 扩展后再试");
-        return false;
+        return { ok: false, diag: "bridge:token-mismatch" };
       }
+      // 桥在跑但业务层拒了这条（2xx + ok:false）：进程活着，再拉起无济于事，
+      // 直接带诊断返回。
+      return { ok: false, diag: `bridge:http-${res.status}-reject` };
     }
+    // 桥在跑但回了非 2xx（Origin 门禁等）：进程明明活着，拉起毫无意义。
+    return { ok: false, diag: `bridge:http-${res.status}` };
   } catch {
-    // 桥不可用 → 走协议
+    // 桥不可用 → 走协议拉起
   }
 
   // 2. 桥不通：VeloxGrab 没在运行。通过 offscreen 文档导航到
@@ -448,12 +459,15 @@ async function send(target) {
   //    桥（bridge::spawn 在 setup 里最早一批），20 秒上限已远超慢机器。
   //    任务送达后桌面端照常走「另存为/静默入队」，用户点一次下载就完事，
   //    不需要再手动重试。超时才把下载交回浏览器（旧兜底）。
-  const started = await launchDesktopViaOffscreen();
-  if (started) {
-    const delivered = await waitAndResend(target, 20_000);
-    if (delivered) return true;
-  }
-  return false;
+  const launch = await launchDesktopViaOffscreen();
+  const poll = launch.ok
+    ? await waitAndResend(target, 20_000)
+    : { ok: false, detail: "launch-failed" };
+  if (poll.ok) return { ok: true, diag: "bridge:after-launch" };
+  return {
+    ok: false,
+    diag: `bridge:down launch:${launch.ok ? "ok" : launch.detail} poll:${poll.detail}`,
+  };
 }
 
 /**
@@ -462,10 +476,15 @@ async function send(target) {
  * 轮询间隔 800ms（桥监听后的 /add 是毫秒级往返，不值得更密）；到上限仍
  * 不通才放弃。发送复用 /add 的 JSON 通道——与首次尝试完全同一参数，
  * 避免「重试的下载丢字段」这类分叉。
+ *
+ * 返回 `{ ok, detail }`；`detail` 供 diag 使用：`delivered` = 补交成功；
+ * `up-http-<status>` = 轮询期间桥回过 HTTP（进程活着、端口在监听，没送达
+ * 是应用侧拒绝而非拉起失败）；`never-up` = 整个窗口桥都没起来。
  */
 async function waitAndResend(target, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let relaunched = false;
+  let sawStatus = 0;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 800));
     try {
@@ -486,8 +505,9 @@ async function waitAndResend(target, timeoutMs) {
       clearTimeout(timer);
       if (res.ok) {
         const j = await res.json().catch(() => ({}));
-        if (j && j.ok) return true;
+        if (j && j.ok) return { ok: true, detail: "delivered" };
       }
+      sawStatus = sawStatus || res.status;
     } catch {
       // 还没起：继续等
     }
@@ -499,7 +519,7 @@ async function waitAndResend(target, timeoutMs) {
       await launchDesktopViaOffscreen();
     }
   }
-  return false;
+  return { ok: false, detail: sawStatus ? `up-http-${sawStatus}` : "never-up" };
 }
 
 /**
@@ -510,15 +530,18 @@ async function waitAndResend(target, timeoutMs) {
  * 页面」的宽松分类）+ 一次性导航。Chrome 限制同 reason 只能一个实例，
  * 所以发完导航就关掉，下次需要再建。
  *
- * 返回 true = 协议导航已触发（或文档早已存在且可能是上一轮触发的）；
- * false = offscreen 不可用（Chrome < 109 / 权限问题），调用方应走旧兜底。
+ * 返回 `{ ok, detail }`：
+ * - `ok: true`  = 协议导航已触发（先关再建保证每次都是全新文档，残留文档
+ *   不会让脚本静默跳过）；
+ * - `ok: false` = offscreen 不可用，`detail` 说明原因：`unsupported`
+ *   （Chrome < 109 / 权限问题）或 `create-failed:…`（createDocument 报错原文）。
  */
 let launchingOffscreen = false;
 async function launchDesktopViaOffscreen() {
-  if (launchingOffscreen) return true; // 并发去重：上一轮正在拉，等它即可
+  if (launchingOffscreen) return { ok: true, detail: "already-running" }; // 并发去重：上一轮正在拉，等它即可
   launchingOffscreen = true;
   try {
-    if (!chrome.offscreen) return false; // Chrome < 109：没有该 API
+    if (!chrome.offscreen) return { ok: false, detail: "unsupported" }; // Chrome < 109：没有该 API
     // **总是**先关再建：offscreen 文档只在创建时执行一次脚本。残留的旧文档
     // （上一轮导航失败后 closeDocument 没跑到、或浏览器重启后恢复）不会再
     // 执行脚本——如果这里走 has=true 分支直接复用，拉起从此永远失败且无
@@ -541,10 +564,11 @@ async function launchDesktopViaOffscreen() {
     } catch {
       // 已经关了/从未建成：不影响任何主流程
     }
-    return true;
-  } catch {
-    // offscreen 不可用（旧浏览器/权限问题）：退回「只提示用户」的旧行为
-    return false;
+    return { ok: true, detail: "navigated" };
+  } catch (e) {
+    // offscreen 不可用（旧浏览器/权限问题）或 createDocument 报错：退回旧兜底，
+    // 错误原文进 detail（换行压成下划线，diag 的 token 以空格分隔）。
+    return { ok: false, detail: `create-failed:${String(e).slice(0, 60).replace(/\s+/g, "_")}` };
   } finally {
     launchingOffscreen = false;
   }
@@ -626,19 +650,22 @@ async function handleMenuClick(info, tab) {
     return;
   }
 
-  let ok = false;
+  let result = { ok: false, diag: "no-target" };
   try {
-    ok = await send(target);
+    result = await send(target);
   } catch (e) {
     notify("发送失败", String(e).slice(0, 200));
     return;
   }
-  if (ok === true) {
+  if (result.ok === true) {
     // 桥已确认（含拉起后自动补交成功），不用打扰用户
   } else {
-    // send() 已试过 offscreen 拉起 + 20 秒轮询仍未通：协议分发多半没生效
-    //（便携版没注册协议 / 浏览器策略拦截），只能请用户手动启动
-    notify("VeloxGrab 未能启动", "请手动启动 VeloxGrab 后重试");
+    // send() 已试过 offscreen 拉起 + 20 秒轮询仍未通：把诊断串交给用户，
+    // 「未能启动」的定性（协议分发没生效 / 便携版没注册协议）从 diag 读出。
+    notify(
+      "VeloxGrab 未能启动",
+      `${result.diag}；请手动启动 VeloxGrab 后重试`
+    );
   }
 }
 
@@ -690,14 +717,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   (async () => {
     const cfg = await getConfig();
-    const ok = await send({
+    const result = await send({
       url: msg.url,
       filename: msg.filename || guessName(msg.url),
       threads: cfg.threads,
       dir: cfg.dir,
       referer: msg.referer || "",
     });
-    sendResponse({ ok });
+    // diag 一并回给 popup：错误面板要显示「断在哪一环」，不只是「失败」
+    sendResponse({ ok: result.ok, diag: result.diag });
   })();
 
   // 异步响应必须返回 true，否则通道会被立刻关掉

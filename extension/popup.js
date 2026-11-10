@@ -372,8 +372,11 @@ async function send(url) {
       setTimeout(() => window.close(), 700);
     } else {
       // 桌面端没在运行：后台已做「拉起 + 最多 20 秒轮询补交」；到这里还没
-      // 成功说明协议分发没生效（便携版/策略拦截），只能请用户手动启动。
-      msg("VeloxGrab 未能启动，请手动打开它后重试", true);
+      // 成功说明链路断在某环。res.diag 是后台的诊断串（bridge:… launch:…
+      // poll:…），原样亮出来——下一步动作（重装/刷新扩展、检查协议注册、
+      // 手动启动）取决于断在哪一环，让面板先给出证据。
+      const diag = (res && res.diag) || "no-diag";
+      msg(`未能送达 [${diag}]。请手动启动 VeloxGrab 后重试；若反复出现，请把这段诊断发给开发者。`, true);
     }
   } catch (e) {
     msg("发送失败：" + String(e), true);
