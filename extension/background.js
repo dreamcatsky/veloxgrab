@@ -261,24 +261,42 @@ chrome.downloads.onCreated.addListener(async (item) => {
   if (!cfg.intercept) return;
 
   if (await isCanceling(item.id)) return;
-  await setCanceling(item.id, true);
 
-  try {
-    await chrome.downloads.cancel(item.id);
-  } catch {
-    // 取消失败（下载已经结束）就别再转发了，否则用户会看到两条。
-    await setCanceling(item.id, false);
+  // **先探桥，再决定动不动这条下载。**
+  //
+  // 旧实现是先 cancel 再 send，send 失败后用 chrome.downloads.download()
+  // 兜底还回去——实测（Edge 157，隔离实例 + 用户真实环境一致）这条兜底
+  // 会立即 USER_CANCELED、0 字节、不产生任何可见记录：用户视角就是
+  // 「点了下载，什么都没发生」。 VeloxGrab 没在跑时唯一不丢下载的兜底
+  // 是**根本不取消**：让浏览器带着自己的手势、Cookie、Referer 把文件下完。
+  const alive = await bridgeAlive();
+  if (!alive) {
+    if (cfg.notify) {
+      notify(
+        "VeloxGrab 未运行，本次由浏览器下载",
+        "启动 VeloxGrab 后，网页下载会自动转给它（可在弹窗确认）"
+      );
+    }
     return;
   }
 
-  // 从浏览器下载队列里抹掉这条记录，否则下载面板会留一条「已取消」。
-  try {
-    await chrome.downloads.erase({ id: item.id });
-  } catch {
-    // erase 失败只是留个痕迹，不影响主流程
-  }
+  await setCanceling(item.id, true);
 
   try {
+    try {
+      await chrome.downloads.cancel(item.id);
+    } catch {
+      // 取消失败（下载已经结束）就别再转发了，否则用户会看到两条。
+      return;
+    }
+
+    // 从浏览器下载队列里抹掉这条记录，否则下载面板会留一条「已取消」。
+    try {
+      await chrome.downloads.erase({ id: item.id });
+    } catch {
+      // erase 失败只是留个痕迹，不影响主流程
+    }
+
     // 用浏览器已经解析出的文件名：它比我们从 URL 猜的准得多
     // （Content-Disposition 里的名字只有浏览器知道）。
     const filename = pickFilename(item);
@@ -291,27 +309,15 @@ chrome.downloads.onCreated.addListener(async (item) => {
       referer,
     });
 
-    if (result.ok === false) {
-      // VeloxGrab 彻底没接住（桌面端缺席且拉起失败/超时）：浏览器那条已经
-      // 被取消并抹掉了，不还回去的话用户点一次下载会「什么都没发生」。
-      // 重新交给浏览器下载。扩展发起的下载带 byExtensionId，上面的监听器
-      // 会跳过它，不会成环。
-      const opts = { url: item.url, conflictAction: "uniquify" };
-      if (filename) opts.filename = filename;
-      try {
-        await chrome.downloads.download(opts);
-      } catch {
-        // 仍然失败就只能靠 send() 里的剪贴板兜底了
-      }
-    }
     if (cfg.notify) {
       if (result.ok === true) {
         notify("已转给 VeloxGrab", filename || item.url);
       } else {
-        // 诊断串跟通知走：用户截一张通知就能定位断在哪一环
+        // 探桥时还活着、发送时才挂的窄竞态：send() 已把任务暂存，用户启动
+        // 桌面端后由弹窗按钮/心跳补交。诊断串跟通知走。
         notify(
-          "VeloxGrab 未响应，已交回浏览器下载",
-          `${result.diag}；可手动启动 VeloxGrab 后再试`
+          "VeloxGrab 未响应，任务已暂存",
+          `${result.diag}；点击扩展图标，用「启动 VeloxGrab 并补交任务」`
         );
       }
     }
@@ -320,6 +326,25 @@ chrome.downloads.onCreated.addListener(async (item) => {
     await setCanceling(item.id, false);
   }
 });
+
+/** 桥存活探测（供拦截路径预检；与 popup.bridgeAlive 同参数语义）。 */
+async function bridgeAlive() {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 1500);
+    const res = await fetch(`${BRIDGE}/ping`, {
+      method: "POST",
+      headers: await bridgeHeaders(),
+      body: "{}",
+      cache: "no-store",
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
 
 /** 从 DownloadItem 里挑一个像文件名的值。 */
 function pickFilename(item) {
@@ -399,13 +424,11 @@ async function bridgeHeaders() {
  *
  * 返回 `{ ok, diag }`：
  * - `ok: true`  桥确认送达，可以放心告诉用户「发出去了」；
- * - `ok: false` 没送达。拦截路径会把下载交回浏览器，右键/弹窗路径如实提示
- *   ——**绝不**开新标签页、不改当前页。
+ * - `ok: false` 没送达。调用方如实提示——**绝不**开新标签页、不改当前页。
  * - `diag` 失败链路的一行诊断（空格分隔 token，如
- *   `bridge:down poll:never-up needs-manual-launch`）：bridge = 首次直发
- *   结果，poll = 20 秒后台轮询结果。它同时进通知与弹窗错误面板——
- *   「点了没反应」这类故障必须能从面板读出断在哪一环，否则每轮排查都
- *   只能靠猜。
+ *   `bridge:down needs-manual-launch`）：bridge = 首次直发结果。它同时进
+ *   通知与弹窗错误面板——「点了没反应」这类故障必须能从面板读出断在哪一环，
+ *   否则每轮排查都只能靠猜。失败时任务已暂存，等「启动按钮/心跳」补交。
  *
  * 顺序很重要：**先桥后协议**。桥是同步返回成败的；协议只是兜底。
  */
@@ -466,20 +489,16 @@ async function send(target) {
   //    外部协议要求 transient user activation，offscreen 永远没有手势，
   //    「SW 自动拉起」在架构上不成立。
   //
-  //    所以这里的兜底是：20 秒后台轮询（覆盖「用户看到通知后顺手启动了
-  //    VeloxGrab」的情况——起来即自动补交，用户无感）；窗口内没起来，把
-  //    任务暂存进 storage.local 并如实上报 diag，弹窗给出「启动 VeloxGrab
-  //    并补交」按钮（点击有 user activation，协议放行）。暂存任务另由
-  //    5 分钟一次的 ping 闹钟兜底：之后任何时刻桥通了都自动补交。
-  const poll = await waitAndResend(target, 20_000);
-  if (poll.ok) {
-    await unstashIfSame(target.url); // 上一轮失败留下的同名暂存不能再补交一遍
-    return { ok: true, diag: "bridge:after-launch" };
-  }
+  //    所以这里的兜底是：任务暂存 + 尽快如实上报（diag 带
+  //    needs-manual-launch），弹窗给出「启动 VeloxGrab 并补交」按钮
+  //    （点击有 user activation，协议放行）。启动后 SW 的 90 秒密集补交
+  //    循环送达暂存任务；没点按钮的话，5 分钟一次的 ping 闹钟也会在桥通后
+  //    自动补交。不再做 20 秒盲等轮询——上一轮实测它只是把失败推迟 20 秒，
+  //    用户照样要手动启动，白等一截还错过立即反馈。
   await stashTask(target);
   return {
     ok: false,
-    diag: `bridge:down poll:${poll.detail} needs-manual-launch`,
+    diag: `bridge:down needs-manual-launch`,
   };
 }
 
@@ -504,16 +523,6 @@ async function stashTask(target) {
 async function unstashTask() {
   try {
     await chrome.storage.local.remove(PENDING_KEY);
-  } catch {
-    // 忽略
-  }
-}
-
-/** 成功送达时清理暂存——只清与当前任务同 URL 的，别把用户更早的另一条吞掉。 */
-async function unstashIfSame(url) {
-  try {
-    const { [PENDING_KEY]: pending } = await chrome.storage.local.get(PENDING_KEY);
-    if (pending && pending.url === url) await chrome.storage.local.remove(PENDING_KEY);
   } catch {
     // 忽略
   }
@@ -584,50 +593,6 @@ async function resendPendingLoop(timeoutMs) {
   } finally {
     resendPendingRunning = false;
   }
-}
-
-/**
- * 拉起桌面端后轮询桥，就绪即补交同一条任务。
- *
- * 轮询间隔 800ms（桥监听后的 /add 是毫秒级往返，不值得更密）；到上限仍
- * 不通才放弃。发送复用 /add 的 JSON 通道——与首次尝试完全同一参数，
- * 避免「重试的下载丢字段」这类分叉。
- *
- * 返回 `{ ok, detail }`；`detail` 供 diag 使用：`delivered` = 补交成功；
- * `up-http-<status>` = 轮询期间桥回过 HTTP（进程活着、端口在监听，没送达
- * 是应用侧拒绝而非拉起失败）；`never-up` = 整个窗口桥都没起来。
- */
-async function waitAndResend(target, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let sawStatus = 0;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 800));
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 1500);
-      const res = await fetch(`${BRIDGE}/add`, {
-        method: "POST",
-        headers: await bridgeHeaders(),
-        body: JSON.stringify({
-          url: target.url,
-          name: target.filename || "",
-          dir: target.dir || "",
-          threads: target.threads || 0,
-          referer: target.referer || "",
-        }),
-        signal: ctrl.signal,
-      });
-      clearTimeout(timer);
-      if (res.ok) {
-        const j = await res.json().catch(() => ({}));
-        if (j && j.ok) return { ok: true, detail: "delivered" };
-      }
-      sawStatus = sawStatus || res.status;
-    } catch {
-      // 还没起：继续等
-    }
-  }
-  return { ok: false, detail: sawStatus ? `up-http-${sawStatus}` : "never-up" };
 }
 
 function guessName(url) {
