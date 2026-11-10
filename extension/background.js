@@ -519,15 +519,22 @@ async function launchDesktopViaOffscreen() {
   launchingOffscreen = true;
   try {
     if (!chrome.offscreen) return false; // Chrome < 109：没有该 API
-    const has = await chrome.offscreen.hasDocument?.();
-    if (!has) {
-      await chrome.offscreen.createDocument({
-        url: "offscreen-launch.html",
-        reasons: ["WORKERS"],
-        justification: "Navigate to veloxgrab://launch to start the desktop app",
-      });
+    // **总是**先关再建：offscreen 文档只在创建时执行一次脚本。残留的旧文档
+    // （上一轮导航失败后 closeDocument 没跑到、或浏览器重启后恢复）不会再
+    // 执行脚本——如果这里走 has=true 分支直接复用，拉起从此永远失败且无
+    // 任何报错（正是实测过的形态）。创建同 reason 的文档在旧实例未关时会
+    // 报错，所以必须显式先关。
+    try {
+      await chrome.offscreen.closeDocument();
+    } catch {
+      // 没有文档在开：正常
     }
-    // offscreen-launch.html 自身导航即触发协议；给它 3 秒完成，然后关掉。
+    await chrome.offscreen.createDocument({
+      url: "offscreen-launch.html",
+      reasons: ["WORKERS"],
+      justification: "Navigate to veloxgrab://launch to start the desktop app",
+    });
+    // offscreen-launch.js 自身导航即触发协议；给它 3 秒完成，然后关掉。
     await new Promise((r) => setTimeout(r, 3000));
     try {
       await chrome.offscreen.closeDocument();
