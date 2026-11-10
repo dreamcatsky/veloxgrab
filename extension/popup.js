@@ -371,12 +371,9 @@ async function send(url) {
       msg("已发送给 VeloxGrab");
       setTimeout(() => window.close(), 700);
     } else {
-      // 桌面端没在运行：让后台用 offscreen 文档拉起它（协议导航），
-      // 提示用户稍后重试——桌面端起来需要几秒，立刻重发大概率还是失败。
-      try {
-        await chrome.runtime.sendMessage({ type: "veloxgrab-launch" });
-      } catch {}
-      msg("VeloxGrab 未运行，已尝试启动它——几秒后重试", true);
+      // 桌面端没在运行：后台已做「拉起 + 最多 20 秒轮询补交」；到这里还没
+      // 成功说明协议分发没生效（便携版/策略拦截），只能请用户手动启动。
+      msg("VeloxGrab 未能启动，请手动打开它后重试", true);
     }
   } catch (e) {
     msg("发送失败：" + String(e), true);

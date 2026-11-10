@@ -282,9 +282,10 @@ chrome.downloads.onCreated.addListener(async (item) => {
     });
 
     if (ok === false) {
-      // VeloxGrab 没接住：浏览器那条已经被取消并抹掉了，这里不还回去的话
-      // 用户点一次下载会「什么都没发生」。重新交给浏览器下载。
-      // 扩展发起的下载带 byExtensionId，上面的监听器会跳过它，不会成环。
+      // VeloxGrab 彻底没接住（桌面端缺席且拉起失败/超时）：浏览器那条已经
+      // 被取消并抹掉了，不还回去的话用户点一次下载会「什么都没发生」。
+      // 重新交给浏览器下载。扩展发起的下载带 byExtensionId，上面的监听器
+      // 会跳过它，不会成环。
       const opts = { url: item.url, conflictAction: "uniquify" };
       if (filename) opts.filename = filename;
       try {
@@ -298,8 +299,8 @@ chrome.downloads.onCreated.addListener(async (item) => {
         notify("已转给 VeloxGrab", filename || item.url);
       } else {
         notify(
-          "VeloxGrab 未运行，已尝试启动它",
-          "已交回浏览器下载；启动 VeloxGrab 后再下一次即可由它接管"
+          "VeloxGrab 未响应，已交回浏览器下载",
+          "拉起或连接失败；可手动启动 VeloxGrab 后再试"
         );
       }
     }
@@ -442,11 +443,62 @@ async function send(target) {
   //    offscreen document 是一个**真实的扩展页面**（有 DOM），location.href
   //    导航到自定义协议触发的是 Windows 协议分发，与用户手点链接同一条
   //    通路——被拦的只是 tabs.update/create 这类「导航标签页」的写法。
-  //    拉起后桌面端的 single_instance 把已有实例带到前台；冷启动则由
-  //    setup 里的 cold_link 通路处理。任务本身不随 launch 重发：桌面端
-  //    起来后用户重试一次即可（避免「拉起 + 下载」的时序竞态——桌面端
-  //    可能还没监听桥）。
-  await launchDesktopViaOffscreen();
+  //
+  //    拉起之后**轮询桥就绪并自动补交任务**：桌面端冷启动 1~3 秒就能监听
+  //    桥（bridge::spawn 在 setup 里最早一批），20 秒上限已远超慢机器。
+  //    任务送达后桌面端照常走「另存为/静默入队」，用户点一次下载就完事，
+  //    不需要再手动重试。超时才把下载交回浏览器（旧兜底）。
+  const started = await launchDesktopViaOffscreen();
+  if (started) {
+    const delivered = await waitAndResend(target, 20_000);
+    if (delivered) return true;
+  }
+  return false;
+}
+
+/**
+ * 拉起桌面端后轮询桥，就绪即补交同一条任务。
+ *
+ * 轮询间隔 800ms（桥监听后的 /add 是毫秒级往返，不值得更密）；到上限仍
+ * 不通才放弃。发送复用 /add 的 JSON 通道——与首次尝试完全同一参数，
+ * 避免「重试的下载丢字段」这类分叉。
+ */
+async function waitAndResend(target, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let relaunched = false;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 800));
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 1500);
+      const res = await fetch(`${BRIDGE}/add`, {
+        method: "POST",
+        headers: await bridgeHeaders(),
+        body: JSON.stringify({
+          url: target.url,
+          name: target.filename || "",
+          dir: target.dir || "",
+          threads: target.threads || 0,
+          referer: target.referer || "",
+        }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (res.ok) {
+        const j = await res.json().catch(() => ({}));
+        if (j && j.ok) return true;
+      }
+    } catch {
+      // 还没起：继续等
+    }
+    // 8 秒仍未通：协议激活可能被系统吞了（注册表缺失/浏览器策略），
+    // 再发一次 launch 提高成功率；桌面端已在启动中时这次是无害的空操作
+    //（single_instance 只会把窗口带到前台）。
+    if (!relaunched && Date.now() > deadline - timeoutMs / 2) {
+      relaunched = true;
+      await launchDesktopViaOffscreen();
+    }
+  }
   return false;
 }
 
@@ -457,13 +509,16 @@ async function send(target) {
  * 的 reason 一般要求页面自证用途。这里用 `WORKERS`（官方对「无 UI 的后台
  * 页面」的宽松分类）+ 一次性导航。Chrome 限制同 reason 只能一个实例，
  * 所以发完导航就关掉，下次需要再建。
+ *
+ * 返回 true = 协议导航已触发（或文档早已存在且可能是上一轮触发的）；
+ * false = offscreen 不可用（Chrome < 109 / 权限问题），调用方应走旧兜底。
  */
 let launchingOffscreen = false;
 async function launchDesktopViaOffscreen() {
-  if (launchingOffscreen) return; // 并发的失败 send 只拉一次
+  if (launchingOffscreen) return true; // 并发去重：上一轮正在拉，等它即可
   launchingOffscreen = true;
   try {
-    if (!chrome.offscreen) return; // Chrome < 109：没有该 API，静默跳过
+    if (!chrome.offscreen) return false; // Chrome < 109：没有该 API
     const has = await chrome.offscreen.hasDocument?.();
     if (!has) {
       await chrome.offscreen.createDocument({
@@ -479,8 +534,10 @@ async function launchDesktopViaOffscreen() {
     } catch {
       // 已经关了/从未建成：不影响任何主流程
     }
+    return true;
   } catch {
     // offscreen 不可用（旧浏览器/权限问题）：退回「只提示用户」的旧行为
+    return false;
   } finally {
     launchingOffscreen = false;
   }
@@ -570,10 +627,11 @@ async function handleMenuClick(info, tab) {
     return;
   }
   if (ok === true) {
-    // 桥已确认，不用打扰用户
+    // 桥已确认（含拉起后自动补交成功），不用打扰用户
   } else {
-    // send() 失败时已顺带用 offscreen 拉起桌面端；这里告知结果
-    notify("VeloxGrab 未运行，已尝试启动它", "稍后重试一次即可把链接交给它");
+    // send() 已试过 offscreen 拉起 + 20 秒轮询仍未通：协议分发多半没生效
+    //（便携版没注册协议 / 浏览器策略拦截），只能请用户手动启动
+    notify("VeloxGrab 未能启动", "请手动启动 VeloxGrab 后重试");
   }
 }
 
