@@ -371,12 +371,13 @@ async function send(url) {
       msg("已发送给 VeloxGrab");
       setTimeout(() => window.close(), 700);
     } else {
-      // 桌面端没在运行：后台已做「拉起 + 最多 20 秒轮询补交」；到这里还没
-      // 成功说明链路断在某环。res.diag 是后台的诊断串（bridge:… launch:…
-      // poll:…），原样亮出来——下一步动作（重装/刷新扩展、检查协议注册、
-      // 手动启动）取决于断在哪一环，让面板先给出证据。
+      // 桌面端没在运行且 20 秒轮询窗口内没起来。拉起必须由**用户手势下的
+      // 导航**触发（实验：Edge 157 对扩展页面的外部协议启动要求 transient
+      // user activation；offscreen / 程序化导航一律静默失败），所以给出
+      // 一个真实按钮，点击后 popup 自己导航到协议 URL。
       const diag = (res && res.diag) || "no-diag";
-      msg(`未能送达 [${diag}]。请手动启动 VeloxGrab 后重试；若反复出现，请把这段诊断发给开发者。`, true);
+      msg(`未能送达 [${diag}]，VeloxGrab 没在运行`, true);
+      showLaunchButton();
     }
   } catch (e) {
     msg("发送失败：" + String(e), true);
@@ -389,6 +390,45 @@ $("send").onclick = () => send();
 $("url").addEventListener("keydown", (e) => {
   if (e.key === "Enter") send();
 });
+
+// ---------- 「启动 VeloxGrab 并补交」按钮 ----------
+//
+// 点击（user activation）→ popup 导航到 veloxgrab://launch → 系统协议分发
+// 拉起桌面端。popup 页面随之被替换/关闭，补交由后台 SW 的轮询兜底：
+// send() 留下的暂存任务由 checkPendingTask（SW 醒来/5 分钟闹钟）自动补交。
+// 这里再挂一个更密的轮询做即时反馈：桥通了两秒内把按钮区换成成功提示。
+function showLaunchButton() {
+  const host = $("msg");
+  const btn = document.createElement("button");
+  btn.id = "launchBtn";
+  btn.textContent = "启动 VeloxGrab 并补交任务";
+  btn.style.marginTop = "6px";
+  btn.onclick = () => {
+    btn.disabled = true;
+    btn.textContent = "正在启动…";
+    msg("");
+    // 先让后台 SW 起密集补交循环（本页马上会被协议导航顶掉，等不了）
+    try {
+      chrome.runtime.sendMessage({ type: "veloxgrab-resend-pending" }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch {
+      // 消息失败不影响导航本身
+    }
+    // 同步导航：user activation 只在点击事件的处理栈里有效
+    location.href = "veloxgrab://launch";
+  };
+  host.after(btn);
+}
+// popup 被协议导航顶替后可能回不到这里；桥一旦起来，后台的暂存补交会接手。
+setInterval(async () => {
+  if (!$("launchBtn")) return;
+  if (await bridgeAlive()) {
+    const btn = $("launchBtn");
+    btn.textContent = "已连接 VeloxGrab ✓";
+    setTimeout(() => window.close(), 900);
+  }
+}, 1000);
 
 init();
 

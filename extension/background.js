@@ -16,6 +16,12 @@
 // 于是「点了没反应」——这正是用户报的故障。协议本身是通的（注册表、单实例
 // 回调、冷启动 argv 都验过），断的是「扩展 → 协议」这一步。
 //
+// 进一步实测（Edge 157，CDP 三组对照）：不止 tabs API，扩展页面里**一切
+// 无用户手势的协议导航**（含 offscreen 文档）都被静默吞掉；只有带
+// transient user activation 的导航（真实点击）才触发外部协议启动。所以
+// 「SW/offscreen 自动拉起桌面端」在架构上不成立——本文件里没有也不该有
+// 自动拉起代码，拉起入口只有 popup 的「启动 VeloxGrab」按钮。
+//
 // 回环 HTTP 桥由 VeloxGrab 自己监听（`src-tauri/src/bridge.rs`），扩展
 // `fetch` 一下就行，不需要固定扩展 ID、不需要注册表、不需要额外二进制。
 
@@ -134,7 +140,10 @@ function ensureAlarm() {
 }
 
 chrome.alarms.onAlarm.addListener((a) => {
-  if (a.name === PING_ALARM) ping();
+  if (a.name === PING_ALARM) {
+    ping();
+    checkPendingTask();
+  }
 });
 
 // 每次 SW 醒来都向 VeloxGrab 报一次「我在」。
@@ -171,6 +180,7 @@ async function ping() {
   }
 }
 ping();
+checkPendingTask();
 
 function setupMenus() {
   chrome.contextMenus.removeAll(() => {
@@ -392,10 +402,10 @@ async function bridgeHeaders() {
  * - `ok: false` 没送达。拦截路径会把下载交回浏览器，右键/弹窗路径如实提示
  *   ——**绝不**开新标签页、不改当前页。
  * - `diag` 失败链路的一行诊断（空格分隔 token，如
- *   `bridge:down launch:ok poll:never-up`）：bridge = 首次直发结果，
- *   launch = offscreen 拉起结果，poll = 拉起后轮询补交结果。它同时进通知
- *   与弹窗错误面板——「点了没反应」这类故障必须能从面板读出断在哪一环，
- *   否则每轮排查都只能靠猜。
+ *   `bridge:down poll:never-up needs-manual-launch`）：bridge = 首次直发
+ *   结果，poll = 20 秒后台轮询结果。它同时进通知与弹窗错误面板——
+ *   「点了没反应」这类故障必须能从面板读出断在哪一环，否则每轮排查都
+ *   只能靠猜。
  *
  * 顺序很重要：**先桥后协议**。桥是同步返回成败的；协议只是兜底。
  */
@@ -447,27 +457,133 @@ async function send(target) {
     // 桥不可用 → 走协议拉起
   }
 
-  // 2. 桥不通：VeloxGrab 没在运行。通过 offscreen 文档导航到
-  //    veloxgrab://launch，触发系统协议分发把桌面端拉起来。
+  // 2. 桥不通：VeloxGrab 没在运行。
   //
-  //    为什么这里能用协议（而文件头注释说 tabs 导航会被拦）：MV3 的
-  //    offscreen document 是一个**真实的扩展页面**（有 DOM），location.href
-  //    导航到自定义协议触发的是 Windows 协议分发，与用户手点链接同一条
-  //    通路——被拦的只是 tabs.update/create 这类「导航标签页」的写法。
+  //    **扩展无法自动拉起桌面端**。实测（Edge 157，2026-11-11，隔离实例 +
+  //    CDP 三组对照）：offscreen 文档导航 `veloxgrab://launch` 返回成功但
+  //    协议分发静默不发生；可见扩展页的程序化导航同样被吞；只有**用户手势
+  //    （真实点击）**触发的外部协议启动才放行——Chromium 对扩展页面发起的
+  //    外部协议要求 transient user activation，offscreen 永远没有手势，
+  //    「SW 自动拉起」在架构上不成立。
   //
-  //    拉起之后**轮询桥就绪并自动补交任务**：桌面端冷启动 1~3 秒就能监听
-  //    桥（bridge::spawn 在 setup 里最早一批），20 秒上限已远超慢机器。
-  //    任务送达后桌面端照常走「另存为/静默入队」，用户点一次下载就完事，
-  //    不需要再手动重试。超时才把下载交回浏览器（旧兜底）。
-  const launch = await launchDesktopViaOffscreen();
-  const poll = launch.ok
-    ? await waitAndResend(target, 20_000)
-    : { ok: false, detail: "launch-failed" };
-  if (poll.ok) return { ok: true, diag: "bridge:after-launch" };
+  //    所以这里的兜底是：20 秒后台轮询（覆盖「用户看到通知后顺手启动了
+  //    VeloxGrab」的情况——起来即自动补交，用户无感）；窗口内没起来，把
+  //    任务暂存进 storage.local 并如实上报 diag，弹窗给出「启动 VeloxGrab
+  //    并补交」按钮（点击有 user activation，协议放行）。暂存任务另由
+  //    5 分钟一次的 ping 闹钟兜底：之后任何时刻桥通了都自动补交。
+  const poll = await waitAndResend(target, 20_000);
+  if (poll.ok) {
+    await unstashIfSame(target.url); // 上一轮失败留下的同名暂存不能再补交一遍
+    return { ok: true, diag: "bridge:after-launch" };
+  }
+  await stashTask(target);
   return {
     ok: false,
-    diag: `bridge:down launch:${launch.ok ? "ok" : launch.detail} poll:${poll.detail}`,
+    diag: `bridge:down poll:${poll.detail} needs-manual-launch`,
   };
+}
+
+// ---------- 任务暂存（发送失败后留给「之后桥通了」的兜底） ----------
+//
+// 暂存只服务长尾场景：send() 的 20 秒轮询窗口内用户没启动桌面端、之后才
+// 启动（手动或点弹窗按钮）。storage.local 比 session 存活期长（浏览器重启
+// 后仍在）；目录/线程等参数随任务固化，可接受。消费方有两处：
+//  - popup 的「启动 VeloxGrab 并补交」按钮（立即补交）；
+//  - checkPendingTask()（ping 闹钟顺带检查，5 分钟粒度的兜底）。
+const PENDING_KEY = "pendingTask";
+const PENDING_MAX_AGE_MS = 24 * 3600 * 1000;
+
+async function stashTask(target) {
+  try {
+    await chrome.storage.local.set({ [PENDING_KEY]: { ...target, at: Date.now() } });
+  } catch {
+    // 暂存失败不影响主流程：用户手动重试即可
+  }
+}
+
+async function unstashTask() {
+  try {
+    await chrome.storage.local.remove(PENDING_KEY);
+  } catch {
+    // 忽略
+  }
+}
+
+/** 成功送达时清理暂存——只清与当前任务同 URL 的，别把用户更早的另一条吞掉。 */
+async function unstashIfSame(url) {
+  try {
+    const { [PENDING_KEY]: pending } = await chrome.storage.local.get(PENDING_KEY);
+    if (pending && pending.url === url) await chrome.storage.local.remove(PENDING_KEY);
+  } catch {
+    // 忽略
+  }
+}
+
+/**
+ * 桥恢复时补交暂存任务。消费方：
+ *  - popup 的「启动 VeloxGrab 并补交」按钮点击后（resendPendingLoop 密集轮询）；
+ *  - ping 闹钟（5 分钟粒度的长尾兜底）。
+ * 返回 true = 已送达并清暂存。任务超过 24 小时作废（URL 里的一次性签名
+ * 直链多半已过期，补交只会换来一个下载失败）。
+ */
+async function tryDeliverPending() {
+  try {
+    const { [PENDING_KEY]: pending } = await chrome.storage.local.get(PENDING_KEY);
+    if (!pending || !pending.url) return false;
+    if (Date.now() - (pending.at || 0) > PENDING_MAX_AGE_MS) {
+      await chrome.storage.local.remove(PENDING_KEY);
+      return false;
+    }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 1500);
+    const res = await fetch(`${BRIDGE}/add`, {
+      method: "POST",
+      headers: await bridgeHeaders(),
+      body: JSON.stringify({
+        url: pending.url,
+        name: pending.filename || "",
+        dir: pending.dir || "",
+        threads: pending.threads || 0,
+        referer: pending.referer || "",
+      }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (res.ok) {
+      const j = await res.json().catch(() => ({}));
+      if (j && j.ok) {
+        await chrome.storage.local.remove(PENDING_KEY);
+        notify("已补交上次未送出的任务", pending.filename || pending.url);
+        return true;
+      }
+    }
+  } catch {
+    // 桥不通：调用方按未送达处理
+  }
+  return false;
+}
+
+async function checkPendingTask() {
+  await tryDeliverPending();
+}
+
+/**
+ * 密集补交：popup 点了「启动」按钮后调。桌面端冷启动 1~3 秒监听桥，
+ * 1 秒间隔 + 90 秒上限足够慢机器；期间 SW 被这条消息唤醒，不会睡过去。
+ */
+let resendPendingRunning = false;
+async function resendPendingLoop(timeoutMs) {
+  if (resendPendingRunning) return;
+  resendPendingRunning = true;
+  try {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await tryDeliverPending()) return;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  } finally {
+    resendPendingRunning = false;
+  }
 }
 
 /**
@@ -483,7 +599,6 @@ async function send(target) {
  */
 async function waitAndResend(target, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  let relaunched = false;
   let sawStatus = 0;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 800));
@@ -511,67 +626,8 @@ async function waitAndResend(target, timeoutMs) {
     } catch {
       // 还没起：继续等
     }
-    // 8 秒仍未通：协议激活可能被系统吞了（注册表缺失/浏览器策略），
-    // 再发一次 launch 提高成功率；桌面端已在启动中时这次是无害的空操作
-    //（single_instance 只会把窗口带到前台）。
-    if (!relaunched && Date.now() > deadline - timeoutMs / 2) {
-      relaunched = true;
-      await launchDesktopViaOffscreen();
-    }
   }
   return { ok: false, detail: sawStatus ? `up-http-${sawStatus}` : "never-up" };
-}
-
-/**
- * 用 offscreen document 拉起桌面端。
- *
- * offscreen 文档的创建有原因（reason）与生命周期约束：AUDIO_PLAYBACK 之外
- * 的 reason 一般要求页面自证用途。这里用 `WORKERS`（官方对「无 UI 的后台
- * 页面」的宽松分类）+ 一次性导航。Chrome 限制同 reason 只能一个实例，
- * 所以发完导航就关掉，下次需要再建。
- *
- * 返回 `{ ok, detail }`：
- * - `ok: true`  = 协议导航已触发（先关再建保证每次都是全新文档，残留文档
- *   不会让脚本静默跳过）；
- * - `ok: false` = offscreen 不可用，`detail` 说明原因：`unsupported`
- *   （Chrome < 109 / 权限问题）或 `create-failed:…`（createDocument 报错原文）。
- */
-let launchingOffscreen = false;
-async function launchDesktopViaOffscreen() {
-  if (launchingOffscreen) return { ok: true, detail: "already-running" }; // 并发去重：上一轮正在拉，等它即可
-  launchingOffscreen = true;
-  try {
-    if (!chrome.offscreen) return { ok: false, detail: "unsupported" }; // Chrome < 109：没有该 API
-    // **总是**先关再建：offscreen 文档只在创建时执行一次脚本。残留的旧文档
-    // （上一轮导航失败后 closeDocument 没跑到、或浏览器重启后恢复）不会再
-    // 执行脚本——如果这里走 has=true 分支直接复用，拉起从此永远失败且无
-    // 任何报错（正是实测过的形态）。创建同 reason 的文档在旧实例未关时会
-    // 报错，所以必须显式先关。
-    try {
-      await chrome.offscreen.closeDocument();
-    } catch {
-      // 没有文档在开：正常
-    }
-    await chrome.offscreen.createDocument({
-      url: "offscreen-launch.html",
-      reasons: ["WORKERS"],
-      justification: "Navigate to veloxgrab://launch to start the desktop app",
-    });
-    // offscreen-launch.js 自身导航即触发协议；给它 3 秒完成，然后关掉。
-    await new Promise((r) => setTimeout(r, 3000));
-    try {
-      await chrome.offscreen.closeDocument();
-    } catch {
-      // 已经关了/从未建成：不影响任何主流程
-    }
-    return { ok: true, detail: "navigated" };
-  } catch (e) {
-    // offscreen 不可用（旧浏览器/权限问题）或 createDocument 报错：退回旧兜底，
-    // 错误原文进 detail（换行压成下划线，diag 的 token 以空格分隔）。
-    return { ok: false, detail: `create-failed:${String(e).slice(0, 60).replace(/\s+/g, "_")}` };
-  } finally {
-    launchingOffscreen = false;
-  }
 }
 
 function guessName(url) {
@@ -660,11 +716,12 @@ async function handleMenuClick(info, tab) {
   if (result.ok === true) {
     // 桥已确认（含拉起后自动补交成功），不用打扰用户
   } else {
-    // send() 已试过 offscreen 拉起 + 20 秒轮询仍未通：把诊断串交给用户，
-    // 「未能启动」的定性（协议分发没生效 / 便携版没注册协议）从 diag 读出。
+    // send() 的 20 秒轮询窗口内用户没启动桌面端：把诊断串交给用户。
+    // 弹窗会显示「启动 VeloxGrab」按钮（点击带 user activation，协议启动
+    // 放行——见 send() 里的实验记录）；右键菜单路径只能靠通知提示手动启动。
     notify(
       "VeloxGrab 未能启动",
-      `${result.diag}；请手动启动 VeloxGrab 后重试`
+      `${result.diag}；点击扩展图标，用弹窗里的「启动 VeloxGrab」按钮`
     );
   }
 }
@@ -679,9 +736,14 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg) return;
-  // popup 请求拉起桌面端（send 失败时触发；offscreen 文档导航协议）
-  if (msg.type === "veloxgrab-launch") {
-    launchDesktopViaOffscreen().then(() => sendResponse({ ok: true }));
+  // popup 的「启动 VeloxGrab」按钮：先唤醒 SW 起密集补交循环（按钮点击
+  // 的导航会顶掉 popup 页面，弹窗自己等不了），按钮再同步导航到协议 URL。
+  // 拉起必须由**带 user activation 的导航**触发（实验：Edge 157 对扩展页面
+  // 的外部协议启动要求用户手势；offscreen/程序化导航一律被静默吞掉），
+  // 所以导航只能发生在 popup 的点击事件栈里，SW 代劳不了。
+  if (msg.type === "veloxgrab-resend-pending") {
+    resendPendingLoop(90_000).catch(() => {});
+    sendResponse({ ok: true });
     return true;
   }
   // popup 查询当前页签嗅探到的流媒体候选
