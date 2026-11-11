@@ -27,6 +27,7 @@
 //! - GUI 已在跑 → single_instance 插件把 argv 转给首实例并拉窗口到前台，
 //!   新进程立刻退出（与用户点协议链接完全同一条通路）；
 //! - GUI 没在跑 → 新进程就是冷启动，天然消费 argv 里的链接。
+//!
 //! 两种情况用户都会看到 VeloxGrab 窗口/另存为弹出——「自动拉起」由此成立。
 //!
 //! ## 安全边界
@@ -65,8 +66,7 @@ pub fn is_nm_host(argv: &[String]) -> bool {
     }
     // 只认**第一个**参数：浏览器的形态是 `exe <origin> [--parent-window=…]`；
     // 而协议拉起是 `exe "veloxgrab://add?..."`，两者不会混淆。
-    argv.iter()
-        .nth(1)
+    argv.get(1)
         .map(|a| {
             let a = a.trim().trim_matches('"').to_ascii_lowercase();
             a.starts_with("chrome-extension://") || a.starts_with("moz-extension://")
