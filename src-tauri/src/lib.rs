@@ -102,6 +102,13 @@ pub(crate) fn dispatch_external_link(app: &tauri::AppHandle, link: String) {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
+        // set_focus 在本进程没有置前权时会被 Windows **静默**拒绝（冷启动
+        // 经 NM 宿主拉起时，宿主的 AllowSetForegroundWindow 移交见
+        // nm_host.rs；其它被拒绝的形态如多桌面/全屏应用也存在）。拒绝不报
+        // 错，用户那边就是「点了没反应」，所以无论焦点是否到手都再闪一次
+        // 任务栏：真到前台了闪烁几乎不可感知，没到手这就是唯一的可见线索。
+        // 与 notify.rs 完成提醒用的是同一机制（request_user_attention）。
+        let _ = win.request_user_attention(Some(tauri::UserAttentionType::Informational));
     }
 }
 
@@ -117,10 +124,13 @@ pub fn run() {
             if let Some(link) = deep_link_from_args(argv) {
                 dispatch_external_link(app, link);
             }
-            // 无论有没有链接，都把已有窗口拉到前台，给用户「点开了」的反馈
+            // 无论有没有链接，都把已有窗口拉到前台，给用户「点开了」的反馈。
+            // set_focus 可能被前台锁静默拒绝（本实例长期在后台，没有置前权），
+            // 理由与 dispatch_external_link 里相同：补一次任务栏闪烁兜底。
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.unminimize();
                 let _ = w.set_focus();
+                let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
             }
         }))
         .setup(|app| {

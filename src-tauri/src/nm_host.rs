@@ -143,7 +143,13 @@ pub fn run_nm_host() -> ! {
                     }
                 };
                 match spawned {
-                    Ok(_) => reply_ok(),
+                    Ok(child) => {
+                        // 冷启动场景 GUI 的 set_focus 会被前台锁拒绝（见
+                        // allow_set_foreground_to）：先把置前权移交过去。
+                        #[cfg(windows)]
+                        allow_set_foreground_to(child.id());
+                        reply_ok()
+                    }
                     Err(e) => reply_error(&format!("failed to start GUI: {e}")),
                 }
             }
@@ -155,6 +161,27 @@ pub fn run_nm_host() -> ! {
         }
     }
     std::process::exit(0);
+}
+
+/// 把本进程持有的「窗口置前权」移交给刚 spawn 的 GUI 子进程。
+///
+/// 为什么需要：Windows 的前台锁规定，只有**由前台进程直接启动**的进程
+/// 才能 SetForegroundWindow。NM 链路里浏览器（前台）拉起本宿主、宿主再
+/// 拉起 GUI——GUI 是**孙进程**，它启动时的 set_focus 会被系统静默拒绝：
+/// 窗口留在浏览器后面、只在任务栏闪一下，用户视角就是「点了下载什么
+/// 都没发生」（实测：隔离 Edge 157 + CDP 触发 NM，VeloxGrab 窗口被压在
+/// Edge 之后）。`AllowSetForegroundWindow` 是系统为此准备的正规移交通道：
+/// 本宿主由前台浏览器直接拉起、持有置前权，转授给 GUI 后其 set_focus
+/// 即可生效。协议直拉路径（veloxgrab:// 的 reg handler 直接起 GUI）不受
+/// 此限——那种 GUI 是前台进程的**直接**子进程，本来就有权。
+#[cfg(windows)]
+fn allow_set_foreground_to(pid: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+    // 失败只有「pid 已退出 / 本进程无置前权」两种形态：spawn 刚成功 pid
+    // 必然在，无权限时也无从恢复，返回值无从处理，忽略。
+    unsafe {
+        AllowSetForegroundWindow(pid);
+    }
 }
 
 /// 读一个 NM 帧。None = 流已干净结束。

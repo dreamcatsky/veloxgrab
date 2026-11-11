@@ -62,6 +62,8 @@ windows-sys = { version = "0.52", features = [
     "Win32_Storage_FileSystem",
     # PlaySoundW：下载完成音效（notify.rs，程序合成的 WAV 内存播放）。
     "Win32_Media_Audio",
+    # AllowSetForegroundWindow：NM 宿主把置前权授予冷启动的 GUI（nm_host.rs）。
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # 发布构建：LTO + 单 codegen unit 换更好的内联与更小的二进制。
