@@ -189,49 +189,103 @@ async function ping() {
     console.warn("[veloxgrab] ping failed:", String(e));
   }
 }
-ping();
-checkPendingTask();
+// 顶层立即调用**不能**放在这里：ping() 内部会 await bridgeHeaders()，
+// 而 bridgeToken 在文件后半段才用 let 声明——脚本求值到这一行时它还在
+// TDZ 里，抛出 "Cannot access 'bridgeToken' before initialization"，
+// 首轮心跳必然失败（5 分钟 alarm 会兜回来，所以症状隐蔽）。
+// 统一挪到文件末尾（所有声明之后），见那里的注释。
 
-function setupMenus() {
-  chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({
-      id: "veloxgrab-link",
-      title: "用 VeloxGrab 下载此链接",
-      contexts: ["link"],
-    });
-    chrome.contextMenus.create({
-      id: "veloxgrab-page",
-      title: "把当前页面链接发给 VeloxGrab",
-      contexts: ["page"],
-    });
-    // 媒体右键发给**页面地址**而不是 srcUrl。
-    //
-    // 原因（实测）：视频站的 <video> 元素 src 多是 `blob:`（B 站、抖音、
-    // YouTube 的 MSE 播放都是），VeloxGrab 只接 http/https，发过去必然被拒；
-    // 即便 srcUrl 是真 https（个别站点的直链），它也只是**一段没有音轨的
-    // 视频流**，下下来是个哑片。
-    // 发页面地址则走 yt-dlp 解析，能拿到完整清晰度列表和音轨——这才是
-    // 用户右键「下载这个视频」真正想要的东西。
-    chrome.contextMenus.create({
-      id: "veloxgrab-media",
-      title: "用 VeloxGrab 解析并下载此视频",
-      contexts: ["image", "video", "audio"],
-    });
-    // 图片/音频的 src 常常就是可直接下载的原文件（没有 blob 化），
-    // 给它留一条「按媒体地址直下」的路，否则下图片会变成去解析图片页。
-    chrome.contextMenus.create({
-      id: "veloxgrab-media-direct",
-      title: "直接下载此媒体文件",
-      contexts: ["image", "audio"],
-    });
-    // 深度嗅探：页面用 MSE 播放时 <video src> 是 blob:，只能从网络请求
-    // 里拿到真正的流媒体清单（.m3u8 / .mpd）。嗅探开启时给一条显式入口。
-    chrome.contextMenus.create({
-      id: "veloxgrab-sniff-open",
-      title: "下载嗅探到的流媒体（HLS/DASH）",
-      contexts: ["page", "video"],
+// 右键菜单的定义表。抽成常量是为了让「重建」变成一次可重放的声明式操作：
+// 菜单项与创建代码不再混在一个 removeAll 回调里，排队的重建才有意义。
+const MENU_ITEMS = [
+  {
+    id: "veloxgrab-link",
+    title: "用 VeloxGrab 下载此链接",
+    contexts: ["link"],
+  },
+  {
+    id: "veloxgrab-page",
+    title: "把当前页面链接发给 VeloxGrab",
+    contexts: ["page"],
+  },
+  // 媒体右键发给**页面地址**而不是 srcUrl。
+  //
+  // 原因（实测）：视频站的 <video> 元素 src 多是 `blob:`（B 站、抖音、
+  // YouTube 的 MSE 播放都是），VeloxGrab 只接 http/https，发过去必然被拒；
+  // 即便 srcUrl 是真 https（个别站点的直链），它也只是**一段没有音轨的
+  // 视频流**，下下来是个哑片。
+  // 发页面地址则走 yt-dlp 解析，能拿到完整清晰度列表和音轨——这才是
+  // 用户右键「下载这个视频」真正想要的东西。
+  {
+    id: "veloxgrab-media",
+    title: "用 VeloxGrab 解析并下载此视频",
+    contexts: ["image", "video", "audio"],
+  },
+  // 图片/音频的 src 常常就是可直接下载的原文件（没有 blob 化），
+  // 给它留一条「按媒体地址直下」的路，否则下图片会变成去解析图片页。
+  {
+    id: "veloxgrab-media-direct",
+    title: "直接下载此媒体文件",
+    contexts: ["image", "audio"],
+  },
+  // 深度嗅探：页面用 MSE 播放时 <video src> 是 blob:，只能从网络请求
+  // 里拿到真正的流媒体清单（.m3u8 / .mpd）。嗅探开启时给一条显式入口。
+  {
+    id: "veloxgrab-sniff-open",
+    title: "下载嗅探到的流媒体（HLS/DASH）",
+    contexts: ["page", "video"],
+  },
+];
+
+/**
+ * 菜单重建的串行链。
+ *
+ * `onInstalled`（安装/更新）与 `onStartup`（浏览器启动）经常**几乎同时**
+ * 触发：扩展刚更新完就重启浏览器、或在 edge://extensions 里点刷新。
+ * 原实现把 `removeAll(cb)` + 五个 `create` 都塞在回调里，两个 setupMenus
+ * 交错执行时，两次 removeAll 先各自完成、再各自 create——第二组必然撞
+ * 已有 id，控制台刷出五条
+ * `Unchecked runtime.lastError: Cannot create item with duplicate id ...`。
+ *
+ * 用一条 promise 链把重建排队：同一时刻只有一次「清空 + 重建」在跑，
+ * 后到的调用等前一次彻底结束后再开始。
+ */
+let menuChain = Promise.resolve();
+
+/** `removeAll` 的回调式包装：老版本浏览器不支持 promise 形态。 */
+function removeAllMenus() {
+  return new Promise((resolve) => {
+    chrome.contextMenus.removeAll(() => {
+      // 必须读一次：不读的话即使失败也会留下 Unchecked runtime.lastError
+      void chrome.runtime.lastError;
+      resolve();
     });
   });
+}
+
+/** 建一条菜单，并把 `lastError` 收进自己的 Promise。 */
+function createMenu(item) {
+  return new Promise((resolve) => {
+    chrome.contextMenus.create(item, () => {
+      const err = chrome.runtime.lastError;
+      if (err) console.warn(`[veloxgrab] 创建右键菜单 ${item.id} 失败: ${err.message}`);
+      resolve();
+    });
+  });
+}
+
+async function rebuildMenus() {
+  await removeAllMenus();
+  for (const item of MENU_ITEMS) {
+    await createMenu(item);
+  }
+}
+
+function setupMenus() {
+  menuChain = menuChain.then(rebuildMenus).catch((e) => {
+    console.warn("[veloxgrab] 重建右键菜单失败:", String(e));
+  });
+  return menuChain;
 }
 
 // ---------- 下载拦截 ----------
@@ -855,3 +909,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 异步响应必须返回 true，否则通道会被立刻关掉
   return true;
 });
+
+// ---------- 顶层启动动作（必须放在文件末尾） ----------
+//
+// ping() 与 checkPendingTask() 第一次醒来就要打桥，而它们依赖的
+// bridgeToken / getConfig 等都在本文件后半段用 let/const 声明。放在声明
+// 之前调用会撞 TDZ：`Cannot access 'bridgeToken' before initialization`，
+// 表现为「SW 每次冷启动的首轮心跳都失败」——5 分钟 alarm 会兜回来，所以
+// 只在扩展错误页和控制台里留一行警告，很难与真实故障区分。
+// 放在所有声明之后，求值顺序就有保证。
+ping();
+checkPendingTask();
