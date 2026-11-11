@@ -3,7 +3,7 @@
   "name": "VeloxGrab Downloader",
   "version": "1.5.2",
   "description": "把网页里的下载链接、图片、视频直接发给 VeloxGrab 桌面程序下载。",
-  "permissions": ["activeTab", "contextMenus", "scripting", "storage", "downloads", "notifications", "alarms", "webRequest", "tabs"],
+  "permissions": ["activeTab", "contextMenus", "scripting", "storage", "downloads", "notifications", "alarms", "webRequest", "tabs", "nativeMessaging"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": {
     "service_worker": "background.js"

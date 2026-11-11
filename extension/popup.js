@@ -371,10 +371,10 @@ async function send(url) {
       msg("已发送给 VeloxGrab");
       setTimeout(() => window.close(), 700);
     } else {
-      // 桌面端没在运行且 20 秒轮询窗口内没起来。拉起必须由**用户手势下的
-      // 导航**触发（实验：Edge 157 对扩展页面的外部协议启动要求 transient
-      // user activation；offscreen / 程序化导航一律静默失败），所以给出
-      // 一个真实按钮，点击后 popup 自己导航到协议 URL。
+      // 桥不通且 NM 宿主也没送出去（便携版 / 桌面端版本太旧没注册 NM /
+      // 注册表漂移）。拉起必须由用户手势下的导航触发（协议导航要求
+      // transient user activation），所以给出真实按钮，点击后 popup 自己
+      // 导航到协议 URL 拉起桌面端，SW 密集补交循环送达暂存任务。
       const diag = (res && res.diag) || "no-diag";
       msg(`未能送达 [${diag}]，VeloxGrab 没在运行`, true);
       showLaunchButton();

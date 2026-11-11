@@ -47,35 +47,39 @@ VeloxGrab 启动时在 `127.0.0.1:58943` 起一个极小的 HTTP 服务
 只接管 `http/https`：`blob:` / `data:` 交给浏览器，VeloxGrab 拿不到内容。
 弹窗里的「接管浏览器下载」开关可以整体关掉（存在 `chrome.storage.sync`）。
 
-### 桌面端没在运行：不抢下载 + 暂存补交 + 用户手势拉起
+### 桌面端没在运行：Native Messaging 自动拉起（主兜底）+ 不丢下载
 
-拦截/发送时如果本地桥连不通（VeloxGrab 没在跑），扩展**不会也无法**自动
-拉起桌面端，而且**不会取消浏览器下载**。两轮实测结论（Edge 157，隔离实例
-+ CDP 对照 + 用户真实环境取证，2026-11-11）：
+拦截/发送时如果本地桥连不通（VeloxGrab 没在跑），扩展走两条实测验证过的路：
 
-**结论一：扩展页面发起的外部协议启动需要用户手势。**
+**主兜底：Native Messaging（免手势，IDM/FDM 同款机制）。**
+浏览器按注册表里的 manifest（`HKCU\Software\{Chrome,Microsoft
+Edge}\NativeMessagingHosts\com.veloxgrab.host`）直接拉起
+`veloxgrab.exe --nm-host`——不需要任何用户点击/手势。宿主把任务转成
+`veloxgrab://add?...` 链接交给 GUI：已运行走 single_instance 到前台，
+未运行冷启动消费链接。**用户点下载 → VeloxGrab 窗口弹出**，全自动。
 
-| 触发方式 | 结果 |
+- 宿主注册由桌面端每次启动自查（`nm_host.rs`），manifest 的 path 随
+  安装目录漂移自动重写；`allowed_origins` 按当前安装路径的确定性扩展 ID
+  （SHA-256/UTF-16LE → a-p 映射，与 Chromium 算法逐位一致，测试锁定）生成。
+- 字段校验与 HTTP 桥共用 `build_link_from_json`：http/https 限定、referer
+  协议白名单、长度上限，NM 不是绕过门禁的暗道。
+
+**两轮实测钉死不可行的路**（Edge 157，隔离实例 + CDP 对照 + 用户真实环境）：
+
+| 兜底 | 实测结果 |
 | --- | --- |
-| offscreen 文档 `location.href/replace` 导航协议 | 返回成功，**协议分发静默不发生** |
-| 可见扩展页程序化导航（`location.assign`，无手势） | 同样被静默吞掉 |
-| 扩展页面上**真实点击**协议链接（有 user activation） | 立即生效，桌面端拉起 |
+| offscreen 文档导航协议 | 返回成功，协议分发静默不发生（要求 transient user activation） |
+| 可见扩展页程序化导航 | 同样被吞 |
+| 扩展页真实点击协议链接 | 生效（所以弹窗「启动」按钮保留为 NM 不可用时的兜底） |
+| `chrome.downloads.download()` 兜底重发 | **立即 USER_CANCELED、0 字节、无记录**——绝不可用于还下载 |
 
-**结论二：`chrome.downloads.download()` 兜底重发不可用。** 旧实现
-「cancel 原下载 → 桥不通 → `downloads.download()` 还回去」实测这条重发
-**立即 USER_CANCELED（interrupt_reason 40）、0 字节、不留记录**——SW 发起
-与扩展页面发起、有无手势、exe 与纯文本、用户真实环境与隔离实例，全部复现。
-用户视角就是「点了下载，什么都没发生」。
+因此当前拦截路径：探桥 → 不通走 NM → NM 也送不出去（便携版/未注册）→
+**不碰下载**，通知后让浏览器带着自己的手势/Cookie/Referer 下完；只有确认
+任务已被接住（桥活着，或 NM 已送达）才 cancel + 转发。
 
-因此当前行为是：
-
-1. **拦截路径先探桥**：桥不通 → 不碰下载，通知「VeloxGrab 未运行，本次由
-   浏览器下载」——浏览器带着自己的手势/Cookie/Referer 把文件下完，绝不丢下载；
-2. **右键/弹窗路径**：任务暂存 `storage.local`，弹窗显示「启动 VeloxGrab
-   并补交任务」按钮——点击（user activation）由 popup 导航
-   `veloxgrab://launch` 拉起桌面端，SW 起 90 秒密集补交循环送达暂存任务；
-3. **长尾兜底**：5 分钟 ping 闹钟顺带补交暂存任务（24 小时过期——一次性
-   签名直链已过期，补交只会换来失败）。
+**长尾兜底**：右键/弹窗路径失败时任务暂存 `storage.local`；弹窗「启动
+VeloxGrab 并补交任务」按钮（user activation 导航协议）+ 90 秒密集补交 +
+5 分钟 ping 闹钟自动补交（24 小时过期）。
 
 前提是协议注册存在——桌面端安装后首次启动会写 `HKCU\...\veloxgrab`。
 便携版没注册协议时，点击按钮导航静默无效，只能手动启动 exe。

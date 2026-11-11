@@ -12,6 +12,7 @@ pub mod ftp;
 pub mod github;
 pub mod hash;
 pub mod history;
+pub mod nm_host;
 pub mod notify;
 pub mod plan;
 pub mod save_dir;
@@ -229,6 +230,24 @@ pub fn run() {
             // 扩展拉不起 veloxgrab://（Chrome 静默拦截自定义协议导航），
             // 这条回环 HTTP 是真正能用的那条路。失败不阻断启动。
             bridge::spawn(app.handle().clone());
+
+            // Native Messaging 宿主注册：让浏览器能以 --nm-host 拉起本 exe
+            // （扩展在 VeloxGrab 未运行时送任务的唯一免手势通道）。与协议
+            // 注册同节奏：安装版每次启动自查，manifest 的 path 漂移（用户
+            // 移动安装目录/升级换路径）就重写。dev 构建跳过——同协议注册
+            // 的理由，别把 HKCU 指到 target\debug。
+            if let Some(exe) = deeplink::installed_exe() {
+                let exe_lower = exe.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+                if exe_lower.contains(r"\target\debug\") {
+                    eprintln!("[nm] dev 构建，跳过 NM 宿主注册");
+                } else {
+                    std::thread::spawn(move || {
+                        if let Err(e) = nm_host::ensure_nm_registered() {
+                            eprintln!("[nm] 注册 NM 宿主失败: {e}");
+                        }
+                    });
+                }
+            }
 
             // aria2 JSON-RPC 兼容层（127.0.0.1:6800）：默认关闭，设置里开启。
             // 开启状态在设置保存时也会同步（见 settings::apply_aria2_toggle）。

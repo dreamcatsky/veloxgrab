@@ -28,6 +28,16 @@
 /** VeloxGrab 的本地桥端口，与 `src-tauri/src/bridge.rs` 的 `PORT` 必须一致。 */
 const BRIDGE = "http://127.0.0.1:58943";
 
+/**
+ * Native Messaging 宿主名，与 `src-tauri/src/nm_host.rs` 的 NM_HOST_NAME 一致。
+ *
+ * 这是「VeloxGrab 没在跑时把任务送出去」的唯一通道：浏览器按注册表 manifest
+ * 自己拉起 `veloxgrab.exe --nm-host`（NM 宿主再以 veloxgrab:// 参数调起 GUI
+ * ——GUI 已跑走 single_instance 转发，没跑则冷启动消费），全程**不需要用户
+ * 手势**。IDM/FDM 的「点下载自动弹软件」就是这条官方机制。
+ */
+const NM_HOST = "com.veloxgrab.host";
+
 /** 默认配置。`intercept` 是「接管浏览器下载」总开关。 */
 const DEFAULTS = { threads: 4, dir: "", intercept: true, notify: true, sniff: true };
 
@@ -267,17 +277,29 @@ chrome.downloads.onCreated.addListener(async (item) => {
   // 旧实现是先 cancel 再 send，send 失败后用 chrome.downloads.download()
   // 兜底还回去——实测（Edge 157，隔离实例 + 用户真实环境一致）这条兜底
   // 会立即 USER_CANCELED、0 字节、不产生任何可见记录：用户视角就是
-  // 「点了下载，什么都没发生」。 VeloxGrab 没在跑时唯一不丢下载的兜底
-  // 是**根本不取消**：让浏览器带着自己的手势、Cookie、Referer 把文件下完。
+  // 「点了下载，什么都没发生」。所以取消不可逆——只有确认「任务已经
+  // 被谁接住」（桥直接活着，或 NM 宿主能拉起桌面端）才允许 cancel。
   const alive = await bridgeAlive();
   if (!alive) {
-    if (cfg.notify) {
-      notify(
-        "VeloxGrab 未运行，本次由浏览器下载",
-        "启动 VeloxGrab 后，网页下载会自动转给它（可在弹窗确认）"
-      );
+    // 桥不通：NM 宿主是最后的机会（浏览器自己拉起 veloxgrab.exe --nm-host，
+    // 免手势）。NM 送出成功 → 取消浏览器下载（任务已被桌面端接住）；
+    // NM 也不可用（便携版/未注册）→ 不碰下载，浏览器正常下完，绝不丢下载。
+    const nm = await sendViaNativeMessaging({
+      url: item.url,
+      filename: pickFilename(item),
+      dir: cfg.dir,
+      threads: cfg.threads,
+      referer: referrerFor(item, ""),
+    });
+    if (!nm.ok) {
+      if (cfg.notify) {
+        notify(
+          "VeloxGrab 未运行，本次由浏览器下载",
+          "安装/启动 VeloxGrab 后，网页下载会自动转给它"
+        );
+      }
+      return;
     }
-    return;
   }
 
   await setCanceling(item.id, true);
@@ -426,9 +448,9 @@ async function bridgeHeaders() {
  * - `ok: true`  桥确认送达，可以放心告诉用户「发出去了」；
  * - `ok: false` 没送达。调用方如实提示——**绝不**开新标签页、不改当前页。
  * - `diag` 失败链路的一行诊断（空格分隔 token，如
- *   `bridge:down needs-manual-launch`）：bridge = 首次直发结果。它同时进
- *   通知与弹窗错误面板——「点了没反应」这类故障必须能从面板读出断在哪一环，
- *   否则每轮排查都只能靠猜。失败时任务已暂存，等「启动按钮/心跳」补交。
+ *   `bridge:down nm:unavailable needs-launch`）：bridge = 首次直发结果，
+ *   nm = NM 宿主结果。它同时进通知与弹窗错误面板——「点了没反应」这类
+ *   故障必须能从面板读出断在哪一环，否则每轮排查都只能靠猜。失败时任务已暂存，等「启动按钮/心跳」补交。
  *
  * 顺序很重要：**先桥后协议**。桥是同步返回成败的；协议只是兜底。
  */
@@ -482,24 +504,74 @@ async function send(target) {
 
   // 2. 桥不通：VeloxGrab 没在运行。
   //
-  //    **扩展无法自动拉起桌面端**。实测（Edge 157，2026-11-11，隔离实例 +
-  //    CDP 三组对照）：offscreen 文档导航 `veloxgrab://launch` 返回成功但
-  //    协议分发静默不发生；可见扩展页的程序化导航同样被吞；只有**用户手势
-  //    （真实点击）**触发的外部协议启动才放行——Chromium 对扩展页面发起的
-  //    外部协议要求 transient user activation，offscreen 永远没有手势，
-  //    「SW 自动拉起」在架构上不成立。
+  //    **Native Messaging 是唯一免手势的拉起通道**。实测（Edge 157，
+  //    2026-11-11，隔离实例 + CDP 对照）：协议导航要求 transient user
+  //    activation（offscreen/程序化导航静默失败），`downloads.download()`
+  //    兜底重发立即 USER_CANCELED——都不可用。NM 则由浏览器按注册表
+  //    manifest 直接拉起 `veloxgrab.exe --nm-host`：宿主进程把任务转成
+  //    veloxgrab:// 链接交给 GUI（已跑 = single_instance 前台；没跑 =
+  //    冷启动），用户立即看到窗口。IDM/FDM 同款机制。
   //
-  //    所以这里的兜底是：任务暂存 + 尽快如实上报（diag 带
-  //    needs-manual-launch），弹窗给出「启动 VeloxGrab 并补交」按钮
-  //    （点击有 user activation，协议放行）。启动后 SW 的 90 秒密集补交
-  //    循环送达暂存任务；没点按钮的话，5 分钟一次的 ping 闹钟也会在桥通后
-  //    自动补交。不再做 20 秒盲等轮询——上一轮实测它只是把失败推迟 20 秒，
-  //    用户照样要手动启动，白等一截还错过立即反馈。
+  //    NM 没注册（便携版/manifest 漂移）时 sendNativeMessage 报错，落回
+  //    「暂存 + 弹窗启动按钮」的兜底——按钮点击有 user activation，协议
+  //    导航放行；90 秒密集补交 + 5 分钟心跳继续覆盖长尾。
+  const nm = await sendViaNativeMessaging(target);
+  if (nm.ok) return { ok: true, diag: "nm-host" };
   await stashTask(target);
   return {
     ok: false,
-    diag: `bridge:down needs-manual-launch`,
+    diag: `bridge:down nm:${nm.detail} needs-launch`,
   };
+}
+
+/**
+ * 经 Native Messaging 宿主送一条任务（并借此拉起桌面端）。
+ *
+ * 返回 `{ ok, detail }`；detail 供 diag：`sent` = 宿主确认；
+ * `unavailable` = 未注册/权限缺失（旧版桌面端没装 NM）；`error:<msg>` =
+ * 宿主在但拒了这条（字段校验失败等，与桥同一套校验）。
+ */
+function sendViaNativeMessaging(target) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (r) => {
+      if (!settled) { settled = true; resolve(r); }
+    };
+    // NM 没有超时保护（浏览器等宿主退出），自备 8 秒上限：
+    // 宿主正常处理一条消息毫秒级；卡住说明注册表/路径有问题，等下去
+    // 只会把「点了没反应」拖成「点了转圈」。
+    const timer = setTimeout(() => done({ ok: false, detail: "timeout" }), 8000);
+    try {
+      chrome.runtime.sendNativeMessage(
+        NM_HOST,
+        {
+          url: target.url,
+          name: target.filename || "",
+          dir: target.dir || "",
+          threads: target.threads || 0,
+          referer: target.referer || "",
+        },
+        (resp) => {
+          clearTimeout(timer);
+          const err = chrome.runtime.lastError;
+          if (err) {
+            // "Access to the specified native messaging host is forbidden" =
+            // 未注册或 allowed_origins 不含本扩展 ID（桌面端版本旧/未首启）。
+            done({ ok: false, detail: "unavailable" });
+            return;
+          }
+          if (resp && resp.ok) {
+            done({ ok: true, detail: "sent" });
+          } else {
+            done({ ok: false, detail: `error:${String(resp && resp.error || "unknown").slice(0, 40)}` });
+          }
+        }
+      );
+    } catch (e) {
+      clearTimeout(timer);
+      done({ ok: false, detail: `throw:${String(e).slice(0, 40)}` });
+    }
+  });
 }
 
 // ---------- 任务暂存（发送失败后留给「之后桥通了」的兜底） ----------

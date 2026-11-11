@@ -704,7 +704,12 @@ fn read_request(stream: &mut TcpStream, deadline: Instant) -> Result<BridgeReq, 
 }
 
 /// 把 POST 的 JSON body 转成 `veloxgrab://add?...` 链接。
-fn build_link_from_json(body: &str) -> Result<String, String> {
+/// 扩展 JSON body → `veloxgrab://add?...` 链接。
+///
+/// 消费方两处：HTTP 桥的 POST body，与 NM 宿主（nm_host.rs）的 stdin 消息
+/// ——两个入口必须走同一套字段校验（http/https、referer 协议白名单、
+/// 长度上限），否则「桥拒绝的 NM 放行」就是一条绕过门禁的暗道。
+pub fn build_link_from_json(body: &str) -> Result<String, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("body 不是合法 JSON: {e}"))?;
     let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("").trim();

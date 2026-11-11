@@ -86,6 +86,62 @@ pub fn sha256_file(_path: &std::path::Path) -> Result<[u8; 32], String> {
     Err("本平台未实现 SHA-256".into())
 }
 
+/// 任意字节串的 SHA-256（BCrypt 单次哈希）。
+///
+/// NM 宿主用扩展安装路径推导浏览器侧的确定性扩展 ID（见 nm_host.rs），
+/// 输入是几十字节的 UTF-16 路径，文件版接口（sha256_file）套不上。
+#[cfg(windows)]
+pub fn sha256_bytes(data: &[u8]) -> Result<[u8; 32], String> {
+    use windows_sys::Win32::Security::Cryptography as bc;
+
+    let mut alg: bc::BCRYPT_ALG_HANDLE = std::ptr::null_mut();
+    // SAFETY: 同 sha256_file——句柄在本函数内创建与释放，指针均指向本栈帧。
+    unsafe {
+        if bc::BCryptOpenAlgorithmProvider(&mut alg, bc::BCRYPT_SHA256_ALGORITHM, std::ptr::null(), 0) < 0 {
+            return Err("初始化 SHA-256 失败".into());
+        }
+        let result = (|| {
+            let mut got: u32 = 0;
+            let mut obj_len: u32 = 0;
+            if bc::BCryptGetProperty(
+                alg,
+                bc::BCRYPT_OBJECT_LENGTH,
+                &mut obj_len as *mut u32 as *mut u8,
+                4,
+                &mut got,
+                0,
+            ) < 0
+            {
+                return Err("读取 SHA-256 参数失败".to_string());
+            }
+            let mut obj = vec![0u8; obj_len as usize];
+            let mut hash: bc::BCRYPT_HASH_HANDLE = std::ptr::null_mut();
+            if bc::BCryptCreateHash(alg, &mut hash, obj.as_mut_ptr(), obj_len, std::ptr::null(), 0, 0) < 0 {
+                return Err("创建 SHA-256 上下文失败".to_string());
+            }
+            let inner = (|| {
+                if bc::BCryptHashData(hash, data.as_ptr(), data.len() as u32, 0) < 0 {
+                    return Err("计算 SHA-256 失败".to_string());
+                }
+                let mut out = [0u8; 32];
+                if bc::BCryptFinishHash(hash, out.as_mut_ptr(), 32, 0) < 0 {
+                    return Err("计算 SHA-256 失败".to_string());
+                }
+                Ok(out)
+            })();
+            bc::BCryptDestroyHash(hash);
+            inner
+        })();
+        bc::BCryptCloseAlgorithmProvider(alg, 0);
+        result
+    }
+}
+
+#[cfg(not(windows))]
+pub fn sha256_bytes(_data: &[u8]) -> Result<[u8; 32], String> {
+    Err("本平台未实现 SHA-256".into())
+}
+
 /// 十六进制摘要的小写规范化 + 合法性校验。长度不对或含非 hex 字符返回 None。
 pub fn normalize_digest(s: &str) -> Option<String> {
     let t = s.trim();
