@@ -1261,10 +1261,8 @@ pub fn set_window_theme(app: tauri::AppHandle, theme: String) {
         "dark" => Some(tauri::Theme::Dark),
         _ => None,
     };
-    for name in ["main"] {
-        if let Some(w) = app.get_webview_window(name) {
-            let _ = w.set_theme(t);
-        }
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.set_theme(t);
     }
 }
 

@@ -64,7 +64,6 @@ jobs:
         run: |
           node --check src/app.js
           node --check src/core.js
-          node --check src/progress.js
           node --check src/theme.js
           node --check extension/background.js
           node --check extension/popup.js
