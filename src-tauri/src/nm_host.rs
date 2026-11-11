@@ -43,6 +43,37 @@ use std::io::{Read, Write};
 /// NM 宿主在注册表里的名字（与安装器写入的键一致）。
 pub const NM_HOST_NAME: &str = "com.veloxgrab.host";
 
+/// 本进程是否被浏览器以 **Native Messaging 宿主** 身份拉起。
+///
+/// 两个判据：
+///
+/// 1. `--nm-host`：我们自己显式传的（手工调试 / 集成测试用）。
+/// 2. **第一个参数是调用方 origin**（`chrome-extension://<id>/`）。
+///    这是浏览器实际使用的形态——它按 manifest 的 `path` 直接起进程，
+///    manifest 里通常没有 `args`，于是 Chromium 在 Windows 上追加的是
+///    `chrome-extension://<id>/ --parent-window=<hwnd>`，**不会**传任何
+///    我们自造的标志。实测（Edge 157，2026-11-11）宿主命令行原样为：
+///    `"veloxgrab.exe"  chrome-extension://<id>/ --parent-window=0`
+///
+/// 早期只判断 `--nm-host`，结果宿主进程掉进 `run()` 起了完整 GUI：stdout
+/// 被 GUI 的日志/GBK 文本污染，浏览器等不到 NM 帧，扩展侧只拿到
+/// `Error when communicating with the native messaging host.`——用户看到的
+/// 就是「点了下载，浏览器自己下完」。这条判据有测试锁死。
+pub fn is_nm_host(argv: &[String]) -> bool {
+    if argv.iter().any(|a| a == "--nm-host") {
+        return true;
+    }
+    // 只认**第一个**参数：浏览器的形态是 `exe <origin> [--parent-window=…]`；
+    // 而协议拉起是 `exe "veloxgrab://add?..."`，两者不会混淆。
+    argv.iter()
+        .nth(1)
+        .map(|a| {
+            let a = a.trim().trim_matches('"').to_ascii_lowercase();
+            a.starts_with("chrome-extension://") || a.starts_with("moz-extension://")
+        })
+        .unwrap_or(false)
+}
+
 /// 一次 NM 会话处理的消息上限：扩展批量抓取的现实上限远低于此。
 /// 超出视为异常客户端，直接收摊。
 const MAX_MESSAGES: usize = 64;
@@ -78,19 +109,37 @@ pub fn run_nm_host() -> ! {
                 };
                 // 转给 GUI（已跑 = single_instance 转发；没跑 = 冷启动消费 argv）。
                 // CREATE_NO_WINDOW：NM 宿主本身无窗口，子进程若弹控制台会闪黑框。
+                //
+                // **stdin/stdout/stderr 必须显式接管**：浏览器给本宿主开的是
+                // NM 帧管道，子进程默认继承它们——GUI 的任何 stdout 输出（日志、
+                // 甚至 GBK 文本）会直接灌进 NM 帧流，把回复帧搞坏；而且子进程
+                // 一直持有管道写端，浏览器读完一帧后仍等不到本宿主退出，扩展侧
+                // 表现为「Error when communicating with the native messaging
+                // host.」。子进程走 null 是唯一安全的选择：它的输出对浏览器
+                // 没有任何意义。
                 let spawned = {
                     #[cfg(windows)]
                     {
                         use std::os::windows::process::CommandExt;
+                        use std::process::Stdio;
                         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                         std::process::Command::new(&exe)
                             .arg(&link)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
                             .creation_flags(CREATE_NO_WINDOW)
                             .spawn()
                     }
                     #[cfg(not(windows))]
                     {
-                        std::process::Command::new(&exe).arg(&link).spawn()
+                        use std::process::Stdio;
+                        std::process::Command::new(&exe)
+                            .arg(&link)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
                     }
                 };
                 match spawned {
@@ -256,5 +305,51 @@ mod tests {
             id_from_path("D:\\Tools\\VeloxGrab\\extension"),
             "addlbhpjfbpffehjhmhfnhjpiieeebne"
         );
+    }
+
+    /// 浏览器拉起宿主的真实 argv 必须被判成 NM 模式。
+    ///
+    /// 这条曾经漏判：只认自造的 `--nm-host`，而 Chromium 传的是扩展
+    /// origin——宿主掉进 Tauri 路径起了完整 GUI，浏览器等不到帧，扩展侧
+    /// 报 "Error when communicating with the native messaging host."，
+    /// 用户侧表现为「点了下载，浏览器自己下完」。
+    #[test]
+    fn chromium_argv_is_recognized_as_nm_host() {
+        let real = vec![
+            r"D:\Tools\VeloxGrab\veloxgrab.exe".to_string(),
+            "chrome-extension://addlbhpjfbpffehjhmhfnhjpiieeebne/".to_string(),
+            "--parent-window=0".to_string(),
+        ];
+        assert!(is_nm_host(&real));
+
+        // 带引号/大写/尾随空格的变体同样要认
+        let quoted = vec![
+            "veloxgrab.exe".to_string(),
+            "  \"CHROME-EXTENSION://abc/\"  ".to_string(),
+        ];
+        assert!(is_nm_host(&quoted));
+
+        // 显式标志（手工调试）仍然有效
+        assert!(is_nm_host(&[
+            "veloxgrab.exe".to_string(),
+            "--nm-host".to_string()
+        ]));
+    }
+
+    /// 正常启动、协议拉起都**不能**被判成 NM 模式——否则用户双击图标
+    /// 会得到一个没有窗口、只读 stdin 就退出的进程。
+    #[test]
+    fn ordinary_launch_is_not_nm_host() {
+        assert!(!is_nm_host(&["veloxgrab.exe".to_string()]));
+        assert!(!is_nm_host(&[
+            r"D:\Tools\VeloxGrab\veloxgrab.exe".to_string(),
+            "veloxgrab://add?url=https%3A%2F%2Fexample.com%2Fa.zip".to_string(),
+        ]));
+        // origin 出现在第二位之后不是浏览器形态（浏览器永远放第一个参数）
+        assert!(!is_nm_host(&[
+            "veloxgrab.exe".to_string(),
+            "veloxgrab://add?url=https%3A%2F%2Fa.com%2Fb".to_string(),
+            "chrome-extension://abc/".to_string(),
+        ]));
     }
 }

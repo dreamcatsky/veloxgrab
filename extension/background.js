@@ -300,6 +300,31 @@ chrome.downloads.onCreated.addListener(async (item) => {
       }
       return;
     }
+
+    // **NM 已经交付完毕，到此为止。**
+    //
+    // 宿主把任务转成了 veloxgrab:// 链接（GUI 已跑 = 单实例转发；没跑 =
+    // 冷启动消费 argv），任务已经在桌面端落地。此时再去 send() 走 HTTP 桥
+    // 是**重复投递**：GUI 冷启动要 1–3 秒才监听 58943，这次 send 必然失败
+    // 并把任务暂存在 storage——之后心跳/popup 补交，用户就得到两条一样的
+    // 下载。所以这里只做「把浏览器那条收掉」，然后返回。
+    await setCanceling(item.id, true);
+    try {
+      try {
+        await chrome.downloads.cancel(item.id);
+      } catch {
+        // 已结束的下载取消不了；NM 那侧已经交付，不补发
+      }
+      try {
+        await chrome.downloads.erase({ id: item.id });
+      } catch {
+        // erase 失败只留个痕迹
+      }
+    } finally {
+      await setCanceling(item.id, false);
+    }
+    if (cfg.notify) notify("已转给 VeloxGrab", pickFilename(item) || item.url);
+    return;
   }
 
   await setCanceling(item.id, true);

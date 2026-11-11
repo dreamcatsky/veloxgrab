@@ -54,9 +54,17 @@ VeloxGrab 启动时在 `127.0.0.1:58943` 起一个极小的 HTTP 服务
 **主兜底：Native Messaging（免手势，IDM/FDM 同款机制）。**
 浏览器按注册表里的 manifest（`HKCU\Software\{Chrome,Microsoft
 Edge}\NativeMessagingHosts\com.veloxgrab.host`）直接拉起
-`veloxgrab.exe --nm-host`——不需要任何用户点击/手势。宿主把任务转成
-`veloxgrab://add?...` 链接交给 GUI：已运行走 single_instance 到前台，
-未运行冷启动消费链接。**用户点下载 → VeloxGrab 窗口弹出**，全自动。
+`veloxgrab.exe <extension-origin> --parent-window=<hwnd>`——不需要任何用户
+点击/手势。宿主把任务转成 `veloxgrab://add?...` 链接交给 GUI：已运行走
+single_instance 到前台，未运行冷启动消费链接。**用户点下载 → VeloxGrab
+窗口弹出**，全自动。
+
+> 注意宿主进程的判据：浏览器**不会**传我们自造的 `--nm-host`，它在
+> Windows 上追加的是调用方 origin（`chrome-extension://<id>/`）。`main.rs`
+> 的 `is_nm_host()` 因此同时认「显式 `--nm-host`」和「第一个参数是扩展
+> origin」。漏掉后者会让宿主掉进 Tauri 启动路径、起完整 GUI，浏览器等不到
+> NM 帧，只报 `Error when communicating with the native messaging host.`
+> （2026-11-11 实测复现并修复）。
 
 - 宿主注册由桌面端每次启动自查（`nm_host.rs`），manifest 的 path 随
   安装目录漂移自动重写；`allowed_origins` 按当前安装路径的确定性扩展 ID
