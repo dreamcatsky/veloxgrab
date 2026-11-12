@@ -225,8 +225,8 @@
     secHeaders: "Custom request headers",
     headersNote: "For hotlink-protected sites add Referer / User-Agent; one Name: value per line. Empty host means all sites, where Authorization is not allowed. Host, Range, Cookie and other managed headers are ignored.",
     headerAdd: "Add preset",
-    popupSaveAs: 'Browser veloxgrab:// downloads ask "Save as" first',
-    popupSaveAsHint: "(off: save straight to the default folder)",
+    popupSaveAs: 'Manual veloxgrab:// links ask "Save as" first',
+    popupSaveAsHint: "(off: save straight to the default folder; tasks sent by the browser extension always enqueue directly)",
     popupQuality: "Video sites: popup quality chooser",
     popupQualityHint: "(off: auto best quality)",
     autoProgress: "Switch to task view when a download starts",
@@ -3027,13 +3027,82 @@
       return;
     }
     if (!p.url) return;
-    // 「先选目录再下载」开关：关掉时保持老行为，静默存入默认目录
     const s = appSettings || (await getSettingsCached());
+    // auto=1：扩展显式投递（桥/NM 链接由 build_link_from_json 统一注入）。
+    // 下载拦截路径送出后就**取消了浏览器自己的下载**，这里若再停在
+    // 「另存为」面板等人确认，面板没被注意到的话这条下载就两边都消失了
+    // ——能自动落的直接落，只有「非人不可」的信息（清晰度选择、探测
+    // 失败的兜底确认）才交给面板。见 autoAcceptExternal。
+    if (p.auto) {
+      await autoAcceptExternal(p, s);
+      return;
+    }
+    // 「先选目录再下载」开关：关掉时保持老行为，静默存入默认目录
     if (!s.popup_save_as) {
       await silentExternalDownload(p, s);
       return;
     }
     saveAsQueue.push(p);
+    pumpSaveAsQueue();
+  }
+
+  // auto=1 的落地策略：先探测分流——
+  // - 直链：静默入队（与 popup_save_as 关闭时同一条路径）；
+  // - 视频：popup_quality 开着 → 面板选清晰度（探测结果预填，不重复探测）；
+  //   关着 → 自动取推荐清晰度直接入队；
+  // - 探测失败/异常：回退面板——「识别失败，可按直链尝试」的说明只有
+  //   面板能承载，静默建任务会把失败原因吞掉。
+  async function autoAcceptExternal(p, s) {
+    let r = null;
+    try {
+      r = await invoke("probe_auto", { url: p.url });
+    } catch (e) {
+      r = { kind: "error", message: String(e) };
+    }
+    if (!r) r = { kind: "error", message: "probe_auto 返回空" };
+    if (r.kind === "direct") {
+      await silentExternalDownload(p, s);
+      return;
+    }
+    if (r.kind === "video" && !s.popup_quality) {
+      const media = r.media;
+      const formats = media.formats || [];
+      let idx = formats.findIndex((f) => f.recommended);
+      if (idx < 0) idx = 0;
+      const f = formats[idx];
+      if (f) {
+        try {
+          await invoke("enqueue_download", {
+            args: {
+              url: media.webpage_url,
+              title: p.filename || media.title,
+              thumbnail: media.thumbnail || null,
+              duration: media.duration || null,
+              format_id: f.format_id,
+              quality_label: f.label,
+              has_audio: f.has_audio,
+              best_audio_format: media.best_audio_format || null,
+              kind: "video",
+              save_dir: p.save_dir || s.download_dir || null,
+              expected_ext: f.ext || null,
+              expected_bytes: f.filesize || null,
+              // 页面 Referer：防盗链站点的解析/下载都可能需要
+              referer: p.referer || null,
+            },
+          });
+          toast("已从浏览器接收下载：" + (media.title || p.url));
+          refreshTasks();
+          return;
+        } catch (e) {
+          toast(String(e), true);
+          return;
+        }
+      }
+    }
+    // 视频且开着清晰度选择 / 探测不顺利：面板接手。探测结果随载荷带给
+    // openSaveAs（_probed），面板不再重探一遍——媒体站解析最长 90 秒，
+    // 重复跑一遍既慢又可能撞站点的频率限制。
+    saveAsQueue.push({ ...p, _probed: r });
     pumpSaveAsQueue();
   }
 
@@ -3107,12 +3176,14 @@
     $("saQualityRow").classList.add("hidden");
     $("saveAsOverlay").classList.remove("hidden");
 
-    let r = null;
-    try {
-      r = await invoke("probe_auto", { url: p.url });
-    } catch (e) {
-      if (!saveAsCtx) return; // 探测期间用户已点取消
-      $("saStatus").textContent = "识别失败：" + String(e) + "（仍可按直链下载）";
+    let r = p._probed || null;
+    if (!r) {
+      try {
+        r = await invoke("probe_auto", { url: p.url });
+      } catch (e) {
+        if (!saveAsCtx) return; // 探测期间用户已点取消
+        $("saStatus").textContent = "识别失败：" + String(e) + "（仍可按直链下载）";
+      }
     }
 
     // 探测是异步的（媒体站最长 90 秒）：这期间用户可能已经点了「取消」，

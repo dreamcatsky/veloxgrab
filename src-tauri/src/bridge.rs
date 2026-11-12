@@ -594,7 +594,9 @@ fn route(req: BridgeReq) -> RouteOutcome {
             }
         }
     } else {
-        format!("veloxgrab://add?{query}")
+        // GET 通道与 POST 同为扩展流量（Origin + token 门禁），auto=1 一并
+        // 注入：语义见 build_link_from_json 的文档注释。
+        format!("veloxgrab://add?{query}&auto=1")
     };
 
     RouteOutcome { status: 200, body: "{\"ok\":true}".to_string(), dispatched_link: Some(link) }
@@ -709,6 +711,13 @@ fn read_request(stream: &mut TcpStream, deadline: Instant) -> Result<BridgeReq, 
 /// 消费方两处：HTTP 桥的 POST body，与 NM 宿主（nm_host.rs）的 stdin 消息
 /// ——两个入口必须走同一套字段校验（http/https、referer 协议白名单、
 /// 长度上限），否则「桥拒绝的 NM 放行」就是一条绕过门禁的暗道。
+///
+/// 生成的链接**总是带 `auto=1`**：能走到这里的请求全部经过了 Origin +
+/// token 门禁，只可能是扩展的显式投递（右键菜单 / 弹窗发送 / 下载拦截
+/// ——每一处都是用户在浏览器里亲手点出来的）。下载拦截路径在送出后
+/// 会**取消浏览器自己的下载**，任务若再停在「另存为」面板等人确认，
+/// 用户没注意到面板的话这条下载就两边都消失了；所以扩展投递的任务
+/// 必须直接入队。手动构造的 `veloxgrab://` 链接不经过本函数，不带标记。
 pub fn build_link_from_json(body: &str) -> Result<String, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("body 不是合法 JSON: {e}"))?;
@@ -742,7 +751,7 @@ pub fn build_link_from_json(body: &str) -> Result<String, String> {
             parts.push(format!("referer={}", urlencoding::encode(r)));
         }
     }
-    Ok(format!("veloxgrab://add?{}", parts.join("&")))
+    Ok(format!("veloxgrab://add?{}&auto=1", parts.join("&")))
 }
 
 /// 扩展版本落后于桌面端的提醒：只弹一次（进程内 OnceLock 记账）。

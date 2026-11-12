@@ -88,6 +88,7 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
             save_dir: None,
             threads: None,
             referer: None,
+            auto: false,
         });
     }
 
@@ -115,6 +116,7 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
             save_dir: None,
             threads: None,
             referer: None,
+            auto: false,
         });
     }
     if !path.eq_ignore_ascii_case("add") {
@@ -128,6 +130,7 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
     let mut save_dir = None;
     let mut threads = None;
     let mut referer = None;
+    let mut auto = false;
 
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -148,10 +151,14 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
             "name" | "filename" | "f" => filename = Some(v),
             "dir" | "d" => save_dir = Some(v),
             "threads" | "t" => threads = v.trim().parse::<usize>().ok(),
-            // 浏览器页面地址：防盗链直链需要它作为 Referer。
+            // 页面地址：防盗链直链需要它作为 Referer。
             // 只接受 http(s) 字面量，其它（file:/javascript:）一律丢弃——
             // 它会直接变成发往目标服务器的请求头值。
             "referer" | "ref" | "r" => referer = Some(v),
+            // auto=1：扩展显式投递（桥/NM 链接由 build_link_from_json 统一
+            // 注入）。前端据此跳过「另存为」面板直接入队——见 bridge.rs 里
+            // 对 auto 语义的说明。手动构造的链接不带它，面板照常。
+            "auto" => auto = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
             _ => {}
         }
     }
@@ -172,6 +179,7 @@ pub fn parse_deep_link(raw: &str) -> Result<LinkRequest, String> {
     Ok(LinkRequest {
         url,
         action: None,
+        auto,
         // 空串与缺省一视同仁
         filename: filename.filter(|f| !f.trim().is_empty()),
         save_dir: save_dir.filter(|d| !d.trim().is_empty()),
@@ -199,6 +207,10 @@ pub struct LinkRequest {
     /// 页面地址，作为 Referer 附加到直链请求（防盗链直链需要）。
     #[serde(default)]
     pub referer: Option<String>,
+    /// auto=1：扩展显式投递，前端跳过「另存为」面板直接入队。
+    /// 手动构造的协议链接不带此标记（缺省 false），照常走面板。
+    #[serde(default)]
+    pub auto: bool,
 }
 
 /// 确保 HKCR\veloxgrab 指向当前可执行文件。
@@ -372,6 +384,29 @@ mod tests {
         // 目标 URL 自带 query 时不能把 &id=2 当成外层参数
         let r = parse_deep_link("veloxgrab://add?url=https%3A%2F%2Fa.com%2Ff%3Fid%3D2%26x%3D1").unwrap();
         assert_eq!(r.url, "https://a.com/f?id=2&x=1");
+    }
+
+    /// auto 标记：扩展投递的链接带 auto=1，手动构造的不带。
+    /// 前端据此决定跳不跳「另存为」面板——漏解析会让拦截路径丢下载。
+    #[test]
+    fn auto_flag_is_parsed() {
+        // 扩展投递形态（build_link_from_json 的产物总以 &auto=1 结尾）
+        let r = parse_deep_link("veloxgrab://add?url=https%3A%2F%2Fa.com%2Fx.zip&auto=1").unwrap();
+        assert!(r.auto, "auto=1 必须解析为 true");
+        let r = parse_deep_link("veloxgrab://add?url=https%3A%2F%2Fa.com%2Fx.zip&auto=true").unwrap();
+        assert!(r.auto);
+
+        // 手动形态：缺省 = false（照常走面板）
+        let r = parse_deep_link("veloxgrab://add?url=https%3A%2F%2Fa.com%2Fx.zip").unwrap();
+        assert!(!r.auto);
+
+        // 任意其它取值不视为 true（防手滑：auto=0 必须是 false）
+        let r = parse_deep_link("veloxgrab://add?url=https%3A%2F%2Fa.com%2Fx.zip&auto=0").unwrap();
+        assert!(!r.auto);
+
+        // bare-url 形态永远不带 auto（手动粘贴）
+        let r = parse_deep_link("veloxgrab://https://a.com/x.zip").unwrap();
+        assert!(!r.auto);
     }
 
     /// Referer 参数（浏览器扩展带来的页面地址）：只接受 http(s)，其它丢弃。
