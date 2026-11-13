@@ -71,7 +71,7 @@ function main() {
     const zip = path.join(tools, "hd.zip");
     run("gh", [
       "release", "download", HDIFF_TAG, "--repo", "sisong/HDiffPatch",
-      "--pattern", `hdiffpatch_${HDIFF_TAG.slice(1)}_bin_windows64.zip`,
+      "--pattern", `hdiffpatch_${HDIFF_TAG}_bin_windows64.zip`,
       "--output", zip, "--clobber",
     ]);
     // 工具在 zip 的顶层子目录里，include 过滤器匹配不到相对路径——
