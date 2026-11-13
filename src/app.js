@@ -2402,7 +2402,16 @@
     const btn = $("upInstall");
     btn.classList.remove("hidden");
     btn.disabled = false;
-    btn.querySelector("span").textContent = `下载并安装（${fmtMB(info.asset_size)}）`;
+    delete btn.dataset.fallback;
+    // 增量优先：补丁通常只有全量安装包的零头（只含 veloxgrab.exe 的差异）。
+    // 后端对补丁不降级——摘要缺失时 info 里根本不会有 patch_url，这里
+    // 看到的就是可信可用的。
+    const patch = info.patch_url && info.patch_digest && info.patch_target_digest;
+    btn.querySelector("span").textContent = patch
+      ? `增量更新（${fmtMB(info.patch_size)}）`
+      : `下载并安装（${fmtMB(info.asset_size)}）`;
+    const tip = $("upBody").querySelector("p.dim");
+    if (tip && patch) tip.textContent += " 本次走增量补丁：体积更小，下载后自动校验再换文件；失败会自动回退全量安装。";
     $("updateOverlay").classList.remove("hidden");
   }
 
@@ -2414,16 +2423,34 @@
     btn.querySelector("span").textContent = "下载中…";
     $("upBarWrap").classList.remove("hidden");
     $("upPct").textContent = "准备下载…";
+    // 「改用全量」回退态：补丁失败一次后，下一次点击走 update_now 全量
+    const patch = !btn.dataset.fallback && info.patch_url && info.patch_digest && info.patch_target_digest;
     try {
       // 成功后 Rust 侧会直接退出本进程去安装，这里不会有返回值可言。
       // digest 是 check_update 里 release JSON 带出来的发布摘要：后端拿它做
       // 逐字节校验，避免为取摘要再打一次限流的 GitHub API。
-      await invoke("update_now", { url: info.download_url, digest: info.digest || null });
+      if (patch) {
+        await invoke("update_now_patch", {
+          patchUrl: info.patch_url,
+          patchDigest: info.patch_digest,
+          targetDigest: info.patch_target_digest,
+        });
+      } else {
+        await invoke("update_now", { url: info.download_url, digest: info.digest || null });
+      }
     } catch (e) {
       $("upPct").textContent = "";
       btn.disabled = false;
-      btn.querySelector("span").textContent = "重试";
+      if (patch) {
+        // 补丁路径的失败（网络/校验/应用）不终结更新：回退全量安装包，
+        // 按钮变成「改用全量」再点一次就是 update_now。
+        btn.querySelector("span").textContent = `改用全量安装（${fmtMB(info.asset_size)}）`;
+        btn.dataset.fallback = "1";
+      } else {
+        btn.querySelector("span").textContent = "重试";
+      }
       toast("更新失败：" + String(e), true);
+      return;
     }
   }
 

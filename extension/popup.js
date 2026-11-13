@@ -269,7 +269,7 @@ async function init() {
   // 恢复上次的目录/线程/接管开关。dir 存 storage.local（本机路径不上云），
   // threads/intercept 存 storage.sync。
   const [cfgSync, cfgLocal] = await Promise.all([
-    chrome.storage.sync.get(["threads", "intercept", "sniff"]),
+    chrome.storage.sync.get(["threads", "intercept", "sniff", "floatBtn"]),
     chrome.storage.local.get(["dir"]),
   ]);
   if (cfgLocal.dir) $("dir").value = cfgLocal.dir;
@@ -287,6 +287,13 @@ async function init() {
     msg($("sniff").checked ? "已开启流媒体嗅探" : "已关闭流媒体嗅探");
     if (!$("sniff").checked) $("sniffWrap").style.display = "none";
     else refreshSniff();
+  };
+  // 悬浮下载按钮（默认开）：content script 在 <video> 旁挂跟随式按钮，
+  // 开关即时生效（content.js 监听 storage.onChanged 现场撤按钮）
+  $("floatBtn").checked = cfgSync.floatBtn !== false;
+  $("floatBtn").onchange = () => {
+    chrome.storage.sync.set({ floatBtn: $("floatBtn").checked });
+    msg($("floatBtn").checked ? "已开启悬浮下载按钮（刷新页面后可见）" : "已关闭悬浮下载按钮");
   };
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });

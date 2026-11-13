@@ -111,6 +111,25 @@ pub struct UpdateInfo {
     pub digest: Option<String>,
     /// 检查失败的原因（网络、限流等）。前端据此决定静默还是报错。
     pub error: Option<String>,
+    /// 增量补丁（当前安装版本 → latest 的 veloxgrab.exe hdiff 补丁）。
+    /// 四个字段齐全才可用：缺任一项前端回退全量安装包。
+    /// 全量 21MB 的安装包，补丁通常只有几 MB——95% 的更新流量省在这。
+    pub patch_url: Option<String>,
+    pub patch_digest: Option<String>,
+    /// 补丁应用后 veloxgrab.exe 应有的 SHA-256（裸 exe 资产的发布摘要）。
+    /// 结果逐字节校验是补丁路径的安全底座：摘要拿不到就不提供补丁。
+    pub patch_target_digest: Option<String>,
+    pub patch_size: u64,
+}
+
+/// 增量补丁的两个资产名：补丁本体 + 补丁产物的**裸 exe**（发布摘要来源）。
+/// 命名即契约：`patch-veloxgrab-<当前版本>-to-<目标版本>.hdiff` 与
+/// `veloxgrab-<目标版本>.exe`，由 scripts/make-patch.mjs 生成并上传。
+pub(crate) fn patch_asset_names(current: &str, latest: &str) -> (String, String) {
+    (
+        format!("patch-veloxgrab-{current}-to-{latest}.hdiff"),
+        format!("veloxgrab-{latest}.exe"),
+    )
 }
 
 /// "1.2.3" / "v1.2.3" / "1.2" → [1,2,3]；解析不了返回 None。
@@ -181,6 +200,47 @@ pub fn parse_release(v: &serde_json::Value, current: &str) -> UpdateInfo {
         None => (String::new(), 0, None),
     };
 
+    // 增量补丁：当前版本 → latest 的 veloxgrab.exe。补丁与目标裸 exe 两个
+    // 资产都在、且**都带发布摘要**才提供——补丁摘要保证运输完整，目标摘
+    // 要保证「应用补丁后的 exe」逐字节可信；缺任何一个就回退全量安装包。
+    let mut patch_url: Option<String> = None;
+    let mut patch_digest: Option<String> = None;
+    let mut patch_target_digest: Option<String> = None;
+    let mut patch_size: u64 = 0;
+    if is_newer(current, &tag) {
+        if let Some(assets) = v.get("assets").and_then(|x| x.as_array()) {
+            let (patch_name, exe_name) = patch_asset_names(current, &tag);
+            let mut fp: Option<(String, Option<String>, u64)> = None;
+            let mut ft: Option<Option<String>> = None;
+            for a in assets {
+                let name = a
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let url = a.get("browser_download_url").and_then(|x| x.as_str()).unwrap_or("");
+                if url.is_empty() || !is_trusted_download(url) {
+                    continue;
+                }
+                if name == patch_name.to_ascii_lowercase() {
+                    fp = Some((
+                        url.to_string(),
+                        a.get("digest").and_then(|x| x.as_str()).map(|s| s.to_string()),
+                        a.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
+                    ));
+                } else if name == exe_name.to_ascii_lowercase() {
+                    ft = Some(a.get("digest").and_then(|x| x.as_str()).map(|s| s.to_string()));
+                }
+            }
+            if let (Some((url, Some(d), size)), Some(Some(td))) = (fp, ft) {
+                patch_url = Some(url);
+                patch_digest = Some(d);
+                patch_target_digest = Some(td);
+                patch_size = size;
+            }
+        }
+    }
+
     UpdateInfo {
         available: is_newer(current, &tag) && !download_url.is_empty(),
         current: current.to_string(),
@@ -191,6 +251,10 @@ pub fn parse_release(v: &serde_json::Value, current: &str) -> UpdateInfo {
         asset_size,
         digest,
         error: None,
+        patch_url,
+        patch_digest,
+        patch_target_digest,
+        patch_size,
     }
 }
 
@@ -205,6 +269,10 @@ fn failed(current: &str, msg: String) -> UpdateInfo {
         asset_size: 0,
         digest: None,
         error: Some(msg),
+        patch_url: None,
+        patch_digest: None,
+        patch_target_digest: None,
+        patch_size: 0,
     }
 }
 
@@ -501,6 +569,170 @@ pub async fn update_now(
     Ok(())
 }
 
+/// 增量更新：下载 hdiff 补丁 → 应用到当前 exe → 校验产物摘要 → 换文件重启。
+///
+/// 与全量 `update_now` 的分工：补丁路径针对的是**裸 veloxgrab.exe**（15MB
+/// 级，补丁只有几 MB），不经过安装器——extension/ 与 yt-dlp 资源随安装包
+/// 才更新，所以本路径只在「补丁资产存在且摘要齐全」时由前端选用，任何
+/// 环节不满足都回退全量。
+///
+/// ## 安全边界（三道门，缺一不可）
+///
+/// 1. 补丁下载地址必须命中信任前缀（与全量同一条 `is_trusted_download`）；
+/// 2. 补丁自身的发布摘要逐字节校验（运输完整性）；
+/// 3. **应用补丁后的产物**再校验目标摘要（`veloxgrab-<版本>.exe` 资产的
+///    digest）——即使补丁被构造出恶意内容，产物摘要对不上就整体作废。
+///    这是补丁路径独有的底座：全量安装包验的是安装包本身，这里验的是
+///    产物，两道缺一都会让「构造补丁」成为可乘之机。
+///
+/// ## 为什么补丁和校验都在 Rust 里同步完成
+///
+/// hpatchz 读运行中的 exe 是只读操作（无文件锁），产物写到临时目录也不
+/// 与运行中文件冲突——所以整个补丁+校验在本进程内做完，bat 安装链只剩
+/// 「等退出 → 换文件 → 重启」三步。若把校验也塞进 bat（certutil/PS），
+/// 校验失败的处理就从 Rust 的 `Err` 退化成日志里的一行，且引号/编码又
+/// 要过一遍 cmd 解析器（install-chain.bat 的坑）。
+///
+/// ## 回滚
+///
+/// 被替换的旧 exe 保留为 `veloxgrab.exe.old`（每次更新覆盖上一次的）：
+/// 新版启动即崩这类极端情况，用户手动改回名字就能回到旧版。
+#[cfg(windows)]
+#[tauri::command]
+pub async fn update_now_patch(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    patch_url: String,
+    patch_digest: String,
+    target_digest: String,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    if UPDATE_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("一次更新正在进行中，请等它完成".into());
+    }
+    let _guard = UpdateGuard;
+
+    if !is_trusted_download(&patch_url) {
+        return Err("下载地址不在信任清单内".into());
+    }
+    // 补丁路径**不降级**：两个摘要都拿不到合法形态就直接拒绝——回退由
+    // 前端去做（改调 update_now 走全量），而不是带着没校验的补丁往下走。
+    let expected_patch =
+        parse_digest(&patch_digest).ok_or("补丁摘要格式不合法，已取消增量更新")?;
+    let expected_target =
+        parse_digest(&target_digest).ok_or("目标摘要格式不合法，已取消增量更新")?;
+
+    let proxy = load_settings(&state).proxy_url();
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+    let client = build_client(proxy.as_deref(), None)?;
+
+    let dir = std::env::temp_dir().join("veloxgrab-update");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+    let patch_tmp = dir.join("veloxgrab-update.hdiff");
+    let out_tmp = dir.join("veloxgrab-patched.exe");
+    let _ = std::fs::remove_file(&patch_tmp);
+    let _ = std::fs::remove_file(&out_tmp);
+
+    // 下载补丁（几 MB 级，流式写盘 + 进度事件与全量共用同一事件名）
+    let resp = client
+        .get(&patch_url)
+        .send()
+        .await
+        .map_err(|e| format!("下载补丁失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("下载补丁失败：HTTP {}", resp.status()));
+    }
+    let mut file = std::fs::File::create(&patch_tmp).map_err(|e| format!("写入补丁失败: {e}"))?;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| format!("补丁下载中断：{e}"))?;
+        file.write_all(&bytes).map_err(|e| format!("写入补丁失败: {e}"))?;
+    }
+    file.flush().map_err(|e| e.to_string())?;
+    drop(file);
+
+    // 运输完整性：补丁本体逐字节校验
+    verify_downloaded(&patch_tmp, expected_patch)?;
+
+    // 应用补丁：hpatchz 读当前 exe（只读，运行中无锁）+ 补丁 → 临时产物。
+    // hpatchz.exe 与 yt-dlp 同一个资源查找规则（资源目录 / exe 旁 bin/）。
+    let hpatchz = resolve_hpatchz().ok_or("找不到内置的 hpatchz.exe（更新工具缺失）")?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let status = std::process::Command::new(&hpatchz)
+        .args([&exe, &patch_tmp, &out_tmp])
+        .creation_flags(0x0800_0000)
+        .status()
+        .map_err(|e| format!("启动补丁工具失败: {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&out_tmp);
+        return Err(format!("应用补丁失败（hpatchz 退出码 {}）", status.code().unwrap_or(-1)));
+    }
+
+    // 结果完整性：补丁产物必须逐字节等于发布的新版 exe
+    verify_downloaded(&out_tmp, expected_target)?;
+
+    // 换文件链（bat 落盘执行，理由与 install-chain.bat 相同：跨 cmd 转义）。
+    // q() 把双引号从路径里剥掉，纵深同 install-chain.bat。
+    {
+        use std::os::windows::process::CommandExt;
+        let q = |p: &std::path::Path| p.display().to_string().replace(['"', '\''], "");
+        let log = dir.join("patch.log");
+        let bat = dir.join("patch-chain.bat");
+        let exe_s = q(&exe);
+        let old_s = q(&exe.with_extension("exe.old"));
+        let out_s = q(&out_tmp);
+        let log_s = q(&log);
+        let bat_body = format!(
+            "@echo off\r\n\
+             echo spawned> \"{log_s}\"\r\n\
+             ping -n 6 127.0.0.1 >nul\r\n\
+             move /y \"{exe_s}\" \"{old_s}\" >nul\r\n\
+             echo moved>> \"{log_s}\"\r\n\
+             move /y \"{out_s}\" \"{exe_s}\" >nul\r\n\
+             echo swapped>> \"{log_s}\"\r\n\
+             start \"\" \"{exe_s}\"\r\n\
+             echo restarted>> \"{log_s}\"\r\n",
+        );
+        std::fs::write(&bat, bat_body).map_err(|e| format!("写换文件脚本失败: {e}"))?;
+        std::process::Command::new("cmd")
+            .args(["/C", &bat.to_string_lossy()])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map_err(|e| format!("启动换文件链失败: {e}"))?;
+    }
+
+    let _ = app.emit("update-progress", Prog { downloaded: 0, total: 0, done: true, error: None });
+    // 退出挪独立线程，理由同 update_now（ExitRequested 里 block_on 死锁）
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        app.exit(0);
+    });
+    Ok(())
+}
+
+/// hpatchz.exe 的查找规则（与 ytdlp 的两级查找同构，少一层 %LOCALAPPDATA%）：
+/// 1. 资源目录 `bin/hpatchz.exe`（安装版走这条，随 NSIS 包发布）；
+/// 2. exe 旁 `bin/hpatchz.exe`（便携包）。
+#[cfg(windows)]
+fn resolve_hpatchz() -> Option<std::path::PathBuf> {
+    if let Some(rd) = crate::ytdlp::resource_dir() {
+        let p = rd.join("bin").join("hpatchz.exe");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let p = exe.parent()?.join("bin").join("hpatchz.exe");
+    if p.is_file() {
+        return Some(p);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +772,59 @@ mod tests {
         assert!(is_trusted_download(&info.download_url));
         // 当前已是最新 → 不提示
         assert!(!parse_release(&v, "1.1.1").available);
+    }
+
+    /// 增量补丁的资产匹配：补丁 + 裸 exe 都在且**都带 digest** 才提供；
+    /// 缺任一项（摘要缺失 = 校验底座不成立）必须回退全量。
+    #[test]
+    fn parse_release_detects_incremental_patch() {
+        let base = "https://github.com/dreamcatsky/veloxgrab/releases/download/v1.5.5";
+        let dg = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+        let asset = |name: &str, digest: serde_json::Value| {
+            serde_json::json!({
+                "name": name,
+                "browser_download_url": format!("{base}/{name}"),
+                "size": 1000,
+                "digest": digest,
+            })
+        };
+        let mk = |assets: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "tag_name": "v1.5.5",
+                "html_url": "https://github.com/dreamcatsky/veloxgrab/releases/tag/v1.5.5",
+                "assets": assets,
+            })
+        };
+        let full = vec![
+            asset("VeloxGrab_1.5.5_x64-setup.exe", serde_json::json!(dg('a'))),
+            asset("patch-veloxgrab-1.5.4-to-1.5.5.hdiff", serde_json::json!(dg('b'))),
+            asset("veloxgrab-1.5.5.exe", serde_json::json!(dg('c'))),
+        ];
+        let info = parse_release(&mk(full.clone()), "1.5.4");
+        assert!(info.available);
+        assert_eq!(
+            info.patch_url.as_deref(),
+            Some("https://github.com/dreamcatsky/veloxgrab/releases/download/v1.5.5/patch-veloxgrab-1.5.4-to-1.5.5.hdiff")
+        );
+        assert_eq!(
+            info.patch_target_digest.as_deref(),
+            Some("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
+
+        // 裸 exe 缺 digest → 不提供补丁（结果校验底座不成立）
+        let no_target = vec![
+            asset("VeloxGrab_1.5.5_x64-setup.exe", serde_json::json!(dg('a'))),
+            asset("patch-veloxgrab-1.5.4-to-1.5.5.hdiff", serde_json::json!(dg('b'))),
+            asset("veloxgrab-1.5.5.exe", serde_json::json!(null)),
+        ];
+        let info = parse_release(&mk(no_target), "1.5.4");
+        assert!(info.patch_url.is_none());
+        assert!(info.patch_digest.is_none());
+
+        // 用户版本与补丁对不上（1.5.3 → 1.5.5 没有 1.5.3 的补丁）→ 不提供
+        let info = parse_release(&mk(full), "1.5.3");
+        assert!(info.available);
+        assert!(info.patch_url.is_none());
     }
 
     #[test]

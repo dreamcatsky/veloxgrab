@@ -888,9 +888,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg.type !== "veloxgrab-send") return;
-  // 只认自家 popup 的消息。当前 manifest 没有 externally_connectable /
-  // content_scripts，网页与第三方扩展本就触不到这里；这行是纵深——
-  // 日后放开任何一条通道时，这个「URL → 本地下载器」的投递口不该裸奔。
+  // 只认自家扩展的消息。通道现有两个：popup（用户手动发送）与 content
+  // script（悬浮下载按钮，见 content.js）——都是本扩展自己的 UI，信任级
+  // 相同，sender.id 校验挡的是第三方扩展与网页（externally_connectable
+  // 未开放，网页本就触不到；这行是纵深）。
   if (sender.id !== chrome.runtime.id) return;
 
   (async () => {

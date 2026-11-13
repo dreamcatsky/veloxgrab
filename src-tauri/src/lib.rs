@@ -393,6 +393,7 @@ pub fn run() {
             settings::default_settings,
             update::check_update,
             update::update_now,
+            update::update_now_patch,
             aria2::aria2_info,
         ])
         .build(tauri::generate_context!())
