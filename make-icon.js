@@ -277,3 +277,28 @@ const outDir = path.join(__dirname, "src-tauri", "icons");
 fs.mkdirSync(outDir, { recursive: true });
 fs.writeFileSync(path.join(outDir, "source.png"), png);
 console.log(`wrote source.png ${png.length} bytes`);
+
+// 扩展三张图标（16/48/128）同步从母版缩出。曾经断供过：应用图标换新
+// （2026-11-05）后扩展目录里的 icon*.png 还停在 10 月的旧设计，工具栏
+// 图标与应用对不上。渲染器是 1024 定坐标的手写管线，缩放交给
+// System.Drawing 高质量插值完成——本项目只发 Windows，这个依赖是安全的。
+// （tauri 图标集记得另跑 `npx tauri icon src-tauri/icons/source.png`。）
+const { execFileSync } = require("child_process");
+const script = `
+Add-Type -AssemblyName System.Drawing
+$src = [System.Drawing.Image]::FromFile('${outDir.replace(/\\/g, "\\\\")}\\source.png')
+foreach ($size in 16, 48, 128) {
+  $bmp = New-Object System.Drawing.Bitmap $size, $size
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+  $g.SmoothingMode = 'HighQuality'
+  $g.PixelOffsetMode = 'HighQuality'
+  $g.DrawImage($src, 0, 0, $size, $size)
+  $bmp.Save('${path.join(__dirname, "extension").replace(/\\/g, "\\\\")}\\icon' + $size + '.png', [System.Drawing.Imaging.ImageFormat]::Png)
+  $g.Dispose(); $bmp.Dispose()
+}
+$src.Dispose()
+`;
+execFileSync("powershell", ["-NoProfile", "-Command", script], { stdio: "inherit" });
+console.log("wrote extension/icon16.png icon48.png icon128.png");
+
