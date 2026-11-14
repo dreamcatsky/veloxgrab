@@ -42,13 +42,17 @@ const NM_HOST = "com.veloxgrab.host";
 const DEFAULTS = { threads: 4, dir: "", intercept: true, notify: true, sniff: true, autoOpen: true };
 
 /**
- * 发送成功后自动弹出监视面板（= 扩展弹窗本体）。
+ * 发送成功后**不**立即弹监视面板——确认阶段的 UI 是桌面端的「另存为」
+ * 面板（popup_save_as 开着时），扩展弹窗此刻凑上去只会跟它抢焦点。
+ * 正确的时机是**任务真正开始下载之后**：桌面端确认完、引擎进下载态，
+ * 监视面板这时弹出才有内容可看。所以交付成功只启动一个短轮询
+ * （startMonitorPoll），等 /tasks 里出现新任务再弹。
  *
- * MV3 的 chrome.action.openPopup() 无需用户手势即可调用（Edge 157 实测：
- * 隔离实例 + CDP 无手势求值成功），唯一要求是浏览器窗口处于前台——用户
- * 刚点了下载，这天然成立；窗口不在前台（切到别的应用了）会抛
- * "Could not find an active browser window"，静默忽略即可，用户回头点
- * 图标照样能看。批量抓取连发时重复调用是幂等的（已打开 = 无操作）。
+ * 弹出的实现：MV3 的 chrome.action.openPopup() 无需用户手势即可调用
+ * （Edge 157 实测：隔离实例 + CDP 无手势求值成功），唯一要求是浏览器
+ * 窗口处于前台——用户刚确认完下载，这天然成立；窗口不在前台（切到
+ * 别的应用了）会抛错，静默忽略即可，用户回头点图标照样能看。
+ * 批量抓取连发时重复调用是幂等的（已打开 = 无操作）。
  */
 async function openMonitor() {
   try {
@@ -56,6 +60,58 @@ async function openMonitor() {
     if (autoOpen === false) return;
     await chrome.action.openPopup();
   } catch { /* 非前台 / 已打开：静默 */ }
+}
+
+// ---------- 「任务开始下载了」的短轮询 ----------
+//
+// 交付（桥/NM）成功 ≠ 任务开始下载：popup_save_as 开着时中间隔着桌面端
+// 的确认面板，用户可能确认也可能取消。交付后每 2 秒查一次 /tasks，出现
+// **基线里没有的新任务**（任意状态——几 KB 的小任务 2 秒内可能已下完，
+// 也算「开始了」）就弹面板；最长等 3 分钟，超时静默收场（用户没确认）。
+// 基线用任务 id 而不是 URL 匹配：yt-dlp 解析出的 webpage_url 与扩展交付
+// 的页面 URL 几乎必然不同（参数被洗掉），精确匹配永远落空。
+let monitorPolls = [];
+
+async function startMonitorPoll() {
+  // 基线在交付瞬间拍：这一刻桌面端还没建任务（确认面板在前端侧），
+  // 之后 /tasks 里任何新 id 都意味着「用户确认了，下载开始了」
+  const base = new Set((await fetchTasksSnapshot()).map((t) => t.id));
+  monitorPolls.push({ base, deadline: Date.now() + 180_000 });
+  runMonitorPolls();
+}
+
+async function runMonitorPolls() {
+  if (!monitorPolls.length) return;
+  monitorPolls = monitorPolls.filter((p) => Date.now() < p.deadline);
+  if (!monitorPolls.length) return;
+  const ids = new Set((await fetchTasksSnapshot()).map((t) => t.id));
+  const fresh = monitorPolls.some((p) => {
+    for (const id of ids) if (!p.base.has(id)) return true;
+    return false;
+  });
+  if (fresh) {
+    monitorPolls = [];
+    openMonitor();
+    return;
+  }
+  // SW 保活靠这个节奏：每 2 秒一次 fetch 重置 30 秒空闲计时，与
+  // checkPendingTask 的密集补交同一套手法
+  setTimeout(runMonitorPolls, 2000);
+}
+
+async function fetchTasksSnapshot() {
+  try {
+    const res = await fetch("http://127.0.0.1:58943/tasks", {
+      method: "POST",
+      headers: await bridgeHeaders(),
+      body: "{}",
+    });
+    if (!res.ok) return [];
+    const j = await res.json().catch(() => ({}));
+    return (j && j.tasks) || [];
+  } catch {
+    return [];
+  }
 }
 
 // ---------- 深度嗅探 ----------
@@ -371,8 +427,8 @@ chrome.downloads.onCreated.addListener(async (item) => {
       }
       return;
     }
-    // 浏览器自己的下载即将被取消，监视面板立即弹出让用户看到接管结果
-    openMonitor();
+    // 浏览器自己的下载即将被取消，监视面板等任务开始下载后自动弹出
+    startMonitorPoll();
 
     // **NM 已经交付完毕，到此为止。**
     //
@@ -552,7 +608,7 @@ async function bridgeHeaders() {
  *
  * 顺序很重要：**先桥后协议**。桥是同步返回成败的；协议只是兜底。
  */
-async function send(target, opts = {}) {
+async function send(target) {
   if (!target || !target.url) return { ok: false, diag: "no-url" };
 
   // 0. 拦在源头：VeloxGrab 只处理 http/https。
@@ -584,7 +640,7 @@ async function send(target, opts = {}) {
     if (res.ok) {
       const j = await res.json().catch(() => ({}));
       if (j && j.ok) {
-        if (!opts.fromPopup) openMonitor();
+        startMonitorPoll();
         return { ok: true, diag: "bridge:direct" };
       }
       // 403 + token mismatch 说明桌面端比扩展新（要求共享 token），把原因
@@ -618,7 +674,7 @@ async function send(target, opts = {}) {
   //    导航放行；90 秒密集补交 + 5 分钟心跳继续覆盖长尾。
   const nm = await sendViaNativeMessaging(target);
   if (nm.ok) {
-    if (!opts.fromPopup) openMonitor();
+    startMonitorPoll();
     return { ok: true, diag: "nm-host" };
   }
   await stashTask(target);
@@ -921,15 +977,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   (async () => {
     const cfg = await getConfig();
-    // popup 自己发的任务，监视面板本来就开着，不再触发自动弹出
-    const fromPopup = (sender.url || "").endsWith("popup.html");
     const result = await send({
       url: msg.url,
       filename: msg.filename || guessName(msg.url),
       threads: cfg.threads,
       dir: cfg.dir,
       referer: msg.referer || "",
-    }, { fromPopup });
+    });
     // diag 一并回给 popup：错误面板要显示「断在哪一环」，不只是「失败」
     sendResponse({ ok: result.ok, diag: result.diag });
   })();
