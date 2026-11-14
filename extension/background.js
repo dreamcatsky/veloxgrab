@@ -39,7 +39,24 @@ const BRIDGE = "http://127.0.0.1:58943";
 const NM_HOST = "com.veloxgrab.host";
 
 /** 默认配置。`intercept` 是「接管浏览器下载」总开关。 */
-const DEFAULTS = { threads: 4, dir: "", intercept: true, notify: true, sniff: true };
+const DEFAULTS = { threads: 4, dir: "", intercept: true, notify: true, sniff: true, autoOpen: true };
+
+/**
+ * 发送成功后自动弹出监视面板（= 扩展弹窗本体）。
+ *
+ * MV3 的 chrome.action.openPopup() 无需用户手势即可调用（Edge 157 实测：
+ * 隔离实例 + CDP 无手势求值成功），唯一要求是浏览器窗口处于前台——用户
+ * 刚点了下载，这天然成立；窗口不在前台（切到别的应用了）会抛
+ * "Could not find an active browser window"，静默忽略即可，用户回头点
+ * 图标照样能看。批量抓取连发时重复调用是幂等的（已打开 = 无操作）。
+ */
+async function openMonitor() {
+  try {
+    const { autoOpen } = await chrome.storage.sync.get(["autoOpen"]);
+    if (autoOpen === false) return;
+    await chrome.action.openPopup();
+  } catch { /* 非前台 / 已打开：静默 */ }
+}
 
 // ---------- 深度嗅探 ----------
 //
@@ -354,6 +371,8 @@ chrome.downloads.onCreated.addListener(async (item) => {
       }
       return;
     }
+    // 浏览器自己的下载即将被取消，监视面板立即弹出让用户看到接管结果
+    openMonitor();
 
     // **NM 已经交付完毕，到此为止。**
     //
@@ -533,7 +552,7 @@ async function bridgeHeaders() {
  *
  * 顺序很重要：**先桥后协议**。桥是同步返回成败的；协议只是兜底。
  */
-async function send(target) {
+async function send(target, opts = {}) {
   if (!target || !target.url) return { ok: false, diag: "no-url" };
 
   // 0. 拦在源头：VeloxGrab 只处理 http/https。
@@ -564,7 +583,10 @@ async function send(target) {
     clearTimeout(timer);
     if (res.ok) {
       const j = await res.json().catch(() => ({}));
-      if (j && j.ok) return { ok: true, diag: "bridge:direct" };
+      if (j && j.ok) {
+        if (!opts.fromPopup) openMonitor();
+        return { ok: true, diag: "bridge:direct" };
+      }
       // 403 + token mismatch 说明桌面端比扩展新（要求共享 token），把原因
       // 带给用户，别让「点了没反应」重演。
       if (j && j.error && /token/i.test(String(j.error))) {
@@ -595,7 +617,10 @@ async function send(target) {
   //    「暂存 + 弹窗启动按钮」的兜底——按钮点击有 user activation，协议
   //    导航放行；90 秒密集补交 + 5 分钟心跳继续覆盖长尾。
   const nm = await sendViaNativeMessaging(target);
-  if (nm.ok) return { ok: true, diag: "nm-host" };
+  if (nm.ok) {
+    if (!opts.fromPopup) openMonitor();
+    return { ok: true, diag: "nm-host" };
+  }
   await stashTask(target);
   return {
     ok: false,
@@ -896,13 +921,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   (async () => {
     const cfg = await getConfig();
+    // popup 自己发的任务，监视面板本来就开着，不再触发自动弹出
+    const fromPopup = (sender.url || "").endsWith("popup.html");
     const result = await send({
       url: msg.url,
       filename: msg.filename || guessName(msg.url),
       threads: cfg.threads,
       dir: cfg.dir,
       referer: msg.referer || "",
-    });
+    }, { fromPopup });
     // diag 一并回给 popup：错误面板要显示「断在哪一环」，不只是「失败」
     sendResponse({ ok: result.ok, diag: result.diag });
   })();

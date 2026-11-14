@@ -269,7 +269,7 @@ async function init() {
   // 恢复上次的目录/线程/接管开关。dir 存 storage.local（本机路径不上云），
   // threads/intercept 存 storage.sync。
   const [cfgSync, cfgLocal] = await Promise.all([
-    chrome.storage.sync.get(["threads", "intercept", "sniff", "floatBtn"]),
+    chrome.storage.sync.get(["threads", "intercept", "sniff", "floatBtn", "autoOpen"]),
     chrome.storage.local.get(["dir"]),
   ]);
   if (cfgLocal.dir) $("dir").value = cfgLocal.dir;
@@ -294,6 +294,12 @@ async function init() {
   $("floatBtn").onchange = () => {
     chrome.storage.sync.set({ floatBtn: $("floatBtn").checked });
     msg($("floatBtn").checked ? "已开启悬浮下载按钮（刷新页面后可见）" : "已关闭悬浮下载按钮");
+  };
+  // 自动弹出监视面板（默认开）：后台 send()/拦截成功后调 action.openPopup
+  $("autoOpen").checked = cfgSync.autoOpen !== false;
+  $("autoOpen").onchange = () => {
+    chrome.storage.sync.set({ autoOpen: $("autoOpen").checked });
+    msg($("autoOpen").checked ? "已开启：发送任务后自动弹出监视面板" : "已关闭自动弹出");
   };
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
